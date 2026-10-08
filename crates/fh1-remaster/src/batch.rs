@@ -380,19 +380,32 @@ struct SmallCasters {
 /// its `Aabb` and final `GlobalTransform` once after spawning).
 #[allow(clippy::type_complexity)]
 fn collect_small_casters(
+    mut commands: Commands,
     mut cache: ResMut<SmallCasters>,
     new: Query<
-        (Entity, &Aabb, &GlobalTransform),
+        (Entity, &Aabb, &GlobalTransform, Has<bevy::camera::visibility::RenderLayers>),
         (With<MeshMaterial3d<crate::material::RemasterMaterial>>, Without<ShadowLod>, Or<(Added<Aabb>, Changed<GlobalTransform>)>),
     >,
 ) {
-    if !crate::enabled() || std::env::var("FH1_SHADOW_SMALL_CULL").is_ok_and(|v| v == "0") {
+    if !crate::enabled() {
         return;
     }
-    for (e, aabb, gt) in &new {
+    let cull = !std::env::var("FH1_SHADOW_SMALL_CULL").is_ok_and(|v| v == "0");
+    // Small pieces stay out of the car probe's cube (car_probe.rs `main_only_layers`), set once here.
+    let main_only = crate::car_probe::main_only_layers();
+    if !cull && main_only.is_none() {
+        return;
+    }
+    for (e, aabb, gt, has_layers) in &new {
         let (scale, _, _) = gt.to_scale_rotation_translation();
         let radius = (Vec3::from(aabb.half_extents) * scale.abs()).length();
         if radius >= SMALL_RADIUS {
+            continue;
+        }
+        if let (Some(l), false) = (&main_only, has_layers) {
+            commands.entity(e).try_insert(l.clone());
+        }
+        if !cull {
             continue;
         }
         let centre = gt.transform_point(Vec3::from(aabb.center));

@@ -65,6 +65,10 @@
 //!   cluster list never names a probe that lost its map). The crossfade follows that timing: the old probe doubles from
 //!   the frame the new one is clustered (the fade loop), and the new one drops to 1x the frame after the old one is gone.
 //!
+//! - **Cheap faces** (2026-10-08, e4's view audit; FH1_RM_PROBE_CHEAP=0 = old): small scenery pieces render on the
+//!   main-view-only layer ([`main_only_layers`]), so the faces skip them; parked, a bake comes every
+//!   FH1_RM_CAR_PROBE_EVERY_PARKED s (4), easing to FH1_RM_CAR_PROBE_EVERY (1) by 10 m/s.
+//!
 //! Anchor: the player car's `fh1_render::reflect::EnvCubeAnchor` (main.rs). Default on (FH1_RM_CAR_PROBE=0 = off, the camera's
 //! atmosphere env only); FH1_RM_CAR_PROBE_RES=n face size (256 since 2026-10-08, was 128). The face camera gets no sun cascades: light.rs empties every
 //! non-main view's entry (it must stay present, see `main_view_cascades_only`).
@@ -100,9 +104,18 @@ pub const OWN_LIGHT_LAYER: usize = 25;
 
 /// Layers for a light of the player car's own (headlight, backfire flash): `Some` while the remaster car probe runs and
 /// hides them from its cube. The main camera gets `[0, OWN_LIGHT_LAYER]` in the same case (light.rs `setup_camera`).
+/// Also the "main view only" layer for things the cube doesn't need (see [`main_only_layers`]).
 pub fn own_light_layers() -> Option<bevy::camera::visibility::RenderLayers> {
     let on = crate::enabled() && enabled() && std::env::var("FH1_RM_PROBE_OWN_LIGHTS").map_or(true, |v| v != "1");
     on.then(|| bevy::camera::visibility::RenderLayers::layer(OWN_LIGHT_LAYER))
+}
+
+/// Layers that keep an entity out of the car probe's cube but in the main view (2026-10-08 perf, e4's view audit):
+/// small scenery pieces (batch.rs) now; tyre smoke, flames, crowds, grass and particles are candidates (not wired yet). `None` = leave the entity on layer 0 (faithful renderer, probe off, FH1_RM_PROBE_CHEAP=0). The sun
+/// and moon render `[0, OWN_LIGHT_LAYER]` (light.rs) so shadows from these pieces stay.
+pub fn main_only_layers() -> Option<bevy::camera::visibility::RenderLayers> {
+    let cheap = std::env::var("FH1_RM_PROBE_CHEAP").map_or(true, |v| v != "0");
+    own_light_layers().filter(|_| cheap)
 }
 
 /// Probe box size (m) turned with the car, or None = the axis-aligned cube (module doc).
@@ -300,6 +313,7 @@ fn drive(
     cube: Option<Res<CarProbeCube>>,
     lighting: Option<Res<crate::light::RemasterLighting>>,
     mut state: ResMut<ProbeState>,
+    mut speed: Local<(Option<Vec3>, f32)>,
     anchors: Query<(&GlobalTransform, Option<&Children>), (With<fh1_render::reflect::EnvCubeAnchor>, Without<CarProbeFace>, Without<CarProbe>)>,
     bodies: Query<&Transform, (With<bevy::world_serialization::WorldAssetRoot>, Without<CarProbe>, Without<CarProbeFace>)>,
     mut face: Query<(Entity, &mut CarProbeFace, &mut bevy::camera::visibility::RenderLayers, &mut Transform, &mut GlobalTransform, &mut Projection, &mut Camera), Without<CarProbe>>,
@@ -312,6 +326,16 @@ fn drive(
     let idle = bevy::camera::visibility::RenderLayers::layer(IDLE_LAYER);
     let car_pos = car.translation();
     let car_rot = car.to_scale_rotation_translation().1;
+    // Car speed (smoothed) for the bake interval: 4 s parked -> FH1_RM_CAR_PROBE_EVERY (1 s) from 10 m/s.
+    let dt = time.delta_secs().max(1e-4);
+    let v = speed.0.map_or(0.0, |p| (car_pos - p).length() / dt).min(150.0);
+    speed.0 = Some(car_pos);
+    speed.1 += (v - speed.1) * (1.0 - (-dt / 0.5).exp());
+    let every = {
+        let fast = env_f32("FH1_RM_CAR_PROBE_EVERY", 1.0);
+        let slow = env_f32("FH1_RM_CAR_PROBE_EVERY_PARKED", 4.0).max(fast);
+        slow + (fast - slow) * (speed.1 / 10.0).clamp(0.0, 1.0)
+    };
     let boxed = probe_box();
     let now = time.elapsed_secs();
     // Car-box mode: from the body's bottom up (module doc), in the car's frame.
@@ -386,7 +410,7 @@ fn drive(
             layers.set_if_neq(idle.clone());
             let due = state.last_bake.is_none_or(|(t, p)| {
                 let age = now - t;
-                age >= env_f32("FH1_RM_CAR_PROBE_EVERY", 1.0)
+                age >= every
                     || (age >= env_f32("FH1_RM_CAR_PROBE_GAP", 0.25) && p.distance(car_pos) > env_f32("FH1_RM_CAR_PROBE_DIST", 10.0))
             });
             // Dusk (sun sunk below the horizon by light.rs's twilight, moon not up): the face camera has no atmosphere, so

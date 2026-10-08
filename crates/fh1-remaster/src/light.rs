@@ -104,6 +104,7 @@ impl Plugin for RemasterLightPlugin {
             .insert_resource(DirectionalLightShadowMap { size: res.next_power_of_two().clamp(512, 8192) })
             .add_plugins(bevy::render::extract_component::ExtractComponentPlugin::<RemasterView>::default())
             .add_systems(Startup, (sky::setup_sky, spawn_moon))
+            .add_systems(Update, main_only_light_layers)
             .add_systems(Update, (setup_camera, sky::update_sky, env_refresh.after(setup_camera)))
             .add_systems(Update, game_shader_casters)
             .add_systems(PostUpdate, game_fog.after(update_lights))
@@ -124,6 +125,17 @@ fn spawn_moon(mut commands: Commands) {
         Transform::default(),
         Name::new("fh1_remaster_moon"),
     ));
+}
+
+/// Sun / moon on `[0, OWN_LIGHT_LAYER]` while main-view-only entities exist (car_probe.rs `main_only_layers`): their
+/// shadow casters are culled by the light's layers, so small scenery on the main-only layer keeps its shadow.
+fn main_only_light_layers(mut commands: Commands, lights: Query<Entity, (With<DirectionalLight>, Without<bevy::camera::visibility::RenderLayers>)>) {
+    if crate::car_probe::main_only_layers().is_none() {
+        return;
+    }
+    for e in &lights {
+        commands.entity(e).insert(bevy::camera::visibility::RenderLayers::from_layers(&[0, crate::car_probe::OWN_LIGHT_LAYER]));
+    }
 }
 
 /// FH1_RM_CONTACT_SHADOWS=0 = off (module doc).

@@ -539,7 +539,7 @@ fn pois(
         t.rotation = cam.rotation;
         if mats.get(&poi.mat).is_some_and(|m| (m.color.alpha() - a).abs() > 0.01) {
             if let Some(mut m) = mats.get_mut(&poi.mat) {
-                m.base_color.set_alpha(a);
+                m.color.set_alpha(a);
                 pace.dirty = true;
             }
         }
