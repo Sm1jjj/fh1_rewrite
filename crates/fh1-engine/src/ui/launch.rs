@@ -351,7 +351,7 @@ fn save(settings: &Settings, path: &SettingsPath) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(b) = serde_json::to_vec_pretty(settings) {
-        let _ = std::fs::write(&path.0, b);
+        crate::perf::writer::replace(path.0.clone(), b);
     }
 }
 

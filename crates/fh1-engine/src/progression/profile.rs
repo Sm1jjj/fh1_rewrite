@@ -72,10 +72,10 @@ impl Profile {
         if !self.persist {
             return;
         }
-        let tmp = self.path.with_extension("json.tmp");
-        let res = serde_json::to_vec_pretty(&self.data).map_err(std::io::Error::other).and_then(|b| std::fs::write(&tmp, b)).and_then(|_| std::fs::rename(&tmp, &self.path));
-        if let Err(e) = res {
-            warn!("progression: saving {}: {e}", self.path.display());
+        // Serialised here, written (tmp + rename) on the background writer (perf/writer.rs; a save never stalls a frame).
+        match serde_json::to_vec_pretty(&self.data) {
+            Ok(b) => crate::perf::writer::replace(self.path.clone(), b),
+            Err(e) => warn!("progression: saving {}: {e}", self.path.display()),
         }
     }
 }

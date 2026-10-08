@@ -74,9 +74,8 @@ impl Discovered {
         }
         self.unsaved = false;
         self.since_save = 0.0;
-        if let Err(e) = std::fs::write(&self.path, &self.seen) {
-            warn!("map: can't save {}: {e}", self.path.display());
-        }
+        // On the background writer (perf/writer.rs): a save never stalls a frame.
+        crate::perf::writer::replace(self.path.clone(), self.seen.clone());
     }
 }
 

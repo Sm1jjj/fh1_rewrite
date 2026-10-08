@@ -228,10 +228,36 @@ fn sleep_on() -> bool {
     std::env::var("FH1_RM_CAR_PROBE_SLEEP").map_or(true, |v| v != "0")
 }
 
-/// FH1_RM_PROBE_EVEN=0 = the old capture bursts (module doc "Even cadence").
+/// Lean faces (P8-B, log 20261008_140912: the every-frame face cost ~4 ms, transparent pass +1.0 ms, opaque +0.5, queue
+/// 1.1): with the even cadence the cube sees only the big opaque world. FH1_RM_PROBE_LEAN=0 = the old face content.
+pub fn lean_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| even_on() && std::env::var("FH1_RM_PROBE_LEAN").map_or(true, |v| v != "0"))
+}
+
+/// Layers for an entity the lean faces skip (transparent scenery, blended game-shader parts, small props): the main
+/// view's own layer only. `None` when the probe or the lean rule is off.
+pub fn probe_skip_layers() -> Option<bevy::camera::visibility::RenderLayers> {
+    main_only_layers().filter(|_| lean_on())
+}
+
+/// World half-diagonal (m) below which a scenery piece / merged prop chunk stays out of the lean faces
+/// (FH1_RM_PROBE_MIN_RADIUS, 4).
+pub fn probe_min_radius() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_RM_PROBE_MIN_RADIUS").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0))
+}
+
+/// Face size cap of the even cadence (FH1_RM_PROBE_EVEN_RES, 128): the quality preset's probe_res, at most this.
+fn even_res_cap() -> u32 {
+    std::env::var("FH1_RM_PROBE_EVEN_RES").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(128).next_power_of_two().clamp(32, 512)
+}
+
+/// FH1_RM_PROBE_EVEN=1 = one face every frame (module doc "Even cadence"). OPT-IN since 2026-10-08 pm: log 140912 fps 67 -> 56
+/// (a second 3D view every frame); default = the capture bursts.
 fn even_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("FH1_RM_PROBE_EVEN").map_or(true, |v| v != "0"))
+    *V.get_or_init(|| std::env::var("FH1_RM_PROBE_EVEN").is_ok_and(|v| v == "1"))
 }
 
 fn face_spread() -> u32 {
@@ -287,6 +313,8 @@ fn deactivate_slots(mut commands: Commands, mut state: ResMut<ProbeState>) {
 
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut state: ResMut<ProbeState>) {
     let size = (env_f32("FH1_RM_CAR_PROBE_RES", 256.0) as u32).next_power_of_two().clamp(32, 512);
+    // Even cadence: a face every frame, so a small fixed face (FH1_RM_CAR_PROBE_RES, when set, wins).
+    let size = if even_on() && std::env::var("FH1_RM_CAR_PROBE_RES").is_err() { size.min(even_res_cap()) } else { size };
     let mut cube = Image::new_uninit(Extent3d { width: size, height: size, depth_or_array_layers: 6 }, TextureDimension::D2, FORMAT, bevy::asset::RenderAssetUsages::RENDER_WORLD);
     cube.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
     cube.texture_view_descriptor = Some(TextureViewDescriptor { dimension: Some(TextureViewDimension::Cube), ..default() });
@@ -443,6 +471,7 @@ fn drive(
             // the cube / target handles and every bind group naming them stay; the next bake fills the new size.
             if let (Some(q), Err(_), None) = (quality.as_ref(), std::env::var("FH1_RM_CAR_PROBE_RES"), state.fade) {
                 let want = q.probe_res.next_power_of_two().clamp(32, 512);
+                let want = if even_on() { want.min(even_res_cap()) } else { want };
                 if want != state.size {
                     state.size = want;
                     if let Some(mut c) = images.get_mut(&cube.0) {
@@ -606,7 +635,7 @@ fn drive(
         state.faces_since_bake += 1;
         let (fwd, up) = face_basis(k);
         if let Projection::Perspective(p) = &mut *proj {
-            let far = if k == 3 { env_f32("FH1_RM_CAR_PROBE_DOWN_FAR", 8.0) } else { env_f32("FH1_RM_CAR_PROBE_FAR", 150.0) };
+            let far = if k == 3 { env_f32("FH1_RM_CAR_PROBE_DOWN_FAR", 8.0) } else { env_f32("FH1_RM_CAR_PROBE_FAR", 100.0) };
             if p.far != far {
                 p.far = far;
             }

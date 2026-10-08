@@ -130,11 +130,12 @@ const MIN_PLACE: usize = 64;
 /// newly extracted mesh's vertex / index data in the frame it appears (47's trace of the stream-in hitches;
 /// RenderAssetBytesPerFrame doesn't throttle it). Zone models, tiles and merged prop chunks wait for room; one item may
 /// overdraw and the next frames pay the debt, so each frame still makes progress. Template placements and parked
-/// zone models reuse existing meshes and don't count. `FH1_MESH_ADD_MB` (default 8; 0 = unlimited, old).
+/// zone models reuse existing meshes and don't count. `FH1_MESH_ADD_MB` (OPT-IN since 2026-10-08 pm: default 0 = unlimited;
+/// log 135653 showed no fewer mesh hitches, a slower render thread, and starved festival roads).
 fn mesh_add_bytes() -> i64 {
     static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        let mb: f64 = std::env::var("FH1_MESH_ADD_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+        let mb: f64 = std::env::var("FH1_MESH_ADD_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
         (mb.max(0.0) * 1024.0 * 1024.0) as i64
     })
 }
@@ -1158,6 +1159,17 @@ impl Scenery {
                     let m = self.simple(material, materials, fx);
                     out.push((mesh, m));
                 }
+            }
+        }
+        // P9: a part with no vertices (empty setup batch) made Bevy's mesh allocator log "Use-after-free: attempted to
+        // copy element data for an unallocated key" (it skips allocating an empty vertex buffer but still copies it;
+        // log 140912, while zones streamed). Dropped here; counted once in the log.
+        let before = out.len();
+        out.retain(|(m, _)| m.count_vertices() > 0);
+        if out.len() < before {
+            static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if LOGGED.fetch_add(before - out.len(), std::sync::atomic::Ordering::Relaxed) == 0 {
+                info!("scenery: dropped {} empty mesh part(s) (no vertices); further ones are dropped silently", before - out.len());
             }
         }
         merge_parts(out)

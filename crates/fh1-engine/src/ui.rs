@@ -1043,11 +1043,8 @@ fn close_menu(menu: &mut Menu, settings: &Settings, path: &SettingsPath) {
             let _ = std::fs::create_dir_all(dir);
         }
         match serde_json::to_vec_pretty(settings) {
-            Ok(b) => {
-                if let Err(e) = std::fs::write(&path.0, b) {
-                    warn!("settings: {}: {e}", path.0.display());
-                }
-            }
+            // On the background writer (perf/writer.rs): a save never stalls a frame.
+            Ok(b) => crate::perf::writer::replace(path.0.clone(), b),
             Err(e) => warn!("settings: {e}"),
         }
     }

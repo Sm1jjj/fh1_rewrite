@@ -106,7 +106,7 @@ impl Plugin for RemasterLightPlugin {
             .add_systems(Startup, (sky::setup_sky, spawn_moon))
             .add_systems(Update, main_only_light_layers)
             .add_systems(Update, (setup_camera, sky::update_sky, env_refresh.after(setup_camera)))
-            .add_systems(Update, game_shader_casters)
+            .add_systems(Update, (game_shader_casters, game_shader_probe_skip))
             .add_systems(Update, apply_quality)
             .add_systems(PostUpdate, game_fog.after(update_lights))
             .add_systems(PostUpdate, update_lights.before(bevy::transform::TransformSystems::Propagate))
@@ -749,6 +749,22 @@ fn game_shader_casters(
         let huge = aabb.is_some_and(|b| b.half_extents.max_element() > 1500.0);
         if sky || huge || materials.get(&m.0).is_some_and(|m| m.alpha_blend) {
             commands.entity(e).try_insert(bevy::light::NotShadowCaster);
+        }
+    }
+}
+
+/// Lean car-probe faces (car_probe.rs `lean_on`): blended game-shader parts (glows, light beams, glass, decals; not the sky,
+/// which is most of what the cube is for) render on the main view's layer only.
+#[allow(clippy::type_complexity)]
+fn game_shader_probe_skip(
+    mut commands: Commands,
+    new: Query<(Entity, &MeshMaterial3d<fh1_render::FxMaterial>), (Added<MeshMaterial3d<fh1_render::FxMaterial>>, Without<fh1_render::sky::SkyPart>, Without<bevy::camera::visibility::RenderLayers>)>,
+    materials: Res<Assets<fh1_render::FxMaterial>>,
+) {
+    let Some(layers) = crate::car_probe::probe_skip_layers() else { return };
+    for (e, m) in &new {
+        if materials.get(&m.0).is_some_and(|m| m.alpha_blend) {
+            commands.entity(e).try_insert(layers.clone());
         }
     }
 }

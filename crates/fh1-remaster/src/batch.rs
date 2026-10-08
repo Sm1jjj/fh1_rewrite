@@ -398,15 +398,18 @@ struct SmallCasters {
 }
 
 /// Collects small casters: remaster scenery entities whose bounds / placement just became known (static scenery gets
-/// its `Aabb` and final `GlobalTransform` once after spawning).
+/// its `Aabb` and final `GlobalTransform` once after spawning). Also sorts entities out of the car probe's cube: small
+/// pieces always (main-only layer); with the lean faces (car_probe.rs `lean_on`) also every transparent / additive
+/// material (decals, water, glass) and anything under `probe_min_radius` (merged prop chunks: their largest placement).
 #[allow(clippy::type_complexity)]
 fn collect_small_casters(
     mut commands: Commands,
     mut cache: ResMut<SmallCasters>,
     new: Query<
-        (Entity, &Aabb, &GlobalTransform, Has<bevy::camera::visibility::RenderLayers>),
-        (With<MeshMaterial3d<crate::material::RemasterMaterial>>, Without<ShadowLod>, Or<(Added<Aabb>, Changed<GlobalTransform>)>),
+        (Entity, &Aabb, &GlobalTransform, Has<bevy::camera::visibility::RenderLayers>, &MeshMaterial3d<crate::material::RemasterMaterial>, Option<&ShadowLod>),
+        Or<(Added<Aabb>, Changed<GlobalTransform>)>,
     >,
+    materials: Res<Assets<crate::material::RemasterMaterial>>,
 ) {
     if !crate::enabled() {
         return;
@@ -414,19 +417,24 @@ fn collect_small_casters(
     let cull = !std::env::var("FH1_SHADOW_SMALL_CULL").is_ok_and(|v| v == "0");
     // Small pieces stay out of the car probe's cube (car_probe.rs `main_only_layers`), set once here.
     let main_only = crate::car_probe::main_only_layers();
+    let lean = crate::car_probe::probe_skip_layers();
     if !cull && main_only.is_none() {
         return;
     }
-    for (e, aabb, gt, has_layers) in &new {
+    for (e, aabb, gt, has_layers, m, lod) in &new {
         let (scale, _, _) = gt.to_scale_rotation_translation();
         let radius = (Vec3::from(aabb.half_extents) * scale.abs()).length();
-        if radius >= SMALL_RADIUS {
-            continue;
+        if !has_layers {
+            if let Some(l) = &lean {
+                let transparent = materials.get(&m.0).is_some_and(|m| !matches!(m.base.alpha_mode, AlphaMode::Opaque | AlphaMode::Mask(_)));
+                if transparent || lod.map_or(radius, |l| l.max_radius) < crate::car_probe::probe_min_radius() {
+                    commands.entity(e).try_insert(l.clone());
+                }
+            } else if let (Some(l), true) = (&main_only, lod.is_none() && radius < SMALL_RADIUS) {
+                commands.entity(e).try_insert(l.clone());
+            }
         }
-        if let (Some(l), false) = (&main_only, has_layers) {
-            commands.entity(e).try_insert(l.clone());
-        }
-        if !cull {
+        if lod.is_some() || radius >= SMALL_RADIUS || !cull {
             continue;
         }
         let centre = gt.transform_point(Vec3::from(aabb.center));

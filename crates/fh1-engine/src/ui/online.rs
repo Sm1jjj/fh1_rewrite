@@ -81,7 +81,7 @@ impl OnlineScreen {
 
     fn save(&self) {
         if let Ok(b) = serde_json::to_vec_pretty(&self.file) {
-            let _ = std::fs::write(&self.path, b);
+            crate::perf::writer::replace(self.path.clone(), b);
         }
     }
 

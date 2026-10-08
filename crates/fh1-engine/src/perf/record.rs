@@ -11,7 +11,6 @@
 //! [`FLUSH_EVERY`] s. Read a log with `tools/perf_report.py <csv>`.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -29,45 +28,18 @@ const HITCH_MS: f32 = 40.0;
 const FLUSH_EVERY: f64 = 5.0;
 const SUMMARY_EVERY: f64 = 30.0;
 
-/// Log file writes, done on a writer thread: the main thread must never wait on the disk (per-frame / periodic writes
-/// from systems froze the game for 10-26 s in the user's 2026-10-07 runs). At exit (`Drop`) they are written in place.
+/// Log file writes go through the shared background writer (perf/writer.rs): the main thread must never wait on the
+/// disk (per-frame / periodic writes from systems froze the game for 10-26 s in the user's 2026-10-07 runs). At exit
+/// (`Drop`) the writer is drained and they are written in place.
 enum FileJob {
     Append(PathBuf, String),
     Write(PathBuf, String),
 }
 
-fn run_job(job: FileJob) {
-    match job {
-        FileJob::Append(p, s) => {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-                let _ = f.write_all(s.as_bytes());
-            }
-        }
-        FileJob::Write(p, s) => {
-            let _ = std::fs::write(&p, s);
-        }
-    }
-}
-
-static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn file_job(job: FileJob) {
-    static TX: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<FileJob>>>> = std::sync::OnceLock::new();
-    if EXITING.load(std::sync::atomic::Ordering::Relaxed) {
-        return run_job(job);
-    }
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<FileJob>();
-        std::thread::Builder::new().name("fh1-perf-log".into()).spawn(move || rx.into_iter().for_each(run_job)).ok()?;
-        Some(std::sync::Mutex::new(tx))
-    });
-    match tx.as_ref().and_then(|t| t.lock().ok()) {
-        Some(t) => {
-            if let Err(e) = t.send(job) {
-                run_job(e.0);
-            }
-        }
-        None => run_job(job),
+    match job {
+        FileJob::Append(p, s) => super::writer::append(p, s),
+        FileJob::Write(p, s) => super::writer::replace(p, s),
     }
 }
 
@@ -238,8 +210,8 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        // Exit: write in place (the writer thread may not get to run again).
-        EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Exit: drain the writer, then write in place (its thread may not get to run again).
+        super::writer::finish();
         self.flush();
         self.write_summary();
     }

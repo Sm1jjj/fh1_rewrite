@@ -219,11 +219,8 @@ impl CarLooks {
             let _ = std::fs::create_dir_all(dir);
         }
         match serde_json::to_vec_pretty(&self.cars) {
-            Ok(b) => {
-                if let Err(e) = std::fs::write(&self.path, b) {
-                    warn!("garage: {}: {e}", self.path.display());
-                }
-            }
+            // Written on the background writer (perf/writer.rs): a save never stalls a frame.
+            Ok(b) => crate::perf::writer::replace(self.path.clone(), b),
             Err(e) => warn!("garage: {e}"),
         }
     }

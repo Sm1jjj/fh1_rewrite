@@ -283,7 +283,8 @@ fn main() -> AppExit {
     // regrows a slab by x1.5 from 1 MiB = a new buffer + a full copy each time the resident scenery set grows): start at
     // FH1_MESH_SLAB_MB (16; global, so every vertex layout's slab starts that big: watch vram_mb) and double.
     // FH1_MESH_SLAB=0 = Bevy's defaults (1 MiB, x1.5).
-    if !std::env::var("FH1_MESH_SLAB").is_ok_and(|v| v == "0") {
+    // OPT-IN since 2026-10-08 pm (FH1_MESH_SLAB=1): no fewer mesh hitches in log 135653, more VRAM.
+    if std::env::var("FH1_MESH_SLAB").is_ok_and(|v| v == "1") {
         if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
             let mut s = bevy::render::mesh::allocator::MeshAllocatorSettings::default();
             let mb = std::env::var("FH1_MESH_SLAB_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(16).max(1);

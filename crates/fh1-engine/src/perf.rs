@@ -20,6 +20,7 @@ mod present;
 pub(crate) mod record;
 mod stack;
 mod watchdog;
+pub mod writer;
 pub(crate) use watchdog::{system_span_layer, watch};
 
 use std::collections::HashMap;
@@ -37,6 +38,7 @@ pub struct PerfPlugin;
 
 impl Plugin for PerfPlugin {
     fn build(&self, app: &mut App) {
+        writer::plugin(app);
         pacing::plugin(app);
         present::plugin(app);
         exec::plugin(app);
