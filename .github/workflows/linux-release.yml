@@ -44,7 +44,9 @@ jobs:
         run: cargo build --release --locked --no-default-features -p fh1setup --features fh2,fm4 -p fh1-launcher -p fh1-engine
 
       - name: Tests (formats paths, launcher)
-        run: cargo test --release --locked -p fh1-formats path:: && cargo test --release --locked -p fh1-launcher
+        run: |
+          cargo test --release --locked -p fh1-formats path::
+          cargo test --release --locked -p fh1-launcher
 
       - name: Package
         id: pack
