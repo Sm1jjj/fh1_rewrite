@@ -14,6 +14,7 @@
 
 #[path = "ai/plugin.rs"]
 mod ai_plugin;
+mod logpipe;
 #[path = "traffic/plugin.rs"]
 mod traffic_plugin;
 mod anim;
@@ -117,6 +118,8 @@ struct SafePose {
 }
 
 fn main() -> AppExit {
+    // Before anything logs: stdout/stderr through a buffered pipe so no game thread waits on the log file (logpipe.rs).
+    logpipe::install();
     let mut data_dir = PathBuf::from("data");
     let mut car = None;
     let mut track_name: Option<String> = None;
