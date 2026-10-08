@@ -649,7 +649,7 @@ pub fn keep_one_aspiration(parts: &mut Value) {
 
 /// Tyre width / rim size rows into the car's tyre columns, the aspect recomputed so the outer diameter stays the
 /// stock one (82BF0B60 / 82D12768): width only changes grip (TireFricScale(width)) and the sidewall, never the radius.
-fn fit_tyre_sizes(p: &mut Value) {
+pub(crate) fn fit_tyre_sizes(p: &mut Value) {
     for (end, width_t, width_k, rim_t, rim_k) in [
         ("Front", "List_UpgradeCarBodyTireWidthFront", "FrontTireWidth", "List_UpgradeRimSizeFront", "FrontWheelDiameter"),
         ("Rear", "List_UpgradeCarBodyTireWidthRear", "RearTireWidth", "List_UpgradeRimSizeRear", "RearWheelDiameter"),
@@ -676,7 +676,7 @@ fn fit_tyre_sizes(p: &mut Value) {
 }
 
 /// Sums over the fitted parts: (MassDiff sum, WeightDistDiff sum, DragScale product, S, intercooler MaxScaleScale).
-fn part_sums(parts: &Value) -> (f32, f32, f32, f32, f32) {
+pub(crate) fn part_sums(parts: &Value) -> (f32, f32, f32, f32, f32) {
     let Some(o) = parts.as_object() else { return (0.0, 0.0, 1.0, 1.0, 1.0) };
     let kept = ASPIRATION.iter().find(|t| o.contains_key(**t)).copied();
     let fitted = || o.iter().filter(|(k, _)| !ASPIRATION.contains(&k.as_str()) || Some(k.as_str()) == kept).map(|(k, v)| (k.as_str(), v));

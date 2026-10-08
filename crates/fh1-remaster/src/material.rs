@@ -463,6 +463,103 @@ struct SceneryParams {
 
 //SAMPLERS
 
+// P12 static world (docs/PERF.md "P12 static world", fh1-remaster static_world.rs): scenery drawn from the arena. The
+// draw record replaces mesh[] / mesh_functions; the rest of the shader is shared with the ECS path.
+#ifdef STATIC_WORLD
+struct SwRecord {
+    rows: array<vec4<f32>, 3>,
+    aabb_min: vec4<f32>,
+    aabb_max: vec4<f32>,
+    lod: vec4<f32>,
+    first_index: u32,
+    index_count: u32,
+    base_vertex: u32,
+    material: u32,
+    flags: u32,
+    tag: i32,
+    pad0: u32,
+    pad1: u32,
+}
+@group(2) @binding(100) var<storage> sw_vertices: array<u32>;
+@group(2) @binding(101) var<storage> sw_records: array<SwRecord>;
+
+fn rm_world_from_local(i: u32) -> mat4x4<f32> {
+    let r = sw_records[i].rows;
+    return transpose(mat4x4<f32>(r[0], r[1], r[2], vec4<f32>(0.0, 0.0, 0.0, 1.0)));
+}
+fn rm_material_slot(i: u32) -> u32 {
+    return sw_records[i].material;
+}
+fn rm_normal_local_to_world(n: vec3<f32>, i: u32) -> vec3<f32> {
+    // Inverse transpose of the 3x3 via cofactors (non-uniform placement scales), sign-corrected for mirrors.
+    let m = rm_world_from_local(i);
+    let c0 = m[0].xyz;
+    let c1 = m[1].xyz;
+    let c2 = m[2].xyz;
+    let w = n.x * cross(c1, c2) + n.y * cross(c2, c0) + n.z * cross(c0, c1);
+    return normalize(w * sign(dot(c0, cross(c1, c2))));
+}
+fn rm_mesh_flags(i: u32) -> u32 {
+    var f = 1u << 29u; // MESH_FLAGS_SHADOW_RECEIVER_BIT (bevy_pbr 0.19 mesh_types.wgsl)
+    let m = rm_world_from_local(i);
+    if dot(m[0].xyz, cross(m[1].xyz, m[2].xyz)) < 0.0 {
+        f |= 1u << 31u; // MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT
+    }
+    return f;
+}
+/// Dither level: the zone fade tag (non-zero), else the record's LOD band as Bevy's visibility range dither.
+fn rm_dither(i: u32, world_origin: vec3<f32>) -> i32 {
+    let r = sw_records[i];
+    if r.tag != 0 {
+        return r.tag;
+    }
+    let d = length(view.world_position - world_origin);
+    let lod = r.lod;
+    let offset = select(-16, 0, d >= lod.z);
+    let bounds = select(lod.xy, lod.zw, d >= lod.z);
+    let level = i32(round((d - bounds.x) / max(bounds.y - bounds.x, 1e-4) * 16.0));
+    return offset + clamp(level, 0, 16);
+}
+struct Vertex {
+    @builtin(instance_index) instance_index: u32,
+    @builtin(vertex_index) vertex_index: u32,
+}
+struct RmVertex {
+    instance_index: u32,
+    position: vec3<f32>,
+    normal: vec3<f32>,
+    uv0: vec2<f32>,
+    uv1: vec2<f32>,
+    uv2: vec2<f32>,
+    color: vec4<f32>,
+}
+fn rm_fetch(vin: Vertex) -> RmVertex {
+    // VERTEX_WORDS = 13: position, normal, uv0, uv1, uv2 (f32), colour (unorm8x4).
+    let b = vin.vertex_index * 13u;
+    var v: RmVertex;
+    v.instance_index = vin.instance_index;
+    v.position = vec3<f32>(bitcast<f32>(sw_vertices[b]), bitcast<f32>(sw_vertices[b + 1u]), bitcast<f32>(sw_vertices[b + 2u]));
+    v.normal = vec3<f32>(bitcast<f32>(sw_vertices[b + 3u]), bitcast<f32>(sw_vertices[b + 4u]), bitcast<f32>(sw_vertices[b + 5u]));
+    v.uv0 = vec2<f32>(bitcast<f32>(sw_vertices[b + 6u]), bitcast<f32>(sw_vertices[b + 7u]));
+    v.uv1 = vec2<f32>(bitcast<f32>(sw_vertices[b + 8u]), bitcast<f32>(sw_vertices[b + 9u]));
+    v.uv2 = vec2<f32>(bitcast<f32>(sw_vertices[b + 10u]), bitcast<f32>(sw_vertices[b + 11u]));
+    v.color = unpack4x8unorm(sw_vertices[b + 12u]);
+    return v;
+}
+#else
+fn rm_world_from_local(i: u32) -> mat4x4<f32> {
+    return mesh_functions::get_world_from_local(i);
+}
+fn rm_material_slot(i: u32) -> u32 {
+    return mesh[i].material_and_lightmap_bind_group_slot & 0xffffu;
+}
+fn rm_normal_local_to_world(n: vec3<f32>, i: u32) -> vec3<f32> {
+    return mesh_functions::mesh_normal_local_to_world(n, i);
+}
+fn rm_mesh_flags(i: u32) -> u32 {
+    return mesh[i].flags;
+}
+
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
     @location(0) position: vec3<f32>,
@@ -486,6 +583,7 @@ struct Vertex {
     @location(7) tint: vec4<f32>,
 #endif
 }
+#endif
 
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -505,13 +603,18 @@ struct Out {
 }
 
 @vertex
-fn vertex(v: Vertex) -> Out {
+fn vertex(vin: Vertex) -> Out {
+#ifdef STATIC_WORLD
+    let v = rm_fetch(vin);
+#else
+    let v = vin;
+#endif
     var out: Out;
-    let world_from_local = mesh_functions::get_world_from_local(v.instance_index);
+    let world_from_local = rm_world_from_local(v.instance_index);
     var local = v.position;
     // Cloth (flags, bunting): a REMASTER wave along the normal, weighted by vertex alpha (the game's cloth weight;
     // 0 at the pinned edge), phase from the position. Material data is visible to the vertex stage.
-    let vslot = mesh[v.instance_index].material_and_lightmap_bind_group_slot & 0xffffu;
+    let vslot = rm_material_slot(v.instance_index);
 #ifdef BINDLESS
     let vp = scenery_params[scenery_indices[vslot].material];
 #else
@@ -529,7 +632,7 @@ fn vertex(v: Vertex) -> Out {
     }
     out.world_position = mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(local, 1.0));
     out.position = position_world_to_clip(out.world_position.xyz);
-    out.world_normal = mesh_functions::mesh_normal_local_to_world(v.normal, v.instance_index);
+    out.world_normal = rm_normal_local_to_world(v.normal, v.instance_index);
     if (vp.info.z & 1024u) != 0u {
         // Trees: the game lights the cards per instance without normals (tree_diff_opac_dirlight VS). REMASTER: a
         // spherical foliage normal from the tree origin (the placement's, or the merged instance centre), so a crown
@@ -570,6 +673,9 @@ fn vertex(v: Vertex) -> Out {
     }
     out.lod_fades = f;
 #endif
+#ifdef STATIC_WORLD
+    out.visibility_range_dither = rm_dither(v.instance_index, world_from_local[3].xyz);
+#else
 #ifdef VISIBILITY_RANGE_DITHER
     // Zone fades (engine scenery.rs, pop-in P3): a MeshTag with bit 31 carries the dither level as (tag & 63) - 16,
     // as the faithful FX shaders read it (fh1-render program.rs fx_vr_level); otherwise Bevy's distance level.
@@ -579,6 +685,7 @@ fn vertex(v: Vertex) -> Out {
     } else {
         out.visibility_range_dither = mesh_functions::get_visibility_range_dither_level(v.instance_index, world_from_local[3]);
     }
+#endif
 #endif
     return out;
 }
@@ -641,7 +748,7 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
         discard;
     }
 #endif
-    let slot = mesh[in.instance_index].material_and_lightmap_bind_group_slot & 0xffffu;
+    let slot = rm_material_slot(in.instance_index);
 #ifdef BINDLESS
     let p = scenery_params[scenery_indices[slot].material];
     var smat = pbr_bindings::material_array[pbr_bindings::material_indices[slot].material];
@@ -760,7 +867,7 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
 
     var pbr = pbr_types::pbr_input_new();
     pbr.material = smat;
-    pbr.flags = mesh[in.instance_index].flags;
+    pbr.flags = rm_mesh_flags(in.instance_index);
     pbr.is_orthographic = view.clip_from_view[3].w == 1.0;
     pbr.V = pbr_functions::calculate_view(in.world_position, pbr.is_orthographic);
     pbr.frag_coord = in.position;

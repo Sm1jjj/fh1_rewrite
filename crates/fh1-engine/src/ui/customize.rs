@@ -64,7 +64,9 @@ impl Plugin for CustomizePlugin {
         let cars = if garage_on() { read_looks(&self.path) } else { BTreeMap::new() };
         let assets = app.world().get_resource::<Garage>().map(|g| g.assets.clone()).unwrap_or_default();
         app.insert_resource(CarLooks { path: self.path.clone(), assets, cars, preview: None })
-            .add_systems(Update, apply_requests.after(super::menu_input).after(super::menu_mouse).before(super::draw_menu));
+            .add_systems(Update, apply_requests.after(super::menu_input).after(super::menu_mouse).before(super::draw_menu))
+            // PI header (47's customize_upgrades::pi_preview, off-thread): FH1_PI_HEADER=0 = none.
+            .add_systems(Update, update_pi.after(apply_requests).before(super::draw_menu).run_if(|| std::env::var("FH1_PI_HEADER").map_or(true, |v| v != "0")));
     }
 }
 
@@ -396,6 +398,10 @@ pub struct CustomizeMenu {
     pub rows: Vec<Row>,
     /// Shop message for the title (bought / not enough credits); cleared when a view opens.
     notice: Option<String>,
+    /// PI header ("B 512 -> A 604" and the ratings) for the parts it was computed for, and the running computation.
+    pi_text: Option<String>,
+    pi_for: Option<(String, BTreeMap<String, i64>)>,
+    pi_task: Option<bevy::tasks::Task<Option<String>>>,
 }
 
 /// Menu navigation (ui.rs `Nav`).
@@ -425,7 +431,10 @@ impl CustomizeMenu {
     }
 
     pub fn title(&self) -> String {
-        let t = self.view_title();
+        let mut t = self.view_title();
+        if let (Some(pi), true) = (&self.pi_text, matches!(self.view, View::Root | View::Upgrades | View::Kit)) {
+            t = format!("{t}    ·    {pi}");
+        }
         match &self.notice {
             Some(n) => format!("{t}    ·    {n}"),
             None => t,
@@ -1062,4 +1071,53 @@ fn apply_requests(
         let cg = car.0.cg_model;
         commands.entity(root).with_children(|p| crate::spawn_body(p, &garage, &track.id, name, cg, &asset_server, &looks));
     }
+}
+
+/// "B 512 -> A 604    SPD 6.1  HDL 5.4  ACC 7.2  LCH 6.0  BRK 5.0": stock vs the previewed parts (47's PI model).
+fn pi_header(stock: Option<fh1_engine::pi::PiResult>, now: Option<fh1_engine::pi::PiResult>) -> Option<String> {
+    let now = now?;
+    let cls = |r: &fh1_engine::pi::PiResult| format!("{} {}", r.class_letter, r.display_pi);
+    let head = match stock {
+        Some(s) if s.display_pi != now.display_pi || s.class_letter != now.class_letter => format!("{} \u{2192} {}", cls(&s), cls(&now)),
+        _ => cls(&now),
+    };
+    let r = now.ratings;
+    Some(format!("{head}    SPD {:.1}  HDL {:.1}  ACC {:.1}  LCH {:.1}  BRK {:.1}", r[0], r[1], r[2], r[3], r[4]))
+}
+
+/// Keep the PI header in step with the previewed parts: computed on the async pool (a few ms of virtual laps, cached
+/// by 47's pi_preview), shown in the Customize title.
+fn update_pi(mut menu: ResMut<Menu>, looks: Res<CarLooks>, garage: Res<Garage>) {
+    let page = menu.page;
+    let menu = menu.bypass_change_detection();
+    if !menu.open || page != super::Page::Customize {
+        return;
+    }
+    let m = &mut menu.custom;
+    if m.car.is_empty() {
+        return;
+    }
+    if let Some(task) = m.pi_task.as_mut() {
+        if let Some(text) = bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task)) {
+            m.pi_task = None;
+            if text != m.pi_text {
+                m.pi_text = text;
+                menu.dirty = true;
+            }
+        }
+        return;
+    }
+    let chosen = looks.get(&m.car).map(|l| l.upgrades.clone()).unwrap_or_default();
+    let key = (m.car.clone(), chosen);
+    if m.pi_for.as_ref() == Some(&key) {
+        return;
+    }
+    m.pi_for = Some(key.clone());
+    let (assets, car, chosen) = (garage.assets.clone(), key.0, key.1);
+    let dir = assets.join("cars").join(&car);
+    m.pi_task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+        let stock = upgrades::pi_preview(&assets, &dir, &car, &BTreeMap::new());
+        let now = upgrades::pi_preview(&assets, &dir, &car, &chosen);
+        pi_header(stock, now)
+    }));
 }

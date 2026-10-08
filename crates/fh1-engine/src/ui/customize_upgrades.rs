@@ -98,6 +98,28 @@ pub fn purchase_price(part: &Part, i: usize, owned: &OwnedParts) -> Option<u32> 
     Some(part.cost(i, owned)).filter(|&c| c > 0)
 }
 
+/// PI / class / display PI / ratings of `car` with the parts `chosen` (docs/PI.md: FH1's PI lap on the fitted build;
+/// the timed Sim* stats stay stock, as in the game). `car_dir` = the car's installed folder (physics.json). Runs three
+/// analytic laps (a few ms): call it off the main thread, e.g. on AsyncComputeTaskPool, for each previewed change. Results
+/// are cached by (car, chosen); None without the `upgrades` group (upgrades-3: pi.json / car_classes.json).
+pub fn pi_preview(assets: &Path, car_dir: &Path, car: &str, chosen: &BTreeMap<String, i64>) -> Option<fh1_engine::pi::PiResult> {
+    use std::sync::{Mutex, OnceLock};
+    static CFG: OnceLock<Option<fh1_engine::pi::PiConfig>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(String, BTreeMap<String, i64>), fh1_engine::pi::PiResult>>> = OnceLock::new();
+    let cfg = CFG.get_or_init(|| fh1_engine::pi::PiConfig::load(assets)).as_ref()?;
+    let key = (car.to_owned(), chosen.clone());
+    if let Some(r) = CACHE.get_or_init(Default::default).lock().ok()?.get(&key) {
+        return Some(r.clone());
+    }
+    let mut p: Value = serde_json::from_slice(&std::fs::read(car_dir.join("physics.json")).ok()?).ok()?;
+    if enabled() {
+        patch(&mut p, &read_doc(assets, car), chosen);
+    }
+    let r = fh1_engine::pi::compute(&p, cfg).map_err(|e| bevy::log::warn!("{car}: PI: {e:#}")).ok()?;
+    CACHE.get_or_init(Default::default).lock().ok()?.insert(key, r.clone());
+    Some(r)
+}
+
 /// Remember that the car owns option `i` of `part` (after a successful spend).
 pub fn record_owned(part: &Part, i: usize, owned: &mut OwnedParts) {
     if let Some(&(id, ..)) = part.options.get(i) {

@@ -71,16 +71,19 @@ const FH1_CLASSES: [(&str, f64, f64); 11] = [
     ("U", 1.0, 999.0),
 ];
 
-/// Normalised PI -> the game's 100..999 display scale (linear between class bounds).
+/// Normalised PI -> the number the game shows (fh1_engine::pi::display_pi, default.xex 82BE0378, VERIFIED by 47): class F
+/// shows 99; class i >= 1 maps linearly onto [MaxDisplay(i-1) + 1, MaxDisplay(i)] with truncation.
 fn fh1_display_pi(pi: f64) -> i64 {
-    let (mut lo, mut lo_d) = (0.0, 0.0);
-    for &(_, hi, hi_d) in &FH1_CLASSES {
-        if pi <= hi {
-            return (lo_d + (pi - lo) / (hi - lo).max(1e-9) * (hi_d - lo_d)).round() as i64;
-        }
-        (lo, lo_d) = (hi, hi_d);
+    let p = pi.clamp(0.0, 1.0);
+    let Some(i) = FH1_CLASSES.iter().position(|c| p <= c.1) else { return 999 };
+    if i == 0 {
+        return FH1_CLASSES[0].2 as i64;
     }
-    999
+    let (lo_pi, lo_d) = (FH1_CLASSES[i - 1].1, FH1_CLASSES[i - 1].2 as i64 + 1);
+    let (hi_pi, hi_d) = (FH1_CLASSES[i].1, FH1_CLASSES[i].2 as i64);
+    let t = (p - lo_pi) / (hi_pi - lo_pi).max(1e-12);
+    let v = (t * (hi_d + 1 - lo_d) as f64 + lo_d as f64) as i64;
+    if v < lo_d { lo_d } else { v.min(hi_d) }
 }
 
 fn drive_name(id: Option<i64>) -> &'static str {
@@ -1466,6 +1469,9 @@ mod tests {
         assert_eq!(fh1_display_pi(0.81), 700);
         // FER_250GTO_64: between C (0.5975 -> 400) and B (0.6505 -> 500).
         assert_eq!(fh1_display_pi(0.617993), 439);
+        // Class F always 99; U (raw 1.0) 999.
+        assert_eq!(fh1_display_pi(0.003), 99);
+        assert_eq!(fh1_display_pi(1.0), 999);
     }
 
     fn car(index: usize, game: &str, maker: &str, name: &str, class: &str, pi: i64) -> CarEntry {

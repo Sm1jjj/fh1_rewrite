@@ -247,7 +247,8 @@ impl Plugin for ProgressionPlugin {
             .add_systems(Update, (apply_results, update_catalog).chain())
             .add_systems(Update, (screen::career_input, screen::draw_career).chain().after(update_catalog))
             .add_systems(Update, (skill::detect_skills.run_if(crate::ui::driving), skill::draw_skill_hud).chain())
-            .add_systems(Update, tick_banners);
+            .add_systems(Update, tick_banners)
+            .add_systems(Update, update_player_build.before(update_catalog));
     }
 }
 
@@ -362,9 +363,45 @@ pub fn fmt_num(n: i64) -> String {
     }
 }
 
-/// The player's car class (CarClasses id) and PI, if the car is an FH1 car with gamedb data.
+/// The player's car class (CarClasses id) and PI, if the car is an FH1 car with gamedb data. For the player's car this is
+/// its CURRENT build (P10: upgrades from the garage, 47's `pi_preview`; the game rewrites the garage car's ClassID / PI
+/// on upgrade, 82546650), so race class matching and the career screen follow the upgrades. `FH1_CLASS_BUILD=0` = the
+/// stock class / PI from gamedb (old).
 pub fn player_class(c: &data::CareerData, media: &str) -> Option<(u32, u32)> {
+    if let Some(Some((class, pi))) = BUILD.lock().ok().and_then(|b| b.as_ref().filter(|b| b.0 == media).map(|b| b.2)) {
+        return Some((class, pi));
+    }
     c.cars.get(media).map(|i| (i.class, i.pi))
+}
+
+/// The player car's build: (car, chosen upgrades, its class / PI), recomputed only when the car or its upgrades change.
+static BUILD: std::sync::Mutex<Option<(String, std::collections::BTreeMap<String, i64>, Option<(u32, u32)>)>> = std::sync::Mutex::new(None);
+
+fn class_build_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_CLASS_BUILD").map_or(true, |v| v != "0"))
+}
+
+/// Keeps [`BUILD`] on the player's car and its garage upgrades (pi_preview is cached per (car, parts); a few ms the first
+/// time, only when something changed).
+fn update_player_build(cars: Query<&crate::Car>, garage: Option<Res<crate::Garage>>, looks: Option<Res<crate::ui::customize::CarLooks>>) {
+    if !class_build_on() {
+        return;
+    }
+    let (Some(car), Some(garage)) = (cars.iter().next(), garage) else { return };
+    let media = &car.0.data.media_name;
+    let empty = std::collections::BTreeMap::new();
+    let ups = looks.as_ref().and_then(|l| l.get(media)).map_or(&empty, |l| &l.upgrades);
+    let Ok(mut b) = BUILD.lock() else { return };
+    if b.as_ref().is_some_and(|(m, u, _)| m == media && u == ups) {
+        return;
+    }
+    let dir = garage.assets.join("cars").join(media);
+    let r = crate::ui::customize_upgrades::pi_preview(&garage.assets, &dir, media, ups).map(|r| (r.class_index as u32, r.display_pi));
+    if let Some((class, pi)) = r {
+        info!("progression: {media} build class {class} PI {pi} ({} upgrade slots)", ups.len());
+    }
+    *b = Some((media.clone(), ups.clone(), r));
 }
 
 /// Popularity board: AIPlayers by rank (index 0 = #1). Nemesis drivers at the top (Gold first), then the rest by

@@ -19,6 +19,10 @@
 //! - `rims.json`: `[{id, media_name, name, maker, mass, price, type, exception}]`, aftermarket rims whose folder the
 //!   cars group installs (`cars/wheels/<MediaName>`).
 //! - `special_colors.json`: `[{id, name, finish, primary, secondary, two_tone: [scale, bias, power]}]`.
+//! - `pi.json` (upgrades-3): `physics.zip/PI.xml` for the PI calculator (fh1-engine pi.rs, docs/PI.md): `{min_time,
+//!   max_time, track_width, corner_scale, straight_scale, lap_scale: [FWD, RWD, AWD], gears_mph: [..], track:
+//!   [{straight, radius, angle}]}`.
+//! - `car_classes.json`: CarClasses rows `[{id, max_pi, max_display, letter}]` (letter from BadgeTexturePathPrefix).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -146,7 +150,59 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
         })
         .collect();
     std::fs::write(out.join("special_colors.json"), serde_json::to_vec_pretty(&specials)?)?;
+    pi_tables(disc, &db, out)?;
     println!("[upgrades] {written} cars, {} aftermarket rims, {} special colours", rims.len(), specials.len());
+    Ok(())
+}
+
+/// `pi.json` (PI.xml) and `car_classes.json` for the engine's PI calculator (docs/PI.md).
+fn pi_tables(disc: &Path, db: &Connection, out: &Path) -> Result<()> {
+    let mut ar = fh1_formats::zip::Archive::open(disc.join("media/physics.zip")).context("media/physics.zip")?;
+    let e = ar.entries.iter().find(|e| e.name.eq_ignore_ascii_case("PI.xml")).cloned().context("physics.zip: PI.xml")?;
+    let text = String::from_utf8_lossy(&ar.read(&e)?).into_owned();
+    let doc = crate::xml::to_json(text.trim_start_matches('\u{feff}'))?;
+    let pi = &doc["PI"];
+    let misc = &pi["Misc"];
+    let three = |k: &str| json!([misc[format!("FWD{k}")], misc[format!("RWD{k}")], misc[format!("AWD{k}")]]);
+    // A single child element is an object, several an array (xml::to_json).
+    let list = |v: &Value| -> Vec<Value> {
+        match v {
+            Value::Array(a) => a.clone(),
+            Value::Null => Vec::new(),
+            other => vec![other.clone()],
+        }
+    };
+    let gears: Vec<Value> = list(&pi["Gears"]["Gear"]).iter().map(|g| g["RedlineSpeedMPH"].clone()).collect();
+    let track: Vec<Value> = list(&pi["Track"]["Segment"])
+        .iter()
+        .map(|s| json!({"straight": s["StraightLengthMeters"], "radius": s["CornerRadiusMeters"], "angle": s["CornerAngleDegrees"]}))
+        .collect();
+    let segments = track.len();
+    let cfg = json!({
+        "min_time": misc["MinPITimeSeconds"],
+        "max_time": misc["MaxPITimeSeconds"],
+        "track_width": misc["TrackWidthMeters"],
+        "corner_scale": three("AccelFrictionScaleWhileCornering"),
+        "straight_scale": three("AccelFrictionScaleWhileStraight"),
+        "lap_scale": three("LapTimeScale"),
+        "gears_mph": gears,
+        "track": track,
+    });
+    std::fs::write(out.join("pi.json"), serde_json::to_vec_pretty(&cfg)?)?;
+    let classes: Vec<Value> = rows(db, "SELECT Id, MaxPerformanceIndex, MaxDisplayPerformanceIndex, BadgeTexturePathPrefix FROM CarClasses ORDER BY Id", [])?
+        .into_iter()
+        .map(|r| {
+            let badge = r["BadgeTexturePathPrefix"].as_str().unwrap_or("");
+            json!({
+                "id": r["Id"],
+                "max_pi": r["MaxPerformanceIndex"],
+                "max_display": r["MaxDisplayPerformanceIndex"],
+                "letter": badge.strip_prefix("CLASS_").unwrap_or(badge),
+            })
+        })
+        .collect();
+    std::fs::write(out.join("car_classes.json"), serde_json::to_vec_pretty(&classes)?)?;
+    println!("[upgrades] PI track {segments} segments, {} car classes", classes.len());
     Ok(())
 }
 

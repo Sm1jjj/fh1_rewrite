@@ -2,7 +2,10 @@
 //! props) as GPU-resident geometry + draw records instead of ECS meshes, so the per-frame CPU cost no longer scales with the
 //! ~40k scenery entities.
 //!
-//! CHUNK 1 (this file so far): the data side only, drawing still goes through the ECS meshes.
+//! CHUNK 2: under the flag the scenery parts are NOT ECS meshes any more: `spawn` gives a bare streaming-handle entity
+//! (ChildOf + Visibility + StaticInstance) and `draw.rs` draws every record through the remaster shader (STATIC_WORLD
+//! variant) with Bevy's own bindless RemasterMaterial bind groups. Only opaque / cutout / unlit materials go static
+//! (decals, water, additive stay ECS: they need sorting).
 //! - Geometry: every remaster scenery mesh is packed (vertex pulling, [`VERTEX_WORDS`] words / vertex: position, normal,
 //!   uv0, uv1, uv2, colour) when it is prepared, keyed by its `AssetId<Mesh>`, and freed when that asset goes.
 //! - Instances: a [`StaticInstance`] component on the scenery entity (the entity stays the streaming handle: tiles, LOD
@@ -24,6 +27,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor};
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{Render, RenderApp, RenderSystems};
+
+mod draw;
 
 /// `FH1_STATIC_WORLD=1` (remaster only).
 pub fn on() -> bool {
@@ -62,6 +67,10 @@ pub const FLAG_CASTS: u32 = 1;
 pub const FLAG_MIRRORED: u32 = 2;
 /// The record is live (a freed slot has 0).
 pub const FLAG_LIVE: u32 = 4;
+/// Geometry / record flags: alpha-tested (cutout) material, double-sided material, hidden (parent Visibility).
+pub const FLAG_MASK: u32 = 8;
+pub const FLAG_TWO_SIDED: u32 = 16;
+pub const FLAG_HIDDEN: u32 = 32;
 
 /// What a scenery entity draws (main world): its slot in the record buffer.
 #[derive(Component, Debug)]
@@ -95,12 +104,14 @@ enum Op {
     AddInstance { slot: u32, mesh: AssetId<Mesh>, material: UntypedAssetId, record: GpuRecord },
     RemoveInstance(u32),
     SetTag(u32, i32),
+    SetHidden(u32, bool),
 }
 
 /// Main-world bookkeeping: packed geometry ids and free instance slots.
 #[derive(Default)]
 struct MainState {
-    geometry: std::collections::HashSet<AssetId<Mesh>>,
+    /// Packed geometry and its flags (FLAG_MASK / FLAG_TWO_SIDED).
+    geometry: HashMap<AssetId<Mesh>, u32>,
     next_slot: u32,
     free_slots: Vec<u32>,
     ops: Vec<Op>,
@@ -152,10 +163,11 @@ pub fn pack_mesh(mesh: &Mesh) -> Option<Packed> {
     pack(mesh).map(|(vertices, indices)| Packed { vertices, indices })
 }
 
-/// Registers packed geometry for mesh asset `id` (once; later calls for the same id are ignored).
-pub fn add_packed(id: AssetId<Mesh>, p: Packed) {
+/// Registers packed geometry for mesh asset `id` (once; later calls for the same id are ignored). `flags`: FLAG_MASK /
+/// FLAG_TWO_SIDED of its material.
+pub fn add_packed(id: AssetId<Mesh>, p: Packed, flags: u32) {
     with(|s| {
-        if !s.geometry.insert(id) {
+        if s.geometry.insert(id, flags).is_some() {
             return;
         }
         s.stats.geometries += 1;
@@ -167,20 +179,19 @@ pub fn add_packed(id: AssetId<Mesh>, p: Packed) {
 
 /// Whether `id` has packed geometry.
 pub fn has_geometry(id: AssetId<Mesh>) -> bool {
-    on() && with(|s| s.geometry.contains(&id))
+    on() && with(|s| s.geometry.contains_key(&id))
 }
 
 /// Adds an instance; returns the component for its entity (None when off or the mesh isn't packed).
 pub fn add_instance(d: InstanceDesc) -> Option<StaticInstance> {
-    if !on() || !has_geometry(d.mesh) {
-        return None;
-    }
+    let geo_flags = if on() { with(|s| s.geometry.get(&d.mesh).copied()) } else { None };
+    let geo_flags = geo_flags?;
     let (wmin, wmax) = world_bounds(d.transform, d.local_min, d.local_max);
     let t = d.transform.transpose();
     let rows = [t.x_axis.to_array(), t.y_axis.to_array(), t.z_axis.to_array()];
     let lod = d.range.map_or([-2.0, -1.0, 1.0e7, 2.0e7], |(s, e)| [s.start, s.end, e.start, e.end]);
     let mirrored = d.transform.determinant() < 0.0;
-    let flags = FLAG_LIVE | if d.casts { FLAG_CASTS } else { 0 } | if mirrored { FLAG_MIRRORED } else { 0 };
+    let flags = FLAG_LIVE | geo_flags | if d.casts { FLAG_CASTS } else { 0 } | if mirrored { FLAG_MIRRORED } else { 0 };
     let record = GpuRecord { rows, aabb_min: wmin.extend(0.0).to_array(), aabb_max: wmax.extend(0.0).to_array(), lod, flags, tag: d.tag, ..default() };
     let slot = with(|s| {
         let slot = s.free_slots.pop().unwrap_or_else(|| {
@@ -194,10 +205,27 @@ pub fn add_instance(d: InstanceDesc) -> Option<StaticInstance> {
     Some(StaticInstance(slot))
 }
 
-/// Zone fade dither level of an instance.
-pub fn set_tag(i: &StaticInstance, level: i32) {
+/// Zone fade dither level of an instance (record slot).
+pub fn set_tag(slot: u32, level: i32) {
     if on() {
-        with(|s| s.ops.push(Op::SetTag(i.0, level)));
+        with(|s| s.ops.push(Op::SetTag(slot, level)));
+    }
+}
+
+/// Spawns the streaming-handle entity of a static scenery part under `parent` (no Mesh3d: the static world draws it).
+/// None when the part isn't static (off, not packed, or a sorted material): spawn the ECS mesh instead.
+pub fn spawn(commands: &mut Commands, parent: Entity, d: InstanceDesc) -> Option<(Entity, u32)> {
+    let i = add_instance(d)?;
+    let slot = i.0;
+    let e = commands.spawn((ChildOf(parent), Visibility::Inherited, i)).id();
+    Some((e, slot))
+}
+
+/// Parent visibility (zone switches, tiles being placed, retired roots, P2 A/B) -> the record's hidden flag.
+fn sync_visibility(q: Query<(&StaticInstance, &InheritedVisibility), Changed<InheritedVisibility>>) {
+    let mut ops: Vec<Op> = q.iter().map(|(i, v)| Op::SetHidden(i.0, !v.get())).collect();
+    if !ops.is_empty() {
+        with(|s| s.ops.append(&mut ops));
     }
 }
 
@@ -251,7 +279,7 @@ fn free_geometry(mut events: MessageReader<AssetEvent<Mesh>>) {
     for e in events.read() {
         if let AssetEvent::Removed { id } = e {
             let gone = with(|s| {
-                let had = s.geometry.remove(id);
+                let had = s.geometry.remove(id).is_some();
                 if had {
                     s.stats.geometries = s.stats.geometries.saturating_sub(1);
                 }
@@ -284,10 +312,11 @@ pub fn plugin(app: &mut App) {
     if !on() {
         return;
     }
-    info!("static world: ON (P12 chunk 1: data only, drawing still through the ECS meshes)");
-    app.add_systems(Last, (free_geometry, log_stats));
+    info!("static world: ON (P12 chunk 2: scenery drawn from the GPU arena, no culling yet, no scenery shadows)");
+    app.add_systems(Last, (free_geometry, log_stats)).add_systems(PostUpdate, sync_visibility.after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate));
     if let Some(ra) = app.get_sub_app_mut(RenderApp) {
         ra.init_resource::<Arena>().add_systems(Render, apply_ops.in_set(RenderSystems::PrepareResources));
+        draw::plugin(ra);
     }
 }
 
@@ -368,6 +397,7 @@ impl WordBuffer {
                     queue.submit([enc.finish()]);
                 }
                 self.buffer = Some(new);
+                GROWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.alloc.alloc(n).expect("grown")
             }
         };
@@ -379,6 +409,9 @@ impl WordBuffer {
         start
     }
 }
+
+/// Bumped when the vertex / index buffer is re-created (draw bind group rebuild).
+static GROWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn bytemuck_words(w: &[u32]) -> &[u8] {
     // SAFETY: u32 has no padding; any byte view of it is valid.
@@ -401,10 +434,17 @@ pub struct Arena {
     indices: WordBuffer,
     geometry: HashMap<AssetId<Mesh>, GeoRange>,
     /// CPU copy of every record slot (uploaded per changed slot) and the slots' meshes / materials.
-    records: Vec<GpuRecord>,
-    slot_mesh: Vec<Option<(AssetId<Mesh>, UntypedAssetId)>>,
-    record_buffer: Option<Buffer>,
+    pub(crate) records: Vec<GpuRecord>,
+    pub(crate) slot_mesh: Vec<Option<(AssetId<Mesh>, UntypedAssetId)>>,
+    pub(crate) record_buffer: Option<Buffer>,
     record_cap: u32,
+    /// Material bind group (bindless slab) per slot, once resolved; slots waiting for their material's binding.
+    pub(crate) slot_group: Vec<Option<u32>>,
+    pub(crate) pending: Vec<u32>,
+    /// Records / buffers changed since the draw lists were built (draw.rs).
+    pub(crate) dirty: bool,
+    /// Bumped whenever a GPU buffer is re-created (the draw bind group must be rebuilt).
+    pub(crate) buffers_generation: u32,
 }
 
 impl Default for Arena {
@@ -417,12 +457,24 @@ impl Default for Arena {
             slot_mesh: Vec::new(),
             record_buffer: None,
             record_cap: 0,
+            slot_group: Vec::new(),
+            pending: Vec::new(),
+            dirty: false,
+            buffers_generation: 0,
         }
     }
 }
 
 impl Arena {
-    fn write_record(&mut self, device: &RenderDevice, queue: &RenderQueue, slot: u32) {
+    pub(crate) fn vertex_buffer(&self) -> Option<&Buffer> {
+        self.vertices.buffer.as_ref()
+    }
+
+    pub(crate) fn index_buffer(&self) -> Option<&Buffer> {
+        self.indices.buffer.as_ref()
+    }
+
+    pub(crate) fn write_record(&mut self, device: &RenderDevice, queue: &RenderQueue, slot: u32) {
         let need = slot + 1;
         if need > self.record_cap || self.record_buffer.is_none() {
             let cap = need.max(self.record_cap + self.record_cap / 2).max(16384);
@@ -435,6 +487,7 @@ impl Arena {
             // Re-upload every record (rare: growth).
             self.record_buffer = Some(new);
             self.record_cap = cap;
+            self.buffers_generation += 1;
             if let Some(b) = &self.record_buffer {
                 let bytes = records_bytes(&self.records);
                 if !bytes.is_empty() {
@@ -457,10 +510,15 @@ fn records_bytes(r: &[GpuRecord]) -> &[u8] {
 /// Applies the main world's ops (render world, once per frame).
 fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<RenderQueue>) {
     let ops = with(|s| std::mem::take(&mut s.ops));
+    let grown = GROWN.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if grown > 0 {
+        arena.buffers_generation += grown;
+    }
     if ops.is_empty() {
         return;
     }
     let a = &mut *arena;
+    a.dirty = true;
     for op in ops {
         match op {
             Op::AddGeometry { mesh, vertices, indices } => {
@@ -480,7 +538,10 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                 if a.records.len() <= s {
                     a.records.resize(s + 1, GpuRecord::default());
                     a.slot_mesh.resize(s + 1, None);
+                    a.slot_group.resize(s + 1, None);
                 }
+                a.slot_group[s] = None;
+                a.pending.push(slot);
                 if let Some(g) = a.geometry.get(&mesh) {
                     record.first_index = g.first_index;
                     record.index_count = g.index_count;
@@ -496,12 +557,23 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                 if let Some(r) = a.records.get_mut(slot as usize) {
                     *r = GpuRecord::default();
                     a.slot_mesh[slot as usize] = None;
+                    a.slot_group[slot as usize] = None;
                     a.write_record(&device, &queue, slot);
                 }
             }
             Op::SetTag(slot, level) => {
                 if let Some(r) = a.records.get_mut(slot as usize) {
                     r.tag = level;
+                    a.write_record(&device, &queue, slot);
+                }
+            }
+            Op::SetHidden(slot, hidden) => {
+                if let Some(r) = a.records.get_mut(slot as usize) {
+                    if hidden {
+                        r.flags |= FLAG_HIDDEN;
+                    } else {
+                        r.flags &= !FLAG_HIDDEN;
+                    }
                     a.write_record(&device, &queue, slot);
                 }
             }

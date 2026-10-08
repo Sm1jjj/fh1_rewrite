@@ -50,6 +50,13 @@ pub struct FieldCtx<'a> {
     pub difficulty: usize,
 }
 
+/// The player's class / PI (current build) and drive type for the class match.
+pub(crate) struct PlayerPi {
+    class: u32,
+    pi: u32,
+    drive: u32,
+}
+
 /// Up to `count` opponents, grid slot order; plus a note for the HUD when the field was changed.
 pub fn build(def: &RaceDef, ctx: &FieldCtx, count: usize) -> (Vec<FieldEntry>, Option<String>) {
     let c = ctx.career;
@@ -91,8 +98,12 @@ pub fn build(def: &RaceDef, ctx: &FieldCtx, count: usize) -> (Vec<FieldEntry>, O
         .collect();
     let mut note = None;
 
-    // Class match.
-    let player = c.cars.get(ctx.player_car);
+    // Class match against the player's CURRENT build (P10: upgrades change the class / PI, as the game rewrites the
+    // garage car's ClassID / PI on upgrade, 82546650); drive type from the car's data.
+    let player = c.cars.get(ctx.player_car).map(|i| {
+        let (class, pi) = crate::progression::player_class(c, ctx.player_car).unwrap_or((i.class, i.pi));
+        super::field::PlayerPi { class, pi, drive: i.drive }
+    });
     if let (true, Some(pi), Some(target)) = (flag("FH1_AI_FIELD"), player, def.target_class) {
         if pi.class != target && !out.is_empty() {
             let mut pool: Vec<(&String, u32)> = c

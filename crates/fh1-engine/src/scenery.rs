@@ -218,6 +218,8 @@ struct ZoneModel {
 struct ZoneLoaded {
     parent: Entity,
     children: Vec<Entity>,
+    /// P12: static-world record slots of the children drawn by the static world (zone fades write their tag).
+    statics: Vec<u32>,
     /// Whether the parent is shown (Visibility::Inherited), and the fade (0 = gone, 1 = fully drawn).
     visible: bool,
     alpha: f32,
@@ -605,17 +607,22 @@ fn start_zone_model(commands: &mut Commands, sc: &mut Scenery, z: &mut Zones, n:
 fn spawn_zone_model(commands: &mut Commands, sc: &mut Scenery, cast: bool, fade_s: f32, parts: Vec<(Handle<Mesh>, BatchMaterial)>) -> ZoneLoaded {
     let parent = commands.spawn((Transform::IDENTITY, Visibility::Hidden, crate::ui::world_load::WorldEntity)).id();
     let mut children = Vec::new();
+    let mut statics = Vec::new();
     for (mesh, material) in &parts {
         sc.p2.spawned += 1;
         STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         sc.budget = sc.budget.saturating_sub(1);
+        let range = (fade_s > 0.0).then(zone_fade_range);
+        if let Some((e, slot)) = sc.static_spawn(commands, parent, mesh, material, Mat4::IDENTITY, range.as_ref(), cast, if fade_s > 0.0 { -16 } else { 0 }) {
+            children.push(e);
+            statics.push(slot);
+            continue;
+        }
         let e = material.spawn(commands, mesh.clone(), Transform::IDENTITY, parent);
         // Category tag for the perf CSV (perf/record.rs) and the P2 stats.
         commands.entity(e).insert(p2::ZoneMesh);
         no_cpu_cull(commands, e);
         sc.static_bounds(commands, e, mesh);
-        let range = (fade_s > 0.0).then(zone_fade_range);
-        sc.static_instance(commands, e, mesh, material, Mat4::IDENTITY, range.as_ref(), cast, if fade_s > 0.0 { -16 } else { 0 });
         if !cast {
             commands.entity(e).insert(bevy::light::NotShadowCaster);
         }
@@ -625,7 +632,7 @@ fn spawn_zone_model(commands: &mut Commands, sc: &mut Scenery, cast: bool, fade_
         }
         children.push(e);
     }
-    ZoneLoaded { parent, children, visible: false, alpha: 0.0, level: -16, parts }
+    ZoneLoaded { parent, children, statics, visible: false, alpha: 0.0, level: -16, parts }
 }
 
 fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Time, meshes: &mut Assets<Mesh>, materials: &mut Assets<StandardMaterial>, fx: &mut FxParams) {
@@ -848,6 +855,9 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
                     l.level = level;
                     for &c in &l.children {
                         commands.entity(c).insert(zone_fade_tag(level));
+                    }
+                    for &slot in &l.statics {
+                        fh1_remaster::static_world::set_tag(slot, if level == 0 { 0 } else { level });
                     }
                 }
             }
@@ -1075,25 +1085,26 @@ fn static_aabb_on() -> bool {
 }
 
 impl Scenery {
-    /// P12 static world (FH1_STATIC_WORLD=1): mirrors a remaster scenery entity into the static world's draw records. The
-    /// entity stays the streaming handle; its `StaticInstance` frees the record when it is despawned.
+    /// P12 static world (FH1_STATIC_WORLD=1): spawns a static scenery part as a bare streaming handle under `parent` (the
+    /// static world draws it; its `StaticInstance` frees the record on despawn). None = not static (off, not packed, a
+    /// sorted material): spawn the ECS mesh as before.
     #[allow(clippy::too_many_arguments)]
-    fn static_instance(
+    fn static_spawn(
         &self,
         commands: &mut Commands,
-        e: Entity,
+        parent: Entity,
         mesh: &Handle<Mesh>,
         material: &BatchMaterial,
         transform: Mat4,
         range: Option<&bevy::camera::visibility::VisibilityRange>,
         casts: bool,
         tag: i32,
-    ) {
-        let BatchMaterial::Remaster(h) = material else { return };
+    ) -> Option<(Entity, u32)> {
+        let BatchMaterial::Remaster(h) = material else { return None };
         if !fh1_remaster::static_world::on() {
-            return;
+            return None;
         }
-        let Some(a) = self.aabbs.get(&mesh.id()) else { return };
+        let a = self.aabbs.get(&mesh.id())?;
         let (c, he) = (Vec3::from(a.center), Vec3::from(a.half_extents));
         let desc = fh1_remaster::static_world::InstanceDesc {
             mesh: mesh.id(),
@@ -1105,9 +1116,7 @@ impl Scenery {
             casts,
             tag,
         };
-        if let Some(i) = fh1_remaster::static_world::add_instance(desc) {
-            commands.entity(e).insert(i);
-        }
+        fh1_remaster::static_world::spawn(commands, parent, desc)
     }
 
     /// Inserts `mesh`'s precomputed bounds + `NoAutoAabb` on static scenery entity `e` (`static_aabb_on`).
@@ -1142,12 +1151,31 @@ impl Scenery {
         fx: &mut FxParams,
     ) -> Vec<(Handle<Mesh>, BatchMaterial)> {
         let mut out: Vec<(Mesh, BatchMaterial)> = Vec::new();
+        // P12 static world: per remaster material, the record flags of the parts that may go static (opaque / cutout /
+        // unlit; decals, water and additive need sorting and stay ECS meshes).
+        let mut static_flags: HashMap<bevy::asset::UntypedAssetId, u32> = HashMap::new();
         match data {
             TileData::Fx(batches) => {
                 for b in batches {
                     if b.flags & STANDIN == 0 {
                         match fx.remaster.batch(&self.dir, b.material) {
                             fh1_remaster::scenery::RemasterBatch::Material(m, _) => {
+                                if fh1_remaster::static_world::on() {
+                                    use fh1_remaster::material::Class;
+                                    use fh1_remaster::static_world::{FLAG_MASK, FLAG_TWO_SIDED};
+                                    if let Some((class, two)) = fx.remaster.record_info(&self.dir, b.material) {
+                                        let side = if two { FLAG_TWO_SIDED } else { 0 };
+                                        match class {
+                                            Class::Opaque | Class::Unlit => {
+                                                static_flags.insert(m.id().untyped(), side);
+                                            }
+                                            Class::Cutout => {
+                                                static_flags.insert(m.id().untyped(), FLAG_MASK | side);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                                 out.push((fh1_remaster::scenery::prepare_mesh(b.mesh), BatchMaterial::Remaster(m)));
                                 continue;
                             }
@@ -1216,10 +1244,11 @@ impl Scenery {
                 let aabb = mesh.compute_aabb();
                 self.spend_mesh(&mesh);
                 // P12 static world (FH1_STATIC_WORLD=1): remaster scenery geometry packed into the GPU arena.
-                let packed = if matches!(m, BatchMaterial::Remaster(_)) { fh1_remaster::static_world::pack_mesh(&mesh) } else { None };
+                let flags = static_flags.get(&m.id()).copied();
+                let packed = flags.and_then(|f| fh1_remaster::static_world::pack_mesh(&mesh).map(|p| (p, f)));
                 let h = meshes.add(mesh);
-                if let Some(p) = packed {
-                    fh1_remaster::static_world::add_packed(h.id(), p);
+                if let Some((p, f)) = packed {
+                    fh1_remaster::static_world::add_packed(h.id(), p, f);
                 }
                 if let Some(a) = aabb {
                     self.aabbs.insert(h.id(), a);
@@ -1741,9 +1770,15 @@ fn spawn_level(
             (true, m) => sc.props.mirrored(&m, &mut fx.materials),
             (false, m) => m,
         };
+        if let Some((id, _)) = sc.static_spawn(commands, parent, mesh, &material, e.m, Some(&range), !e.small, 0) {
+            sc.p2.spawned += 1;
+            STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            sc.budget = sc.budget.saturating_sub(1);
+            out.push(id);
+            continue;
+        }
         let id = material.spawn(commands, mesh.clone(), t, parent);
         sc.static_bounds(commands, id, mesh);
-        sc.static_instance(commands, id, mesh, &material, e.m, Some(&range), !e.small, 0);
         sc.p2.spawned += 1;
         STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         sc.budget = sc.budget.saturating_sub(1);
@@ -2061,10 +2096,12 @@ pub fn stream(
         if let Some(data) = block_on(future::poll_once(task)).flatten() {
             let parent = commands.spawn((Transform::IDENTITY, Visibility::default(), crate::ui::world_load::WorldEntity)).id();
             for (mesh, material) in sc.prepare(data, &mut meshes, &mut materials, &mut fx) {
+                if sc.static_spawn(&mut commands, parent, &mesh, &material, Mat4::IDENTITY, None, true, 0).is_some() {
+                    continue;
+                }
                 let e = material.spawn(&mut commands, mesh.clone(), Transform::IDENTITY, parent);
                 no_cpu_cull(&mut commands, e);
                 sc.static_bounds(&mut commands, e, &mesh);
-                sc.static_instance(&mut commands, e, &mesh, &material, Mat4::IDENTITY, None, true, 0);
             }
             sc.loaded.insert(k, parent);
         }

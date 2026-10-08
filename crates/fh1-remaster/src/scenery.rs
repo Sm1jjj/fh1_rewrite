@@ -185,6 +185,14 @@ impl RemasterScenery {
         RemasterBatch::Material(self.build(track, game_material as usize, false, None, night, materials), class)
     }
 
+    /// P12 static world: (class, double-sided) of a game material's record (None = no remaster record).
+    pub fn record_info(&mut self, scenery_dir: &Path, game_material: u32) -> Option<(Class, bool)> {
+        let track = self.track(scenery_dir)?;
+        let r = self.tracks[track].records.get(game_material as usize)?;
+        let two_sided = r.flags & material::FLAG_TWO_SIDED != 0 || r.class == Class::Water;
+        Some((r.class, two_sided))
+    }
+
     /// The same material with culling flipped, for mirrored placements (negative determinant).
     pub fn mirrored(&mut self, h: &Handle<RemasterMaterial>, materials: &mut Assets<RemasterMaterial>) -> Handle<RemasterMaterial> {
         let Some(&(track, index, m, lm)) = self.origin.get(&h.id()) else { return h.clone() };
@@ -226,6 +234,11 @@ impl RemasterParams<'_> {
             (Some(s), Some(m)) if crate::enabled() => s.batch(scenery_dir, game_material, m),
             _ => RemasterBatch::Faithful,
         }
+    }
+
+    /// See [`RemasterScenery::record_info`].
+    pub fn record_info(&mut self, scenery_dir: &Path, game_material: u32) -> Option<(Class, bool)> {
+        self.scenery.as_mut().and_then(|s| s.record_info(scenery_dir, game_material))
     }
 
     pub fn mirrored(&mut self, h: &Handle<RemasterMaterial>) -> Handle<RemasterMaterial> {
