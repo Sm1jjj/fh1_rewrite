@@ -273,8 +273,19 @@ fn main() -> AppExit {
         .add_systems(Update, objects::teleport.before(scenery::stream))
         .init_resource::<smash::PropCollision>()
         .add_systems(Update, (smash::update.after(scenery::stream), smash::test_drive))
-        .add_systems(Update, autotest)
-        .run()
+        .add_systems(Update, autotest);
+    // Mesh slabs (2026-10-08, 47's analysis of log 133825: the streaming hitches are bevy's allocate_and_free_meshes, which
+    // regrows a slab by x1.5 from 1 MiB = a new buffer + a full copy each time the resident scenery set grows): start at
+    // 32 MiB and double. FH1_MESH_SLAB=0 = Bevy's defaults (1 MiB, x1.5).
+    if !std::env::var("FH1_MESH_SLAB").is_ok_and(|v| v == "0") {
+        if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+            let mut s = bevy::render::mesh::allocator::MeshAllocatorSettings::default();
+            s.min_slab_size = 32 << 20;
+            s.growth_factor = 2.0;
+            render_app.insert_resource(s);
+        }
+    }
+    app.run()
 }
 
 /// Thread pools (2026-10-08 perf, e1): the render thread rose and fell with the main world's load (r = 0.92), because both

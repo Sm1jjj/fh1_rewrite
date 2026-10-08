@@ -159,8 +159,15 @@ impl Chain {
 #[derive(Message, Clone, Debug)]
 pub enum SkillEvent {
     Award { label: String, fame: u32, kind: SkillKind, combo: bool },
-    Banked { value: u64, mult: u32 },
-    Lost { value: u64 },
+    Banked {
+        value: u64,
+        #[allow(dead_code)]
+        mult: u32,
+    },
+    Lost {
+        #[allow(dead_code)]
+        value: u64,
+    },
     /// A skill in progress (every frame while it runs): "DRIFT", "42 m".
     Live { label: String, value_text: String },
 }

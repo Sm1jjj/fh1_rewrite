@@ -51,6 +51,8 @@ pub struct RaceDef {
     pub circuit: bool,
     pub credits: u32,
     pub drivers: u32,
+    /// gamedb Events.TrackID, parsed with the race (not read yet).
+    #[allow(dead_code)]
     pub track_id: u32,
     pub route_file: String,
     pub length_m: f32,
@@ -79,6 +81,7 @@ pub struct RaceDef {
     /// Events.TargetClass (CarClasses id), None = open.
     pub target_class: Option<u32>,
     /// Forced player car (exhibitions / nemesis), RestrictionDescription, prize car (Rewards_EventPrizes), recommended cars.
+    #[allow(dead_code)]
     pub player_car: Option<String>,
     pub restriction: Option<String>,
     pub prize_car: Option<String>,
@@ -308,10 +311,6 @@ impl Default for RaceState {
 }
 
 impl RaceState {
-    pub fn active(&self) -> bool {
-        self.phase != RacePhase::Idle
-    }
-
     /// Seconds the player has been off the route or stuck (the reset hint shows after a while).
     pub fn lost_s(&self) -> f32 {
         self.off_track_s.max(self.stuck_s).max(self.wrong_way_s)

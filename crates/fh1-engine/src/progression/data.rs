@@ -15,6 +15,8 @@ pub struct Wristband {
     pub xp: u64,
     /// XP per finishing place (1st..8th), WristbandScoring.
     pub points: Vec<u32>,
+    /// Parsed with the wristband table (not read yet).
+    #[allow(dead_code)]
     pub rival_mult: f32,
     /// Credits for beating this tier's nemesis.
     pub nemesis_bonus: u32,
@@ -40,6 +42,7 @@ pub struct CarInfo {
     pub class: u32,
     pub pi: u32,
     pub drive: u32,
+    #[allow(dead_code)]
     pub year: u32,
     pub make: String,
     /// Data_Car.DisplayName ("Camaro SS Coupe"), events-4; empty before.

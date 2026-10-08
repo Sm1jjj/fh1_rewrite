@@ -175,8 +175,9 @@ impl Default for Settings {
     }
 }
 
+/// Public: ui/launch.rs `main_menu` (pub) takes it.
 #[derive(Resource)]
-struct SettingsPath(PathBuf);
+pub struct SettingsPath(PathBuf);
 
 /// (map id, display name) for the map picker.
 #[derive(Resource, Default)]

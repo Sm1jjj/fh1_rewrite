@@ -241,6 +241,7 @@ impl CarCatalog {
     }
 
     /// Cars of a game + maker (`None` = all makers) under the class filter, in `sort` order: entry indices.
+    #[allow(dead_code)]
     pub fn cars(&self, game: &str, maker: Option<&str>, class: Option<&str>, sort: Sort) -> Vec<usize> {
         self.cars_by(game, maker, class, None, sort)
     }
@@ -526,12 +527,16 @@ fn hint(pads: &'static [&'static str], keys: &'static str, action: impl Into<Str
 #[derive(Clone, Debug, Default)]
 pub struct BrowserView {
     /// Game strip (LB / RB).
+    // The browser's spawn_view / details panel is written but not wired yet (docs/UI.md): kept on purpose.
+    #[allow(dead_code)]
     pub tabs: Vec<Tab>,
     /// Where you are: `FH2`, `Ferrari`.
     pub crumbs: Vec<String>,
     /// Filters, sort, position.
     pub status: String,
     /// Details panel of the selected row: title and (key, value) lines.
+    // The browser's spawn_view / details panel is written but not wired yet (docs/UI.md): kept on purpose.
+    #[allow(dead_code)]
     pub details: Option<(String, Vec<(String, String)>)>,
     pub hints: Vec<Hint>,
 }
@@ -670,6 +675,7 @@ impl CarBrowser {
         self.catalog.games.get(self.game).cloned().unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub fn class_filter(&self) -> Option<String> {
         self.class.clone()
     }
@@ -1293,11 +1299,13 @@ impl MapBrowser {
 // ---------------------------------------------------------------------------------------------------------------
 
 /// First row of a `visible`-row window around `cursor` (the pause menu's window formula).
+#[allow(dead_code)]
 pub fn window_first(cursor: usize, n: usize, visible: usize) -> usize {
     cursor.saturating_sub(visible / 2).min(n.saturating_sub(visible))
 }
 
 /// Xbox face-button colours for the glyph chips.
+#[allow(dead_code)]
 fn glyph_color(g: &str) -> Color {
     match g {
         "A" => Color::srgb(0.30, 0.66, 0.18),
@@ -1311,7 +1319,8 @@ fn glyph_color(g: &str) -> Color {
 /// Spawns a browser screen under `parent`: game tabs (LB / RB), breadcrumb + status, the row list windowed around
 /// `cursor` beside a details panel, and the button-hint bar. `row_hook(entity, shown_index)` decorates each row (the
 /// pause menu adds its mouse components). `fade` = the main menu's overlay fade components.
-#[allow(clippy::too_many_arguments)]
+// Written but not wired yet (docs/UI.md: the details panel / tabs view): kept on purpose.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn spawn_view(
     commands: &mut Commands,
     parent: Entity,

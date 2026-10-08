@@ -61,6 +61,8 @@ pub enum EventKind {
     Showcase,
     Headline,
     Nemesis,
+    /// No PR-stunt event is built yet (no data); named by the map legend (ui/worldmap.rs).
+    #[allow(dead_code)]
     PrStunt,
     Other,
 }
@@ -120,6 +122,7 @@ pub struct EventInfo {
     pub hub: u8,
     /// Marker, engine space.
     pub pos: Vec3,
+    #[allow(dead_code)]
     pub yaw: f32,
     pub state: EventState,
     /// Credits for a win.
@@ -141,11 +144,6 @@ pub struct EventCatalog {
     pub generation: u32,
 }
 
-impl EventCatalog {
-    pub fn get(&self, id: &str) -> Option<&EventInfo> {
-        self.events.iter().find(|e| e.id.eq_ignore_ascii_case(id))
-    }
-}
 
 /// Map / screens -> race: start this event (teleports to its grid). Ignored for locked events or during a race.
 #[derive(Message, Clone, Debug)]
@@ -164,6 +162,8 @@ pub struct RaceFinished {
     /// 1-based; None = did not finish (no rewards).
     pub place: Option<u32>,
     pub time_s: Option<f32>,
+    /// Field size (not read yet).
+    #[allow(dead_code)]
     pub field: u32,
 }
 
@@ -196,7 +196,11 @@ pub enum CareerNotice {
     EventUnlocked { name: String },
     Wristband { tier: u8 },
     Payout { credits: i64, reason: String },
-    Fame { amount: u64 },
+    Fame {
+        /// Shown on the popularity bar from the profile instead (ui/skillhud.rs); kept for other listeners.
+        #[allow(dead_code)]
+        amount: u64,
+    },
     PrizeCar { car: String },
 }
 
