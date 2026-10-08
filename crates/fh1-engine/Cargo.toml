@@ -32,7 +32,7 @@ fh1-ui = { path = "../fh1-ui" }
 # `trace`: every system run is a tracing span; the stall watchdog (src/perf/watchdog.rs) uses it to name a blocking system.
 bevy = { version = "0.19.1", features = ["trace", "debug"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }  # settings.json `flags` keeps its area order (flags.rs)
 anyhow = "1"
 
 # Stall watchdog: main-thread stack capture (src/perf/stack.rs).

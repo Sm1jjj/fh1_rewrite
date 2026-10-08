@@ -7,15 +7,22 @@
 // Outputs display-linear colour, not exposed by the view (the old rigs' emission x 1.2 x 2^ev100 x view.exposure came
 // to the same), so a flame reads the same at noon and at night.
 
+// Half-res effects pass (fh1-render fx_half_res.rs, FH1_FX_HALF_RES=0 = off): same shader, our own view bindings and
+// world-space vertices (identity get_world_from_local), material at group 1.
+#ifdef FX_HALF_RES
+#import fh1_render::fx_half::{view, globals, get_world_from_local}
+#else
 #import bevy_pbr::mesh_view_bindings::{view, globals}
 #import bevy_pbr::mesh_functions::get_world_from_local
+#endif
 
 struct FlameParams {
     // x = global brightness (FH1_FLAME_BRIGHT), yzw unused.
     k: vec4<f32>,
 }
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> p: FlameParams;
+// Binding 2: the half-res pass's fixed material layout (fx_half_res.rs) has the uniform there.
+@group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> p: FlameParams;
 
 struct In {
     @builtin(instance_index) instance: u32,

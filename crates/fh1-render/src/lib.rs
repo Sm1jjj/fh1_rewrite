@@ -23,6 +23,7 @@ pub mod shadow;
 pub mod sky;
 pub mod glow;
 pub mod particles;
+pub mod fx_half_res;
 pub mod headlight;
 pub mod tod;
 pub mod wheel;
@@ -51,6 +52,7 @@ impl Plugin for Fh1RenderPlugin {
             .add_plugins(wheel::FxWheelPlugin)
             .add_plugins(glow::FxGlowPlugin)
             .add_plugins(particles::FxParticlesPlugin)
+            .add_plugins(fx_half_res::FxHalfResPlugin)
             .add_plugins(headlight::FxHeadlightPlugin)
             .add_systems(PostUpdate, postfx::update_post.after(lighting::update_time_of_day))
             .add_systems(PreStartup, postfx::init_post)

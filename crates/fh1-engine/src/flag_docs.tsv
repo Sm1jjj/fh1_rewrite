@@ -1,0 +1,631 @@
+# FH1_* flag documentation for data/settings.json (section "flags"; build.rs merges it with the scanned flag table).
+# Columns (TAB-separated): NAME, AREA, DEFAULT, WHAT, EFFECT. AREA is one of build.rs AREAS; DEFAULT = on | off | <number> | unset
+# (behaviour when the variable is unset). WHAT = what it does (player-facing), EFFECT = what changes in looks / gameplay / performance.
+# Flags missing here fall back to their code comment. Keep one line per flag, no tabs inside fields.
+FH1_AA	Renderer	unset	Overrides the Options anti-aliasing: off, fxaa, smaa, smaa2x (SMAA on MSAA 2x, the default), msaa2, msaa (4x) or old (leave cameras alone).	Changes edge smoothness versus GPU cost.
+FH1_ABS_SLIP	Drivetrain/assists	unset	Chooses how ABS measures slip: v (road speed, ABS never fires), wr (wheel surface speed), anything else uses the default normalised slip.	Changes ABS pulse behaviour; default matches the original.
+FH1_AERO_ELEMENTS	Vehicle/handling	on	Front bumper and rear wing parts add drag and downforce. Set to 0 to ignore them.	Winged cars get downforce at speed; 0 removes it.
+FH1_AI_AUDIO_DOPPLER	Audio/radio	on	Doppler pitch shift on AI and traffic engine sounds. Set to 0 to disable.	Passing cars change pitch as they go by.
+FH1_AI_AUDIO_VOICES	Audio/radio	4	How many nearby AI and traffic cars get engine sounds at once.	More voices make traffic louder and richer but cost audio CPU.
+FH1_AI_AWARE	AI/traffic/races	on	AI cars pass and follow other cars with side clearance and braking checks. Set to 0 for the older simpler rule.	AI overtakes and traffic following look more natural by default.
+FH1_AI_DEBUG	Perf/logging	off	Set to any value to log driving-line details every frame.	Prints debug lines about the racing line; floods the log.
+FH1_AI_DRAW_DIST	AI/traffic/races	1500	Distance in metres within which AI cars are drawn.	Larger shows AI cars farther away at some performance cost.
+FH1_AI_FIELD	AI/traffic/races	on	Set to 0 to stop matching AI opponents to the event car class.	Off can put mismatched-class cars in the field.
+FH1_AI_FOLLOW_DECEL	AI/traffic/races	6	Braking deceleration in m/s2 that AI cars plan with when closing on a car ahead.	Higher lets AI cars brake later and tailgate closer.
+FH1_AI_GEARS	AI/traffic/races	on	AI cars use their own AI gearbox logic. Set to 0 to use the car's normal automatic.	Changes how AI cars shift and accelerate.
+FH1_AI_GRIP_BASE	AI/traffic/races	1.0	Fraction of its tyre grip the computer drivers will use in corners.	Higher makes AI cars corner faster, lower makes them slower and easier to beat.
+FH1_AI_LANE_HOLD	AI/traffic/races	120	Metres after the start that an AI car keeps its grid lane before moving to the racing line; 0 means straight to the line.	Longer values give a more orderly race start.
+FH1_AI_MERGE_RATE	AI/traffic/races	0.8	Sideways speed in m/s at which AI cars move from their grid lane onto the racing line.	Higher makes AI cars cut over faster after the start.
+FH1_AI_PACE	AI/traffic/races	on	Set to 0 to use the event data raw AI skill without the difficulty-based cap.	Off makes AI faster and tougher in early events.
+FH1_AI_RACE	Dev hooks	unset	Starts an AI-only test race on a given route (format route:count) with no barriers or race rules.	Testing only: spawns AI cars on a route at startup and skips the launch menu.
+FH1_AI_RIVALS	AI/traffic/races	on	Set to 0 to stop placing the named leaderboard rivals above you on the grid.	Off uses anonymous drivers instead of ranked rivals.
+FH1_AI_SKILL_CAP	AI/traffic/races	unset	Number that caps the AI skill id (1 is the fastest); unset follows difficulty: Easy 80, Medium 20, Hard 8, Pro 1.	Lower makes AI drivers faster and harder to beat.
+FH1_AI_SMOKE	Effects	off	Set to 1 to give AI and traffic cars tyre smoke too (default is the player only).	More smoke on screen in races, with some fps cost.
+FH1_AI_TCS	AI/traffic/races	on	AI cars use traction control. Set to 0 to drive them without it.	Without it AI cars spin wheels more and launch worse.
+FH1_AI_TIER_SCALE	AI/traffic/races	on	Set to 0 to stop making AI easier when the event is below your career tier.	Off keeps AI as strong as the event data says on early events.
+FH1_ANGVEL_CLAMP	Vehicle/handling	on	Limits the car rotation speed to 6 rad/s like the original; set to 0 to remove the limit.	Prevents wild spinning; off allows faster spins.
+FH1_ANIM	Scenery/props/zones	on	Set to 0 to turn off animated world objects entirely.	Removes moving props such as animated scenery; slightly lower load.
+FH1_ANIM_ASYNC_IO	Perf/logging	on	Animated objects and their textures load on a background task. Set to 0 to load inside the frame.	Avoids long freezes when new animated objects load.
+FH1_ANIM_CULL	Dev hooks	unset	Debug face culling for animated objects: game uses the game's mode, none draws both sides; default is flipped culling.	Testing only: shows faces that are normally hidden.
+FH1_ANIM_DUMP	Dev hooks	unset	Path prefix; when set, writes the translated animated-object shader code to files there.	Testing only: dumps shader source files to disk.
+FH1_ANIM_FX	Scenery/props/zones	on	Animated world objects use the game's shaders. Set to 0 to use the standard material.	Changes the shading of animated props.
+FH1_ANIM_FX_SKIN	Scenery/props/zones	on	Skinned animated objects use the game's shaders. Set to 0 to draw them with the standard material.	Affects how animated skinned props look.
+FH1_ANIM_LIGHTS	Scenery/props/zones	on	Animated objects emit their lights (glows) near the camera. Set to 0 to disable them.	Lights on moving props such as rides appear or vanish.
+FH1_ANIM_RATE	Perf/logging	on	Throttles the update rate of distant animated objects. Set to 0 to animate everything every frame.	Saves CPU; 0 gives full-rate animation everywhere.
+FH1_ANIM_VIEW	Dev hooks	unset	Moves the camera to view a named animated object (name,distance,height).	Testing only: repositions the camera for inspecting an animated object.
+FH1_ASYNC_WORLD_LOAD	Perf/logging	on	Loads the chosen world data on a background thread; set to 0 to load it on the main thread.	Smoother loading screen; off may freeze the window while loading.
+FH1_ASYNC_WRITES	Perf/logging	on	Set to 0 to write save/log files on the main thread instead of a background writer.	Off can cause small hitches when the game saves or logs.
+FH1_AUDIO	Audio/radio	unset	on forces sound enabled, off silences all game audio and radio; unset plays sound except in automated agent runs.	Turns the entire car audio and radio on or off.
+FH1_AUDIO_ASYNC_PLAYER	Perf/logging	on	Loads the player car's sound on a background task. Set to 0 to load it inside the frame.	Avoids a hitch when the car changes.
+FH1_AUDIO_BURBLE_GATE	Audio/radio	on	Gates overrun burbles on a real throttle lift. Set to 0 for the old trigger.	Burbles occur only after genuine lift-offs.
+FH1_AUDIO_CAPTURE	Dev hooks	unset	File path; when set, the final in-game audio mix is also recorded to it as raw 16-bit stereo.	Testing only: writes a raw audio recording to disk while playing.
+FH1_AUDIO_CHAR	Audio/radio	on	Engine-sound character chain (distortion, exaggerated shift cuts, backfire pops, limiter). Set to 0 for the old clean engine sound.	Engines sound grittier, louder and more aggressive by default; 0 gives the cleaner stock-style mix.
+FH1_AUDIO_DEVICE	Audio/radio	unset	Part of an audio output device name; the game uses the first device whose name contains it instead of following the system default.	Pins sound to a chosen speaker or headset and stops it switching when the Windows default changes.
+FH1_AUDIO_ENGINE	Audio/radio	1.3	Gain of the engine sound layers (1.0 is the original level).	Louder or quieter engine against turbo, tyres and other effects.
+FH1_AUDIO_GRIT	Audio/radio	1.0	Strength of the added engine grit/distortion; 0 is clean, higher is rawer.	Changes how raspy and aggressive engines sound.
+FH1_AUDIO_LFE_FLAT	Audio/radio	on	Flattens the volume envelope of the engine bass layer. Set to 0 to keep the original envelope.	Steadier engine rumble without pulsing.
+FH1_AUDIO_LFE_LOOP	Audio/radio	on	Makes the low-frequency engine rumble layer a seamless loop. Set to 0 for the raw clip with its gap.	Removes a periodic thud in the engine bass.
+FH1_AUDIO_LFE_SHORT	Audio/radio	off	Set to 1 to use the short rumble clip for engines up to 6 cylinders instead of the longer pitched-down 8-cylinder loop.	Changes the low-end rumble character on small engines.
+FH1_AUDIO_LOUD	Audio/radio	0	Extra engine loudness in dB added on top of the character chain.	Makes the engine louder overall; raise it if the car sounds quiet.
+FH1_AUDIO_POPS	Audio/radio	0.6	Level of exhaust pops, burbles and backfire crackle on lift-off and shifts; 0 removes them.	More or fewer pops and burbles when you lift or shift.
+FH1_AUDIO_SKID	Audio/radio	0.45	Volume of tyre roll and skid screech sounds.	Lower for quieter tyre screeching, raise for louder.
+FH1_AUDIO_TURBO	Audio/radio	1.0	Gain of turbo spool and blow-off sounds relative to the game's own levels.	Lower it to hear the raw engine more, raise it for a louder turbo whistle.
+FH1_AUTODRIVE	Dev hooks	off	Set to any value to hold full throttle with a slight steer, with no player input.	Testing only: the car drives itself and the launch menu is skipped.
+FH1_AUTODRIVE_STEER	Dev hooks	0.15	Steering amount (-1 to 1) used by the autodrive test mode.	Testing only: changes how sharply the autodriven car turns.
+FH1_AWD_RADIUS	Drivetrain/assists	on	Weights AWD power split by tyre radius; set to 0 for the older split without it.	Slightly changes how AWD cars divide power between axles.
+FH1_BACKFIRE_BANGS_ONLY	Effects	on	Only loud bangs (upshift cracks, rev-limiter bounces) fire flames; burbles do not. Set to 0 to flame on every audible pop.	Fewer flames; 0 gives flames on small crackles too.
+FH1_BACKFIRE_DEBUG	Dev hooks	off	Set to 1 to draw markers at every exhaust outlet of every car and log their positions.	Testing only: shows red and blue debug markers on cars.
+FH1_BACKFIRE_FX	Effects	on	Exhaust backfire flames and flashes. Set to 0 to turn them off.	No flames from the exhaust on pops and bangs.
+FH1_BACKFIRE_MIN_PROM	Effects	1.5	How far a pop must stand out above the engine loudness before it produces a flame.	Higher means fewer flames, lower means more flames from quiet pops.
+FH1_BACKFIRE_STYLE	Effects	unset	Set to game to use the game's own backfire particles instead of the custom flame effect.	Changes the look of exhaust flames.
+FH1_BACKFIRE_SYNC	Effects	on	Backfire flames are driven only by pops that are actually audible. Set to 0 for the older unsynced triggering.	Flames line up with the pop sounds you hear.
+FH1_BAKED	Static world	on	Set to 0 to ignore pre-baked scenery bundles and stream everything live.	Baked data loads faster; 0 is slower to stream but always uses fresh data.
+FH1_BAKE_CELLS	Dev hooks	unset	Set to 1 (or to a folder path) to run the engine in static-world cell bake mode and write baked cells.	Testing only: a build step that forces the static world on and loads scenery for baking; not for normal play.
+FH1_BATCH	Scenery/props/zones	on	Merges props into per-cell chunks; set to 0 to draw every prop separately.	Better fps with merging; with 0 draw calls and CPU cost go up.
+FH1_BATCH_CELL	Scenery/props/zones	64	Cell size in metres used when merging props into chunks.	Larger cells mean fewer draws but coarser culling; smaller the opposite.
+FH1_BATCH_SHADOW_FINAL	Scenery/props/zones	on	Only each prop's coarsest LOD casts sun shadows; set to 0 so every LOD level casts in its own range.	Fewer shadow draws and better fps; with 0 shadows are drawn from finer LODs.
+FH1_BATCH_SHADOW_LOD	Scenery/props/zones	on	Merged prop chunks cast shadows only within their LOD range; set to 0 to make all chunks cast.	Fewer shadow draws and better fps; with 0 more shadow casters are drawn.
+FH1_BATCH_SMALL_NOCAST	Static world	on	Set to 0 to stop batching small non-shadow-casting scenery together.	Batching lowers draw calls; turning it off may reduce fps in dense areas.
+FH1_BEVY_LIGHTS	Shadows/post/sky	unset	Set to relative to use the old sun/ambient light scaling (noon values scaled by brightness) instead of the game's time-of-day colours.	Lighting on engine-lit objects (e.g. dusk cars) looks brighter or flatter than the default.
+FH1_BODY_CONTACT_FALLBACK	Vehicle/handling	on	Cars without flagged ground-contact points use points from the body bounding box. Set to 0 for none.	Prevents such cars sinking into or scraping the road oddly.
+FH1_BODY_SWEEP	Vehicle/handling	on	Body collision also tests along the car path each tick; set to 0 for the old discrete test.	Fewer cars tunnelling through thin walls at high speed.
+FH1_BOOT_HIDDEN	UI/HUD	on	Keeps the window hidden at boot until the first menu or loading frame is ready; set to 0 to show it immediately.	Avoids a white or blank window flash at startup.
+FH1_BRAKE_LIGHT_ABS	Car paint/models	on	Set to 0 to keep brake lights steady instead of pulsing dark while ABS releases a wheel.	Off gives constant brake lights; default flickers with ABS activity.
+FH1_BRAKE_SCALE	Vehicle/handling	1.0	Multiplier on brake strength; 1.0 is the game's value, higher brakes harder, lower softer.	Changes stopping distances and how easily the wheels lock or ABS kicks in.
+FH1_BRAKE_SOLVE	Vehicle/handling	on	Applies brake torque inside the wheel solver with the game smooth sign; set to 0 for the old lock clamp after the solve.	More accurate braking and ABS behaviour, especially at low speed.
+FH1_CAMERA_EFFECTS	Effects	on	Uses the full camera effect layers from the car data. Set to 0 to use the set without effects.	Changes how much the cameras sway and react.
+FH1_CAMERA_MODE	Dev hooks	unset	Number of the camera view to start in (0-4).	Testing only: starts the game in a chosen camera view.
+FH1_CAM_LOG	Dev hooks	unset	File path; when set, the chase camera writes a log of its state to it.	Testing only: writes camera log data to disk.
+FH1_CARFX	Car paint/models	on	Set to 0 to keep the simple glTF car body instead of the game's own car body shaders (faithful renderer only; the Remaster renderer ignores this).	0 makes cars look flatter and less like the original; no effect in the Remaster renderer.
+FH1_CARFX_AB	Dev hooks	off	Set to 1 to run an automatic A/B comparison toggling the game car shaders during the run.	Testing only: car body look flips back and forth while comparing; faithful renderer only.
+FH1_CARFX_COLOR_SRGB	Car paint/models	on	Set to 0 to decode car paint and shader colours with the old raw/PWL conversion instead of the game's sRGB conversion.	0 shifts car colours (for example the teal glass and the paint hue) away from the original.
+FH1_CARFX_CONST	Dev hooks	unset	Overrides a car material constant as tech:Name=x,y,z,w; entries separated by semicolons, * for all techniques.	Testing only: arbitrary car shader tweaking for debugging.
+FH1_CARFX_CULL	Dev hooks	unset	Overrides face culling per car shader technique as tech:none|flip, comma separated, * for all.	Testing only: can make car parts disappear or turn inside out.
+FH1_CARFX_DL_GATE	Car paint/models	on	Set to 0 to always set the car dynamic-light registers, even when no headlight is on.	No visible change; 0 restores an old register difference from the game (faithful car shaders).
+FH1_CARFX_DUMP	Dev hooks	unset	Path of a file to append JSON dumps of every car shader constant and global to.	Testing only: writes debug data to disk when cars load.
+FH1_CARFX_DUMP_AT	Dev hooks	10	Seconds after start at which the car shader globals are dumped to the FH1_CARFX_DUMP file.	Testing only: timing of a debug dump.
+FH1_CARFX_LENS1	Car paint/models	on	Set to 0 to skip the extra reflection layer on car headlight/taillight glass lenses.	0 removes the glossy reflection on lamp lenses (faithful car shaders).
+FH1_CARFX_LENS_DEPTH	Car paint/models	on	Set to 0 to stop lamp covers writing depth; ab flips it periodically for testing.	0 can bring back lamp covers popping in and out or being painted over by bulb layers.
+FH1_CARFX_LENS_SORT	Car paint/models	off	Set to 1 to enable a special draw order for lamp lenses; ab flips it periodically for comparison.	Experimental lamp ordering with no measured effect; ab is a test mode that flips it every 20 frames.
+FH1_CARFX_LOG	Dev hooks	off	Any value prints one log line per car part with its material, technique and textures, plus car shader globals.	Testing only: spams the log when a car loads.
+FH1_CARFX_ORDER	Car paint/models	on	Set to 0 to stop sorting car parts in file order when drawing transparent parts; ab flips it periodically for testing.	0 can bring back flicker/popping of lamp covers; ab is a test mode.
+FH1_CARFX_PAINT_ALL	Car paint/models	off	Set to 1 to tint every car shader technique with the car's paint colour, as the older code did.	1 can wrongly paint non-body parts (such as trim) in the car colour; default paints body techniques only.
+FH1_CARFX_SKIP	Dev hooks	unset	Comma list of car shader technique names to leave out entirely.	Testing only: hides the car parts using those techniques.
+FH1_CARFX_SWITCH_AT	Dev hooks	unset	Seconds after start at which the game simulates a single press of the next-car key.	Testing only: automatically switches car once for automated runs.
+FH1_CARFX_WGSL	Dev hooks	unset	Folder to write each car shader technique's translated WGSL source into.	Testing only: writes shader files to disk; no visual change.
+FH1_CARFX_WHEELS	Car paint/models	on	Set to 0 to use the basic glTF wheels instead of the game-shaded wheels (also off with FH1_CARFX=0).	Wheels lose the game's rim shading and detail.
+FH1_CARFX_WHEEL_LOD0	Car paint/models	on	Set to 0 to use the lower-detail wheel model instead of the high-detail LOD0 rim.	Rims look less detailed with 0.
+FH1_CAR_ASYNC_LOAD	Perf/logging	on	Set to 0 to load cars in the main update instead of on a background thread.	Off causes longer stalls when swapping or spawning a car.
+FH1_CAR_CSM	Shadows/post/sky	on	Set to 0 to stop the car from casting into the main shadow cascades.	0 removes the car's real-time shadow (the drop shadow still shows) and saves GPU time.
+FH1_CAR_CSM_CULL	Shadows/post/sky	2	Face culling for the car shadow casters: 0 two-sided, 1 cull back faces, 2 cull front faces.	Changes shadow acne on the car body; the default is chosen to avoid it.
+FH1_CAR_CSM_MERGE	Shadows/post/sky	on	Set to 0 to give every car part its own shadow-caster proxy instead of one merged proxy per node.	0 costs many more draws for car shadows (lower fps); same shadow shape.
+FH1_CAR_CSM_NOFFSET	Shadows/post/sky	0.03	Distance in metres car shadow-caster surfaces are pushed inward to cut self-shadowing; 0 disables.	Higher values reduce shadow streaks on the car body but can thin the shadow.
+FH1_CAR_DEBOUNCE	UI/HUD	0.35	Seconds the N/P car-switch keys must rest before the new car is actually loaded (0 loads every car scrolled past).	Higher avoids hitches while cycling cars quickly; 0 loads each car instantly.
+FH1_CAR_DIRT	Effects	on	Set to 0 to stop cars getting dirty from driving.	The car stays clean instead of gathering dirt over distance.
+FH1_CAR_LIGHT_GAME	Car paint/models	on	Set to 0 to stop correcting car lighting constants to match the game's own values.	0 gives the old, slightly different car lighting (faithful car shaders only).
+FH1_CAR_PREFETCH_WAIT	Perf/logging	on	Set to 0 to read car files on the main thread instead of waiting for a background prefetch.	0 can cause freezes of several seconds when cars load; default makes parts appear a few frames later.
+FH1_CAR_REFL	Car reflections	1.0	Multiplier for the strength of environment reflections on game-shaded car bodies; 0 = no reflection.	Higher gives shinier, more mirror-like paint; 0 gives matte paint (faithful car shaders only).
+FH1_CAR_SHADOW_BIAS	Shadows/post/sky	0.3	Extra shadow receiver bias in metres on cars; hides self-shadow crawling on lamps and bumpers.	Lower brings back flickering streaks on the car; higher softens its self-shadowing.
+FH1_CAR_SH_FIT	Car paint/models	0.39,0.65	Two comma-separated multipliers (ambient and directional) on the car's hemispherical ambient lighting.	Higher values brighten the ambient light on car bodies; faithful car shaders only.
+FH1_CAS	Renderer	on	Applies contrast-adaptive sharpening after upscaling; set to 0 to turn it off.	Sharper image when render scale is below 100%; off gives a softer picture.
+FH1_CAS_STRENGTH	Renderer	0.5	Sharpening amount from 0.0 to 1.0 for contrast-adaptive sharpening.	Higher values give a crisper but possibly over-sharpened image.
+FH1_CATALOG_PREFETCH	UI/HUD	on	Builds the car catalog (details panel stats) on a background thread at startup; set to 0 to build it when the menu opens.	Avoids a hitch on first opening the car browser; 0 brings the hitch back.
+FH1_CLASS_BUILD	AI/traffic/races	on	Set to 0 to stop tracking the player car class and upgrade build for race field matching.	Off makes AI fields ignore your car upgrades.
+FH1_CLOUD_T	Dev hooks	unset	Seconds added to the cloud animation clock at start so screenshots match a reference.	Testing only: clouds start at a different position.
+FH1_CLUSTERS	Renderer	off	Set to 1 to re-enable GPU light clustering.	Off by default (saves about 1 ms per frame); on may look identical but costs fps.
+FH1_CREDIT_TOAST	UI/HUD	on	Shows a +N CR notification when you gain credits; set to 0 to hide them.	Fewer on-screen popups when off.
+FH1_CROWD	Scenery/props/zones	unset	0 turns crowds off, all draws every crowd object including event crowds, walkers selects walkers; unset draws the named festival crowds.	Controls how many spectators and walkers are in the world.
+FH1_CROWD_AB	Perf/logging	off	Set to 1 to run an in-process A/B timing comparison of crowd rendering modes.	Testing only: changes crowd rendering while it measures.
+FH1_CROWD_BRIGHTNESS	Scenery/props/zones	1.0	Brightness multiplier for crowd cards.	Makes spectators brighter or darker.
+FH1_CROWD_CARD_LIGHT	Scenery/props/zones	on	Crowd cards are lit by the sun and ambient light. Set to 0 for unlit cards.	Crowds match the time of day; 0 looks flat and bright.
+FH1_CROWD_CELLS	Perf/logging	on	Crowd cards are merged per cell. Set to 0 to draw one card object per spectator.	Merged cells reduce draw overhead; 0 uses more entities.
+FH1_CROWD_FACING_OLD	Scenery/props/zones	off	Set to 1 to use the old model orientation, in which crowd figures showed their backs and walkers walked backwards.	Restores the earlier wrong facing; only for comparison.
+FH1_CROWD_GPU_FIGURES	Perf/logging	on	3D crowd figures are animated on the GPU. Set to 0 for the CPU path.	Faster crowds with less CPU use.
+FH1_CROWD_GPU_WALK	Perf/logging	on	Crowd walkers are moved on the GPU. Set to 0 to walk them on the CPU.	Lower CPU cost for walkers; 0 is the old slower path.
+FH1_CROWD_HEADING_SIGN	Dev hooks	1.0	Sign (1 or -1) applied to crowd card heading; a debug fix for facing.	Testing only: flips which way crowd cards face.
+FH1_CROWD_MERGED	Perf/logging	off	Set to 1 to draw crowd cards per object instead of merged per cell.	Used for performance comparison; more entities.
+FH1_CROWD_MODEL_YAW	Scenery/props/zones	180	Degrees of yaw applied to 3D crowd figures so they face the right way.	Rotates all spectator figures.
+FH1_CROWD_NEAR	Scenery/props/zones	unset	Distance in metres within which crowd members are 3D figures instead of flat cards; default comes from the track settings.	Larger shows more 3D spectators at more cost.
+FH1_CROWD_PRELOAD	Perf/logging	on	Pre-reads crowd model files in the background. Set to 0 to skip.	Fewer hitches when crowds first appear; slightly more memory use.
+FH1_CROWD_SPAWNS	Perf/logging	6	Maximum 3D crowd figures created per frame; 0 means unlimited.	Lower avoids hitches when crowds load; higher fills them in sooner.
+FH1_CUSTOMIZE	UI/HUD	on	Pause menu shows the Garage page (Change car / Customize); set to 0 to go straight to the car list.	Enables or hides the paint, rims and kit customisation menus.
+FH1_DIAG	UI/HUD	unset	Set to 0 to start with the diagnostics overlay hidden (F3 toggles it).	Shows or hides the FPS and resource overlay at startup.
+FH1_DISC	Dev hooks	unset	Path to the extracted game disc folder, used as a fallback source for traffic settings and by data-parsing tests (defaults to the repo disc folder).	Testing only: only matters when converted game data is missing; no change in normal play.
+FH1_DRIVELINE	Drivetrain/assists	1	Reflects engine inertia onto the driven wheels while the clutch is engaged; set to 0 for the old behaviour that ignored it.	Slightly changes acceleration feel and how quickly wheels spin up.
+FH1_DRIVING_LINE_OLD	AI/traffic/races	off	Set to 1 to use the older chevron racing line that slides with the car instead of the game's world-anchored strip.	Changes the look of the driving line on the road.
+FH1_DROPSHADOW	Effects	on	Set to 0 to turn off the soft contact shadow drawn under cars.	0 removes the dark patch under the car, making cars look less grounded.
+FH1_DROPSHADOW_DEBUG	Dev hooks	off	Any value switches the drop shadow to a debug display mode.	Testing only: draws the car drop shadow in a debug visualization.
+FH1_DROPSHADOW_DIST	Effects	80	Distance in metres beyond which other cars' contact shadows are hidden and not updated; 0 = always update.	Higher shows distant car shadows but costs CPU; lower saves performance on traffic and AI cars.
+FH1_DROPSHADOW_GUARD	Perf/logging	on	Set to 0 to rewrite the car drop-shadow mesh and material every frame instead of only when something changed.	0 costs a little CPU each frame; no visual change.
+FH1_DROPSHADOW_LOG	Perf/logging	off	Any value logs car drop-shadow setup details (parts found, triangle counts, peak darkness).	Testing only: log output; no visual change.
+FH1_ECS_MASK_PREPASS	Renderer	off	Set to 1 to put GPU crowd figures and swapped glTF (FxRawStandard) materials back into Bevy's depth prepass.	The prepass only feeds contact shadows; off saves GPU time, but those objects then cast no contact shadows.
+FH1_EDGE_WALLS	Vehicle/handling	on	Set to 0 to remove the invisible walls along unfenced paved road edges.	Without them you can drive off road edges and fall out of the map.
+FH1_ENGINE_DRAG	Drivetrain/assists	on	The newer engine model with drag at the rev limiter and proper engine braking; set to 0 for the old model.	Changes engine braking when lifting off and behaviour at the limiter.
+FH1_ENGINE_ROLL	Vehicle/handling	on	Engine torque rolls the car body like the original; set to 0 to disable.	Body leans when revving or launching; off removes that lean.
+FH1_ENVCUBE	Car reflections	on	Set to 0 to turn off the live reflection cube that updates car reflections as you drive.	Car reflections become static; a bit faster.
+FH1_ENVCUBE_AB	Perf/logging	off	Set to 1 to switch the live reflection cube on and off every 5 seconds and log mean frame time of each.	Testing only: reflections flip on and off while running.
+FH1_ENVCUBE_EVERY	Car reflections	2	Render a reflection cube face only every N-th frame.	Higher saves GPU time but reflections update more slowly.
+FH1_ENVCUBE_FACES	Car reflections	1	Number of cube faces rendered per update (1 to 6).	More faces keep reflections fresher but cost GPU time.
+FH1_ENVCUBE_IDLE	Car reflections	unset	Set to off to switch the reflection camera off on frames with no face (experimental); default keeps it active.	Rarely helps; can cause hitches or worse frame times.
+FH1_ENVCUBE_LIMIT	Car reflections	300	Maximum number of meshes drawn into the reflection cube (default from the track settings).	Higher shows more in reflections but costs more GPU/CPU.
+FH1_ENVCUBE_LOG	Perf/logging	off	Any value logs which big meshes and how many candidates go into the reflection cube.	No visible change; adds log lines.
+FH1_ENVCUBE_MAXR	Car reflections	8000	Maximum bounding radius in metres for scenery drawn into the reflection cube.	Lowering it hides huge backdrop meshes from reflections.
+FH1_ENVCUBE_MINR	Car reflections	2	Minimum bounding radius in metres for scenery to be drawn into the reflection cube.	Raising it drops small objects from reflections for speed.
+FH1_ENVCUBE_PERSIST	Car reflections	on	Set to 0 to use six separate face cameras instead of one persistent camera re-aimed each update.	Same image; 0 can cause extra CPU work and hitches.
+FH1_ENVCUBE_SHOT	Dev hooks	unset	File path (.ppm) to save the six reflection cube faces to after a few seconds.	Testing only: writes an image file.
+FH1_ENVCUBE_SHOT_AT	Dev hooks	3	Seconds after start at which the reflection cube screenshot is taken.	Testing only: only matters with FH1_ENVCUBE_SHOT.
+FH1_ENVCUBE_SIZE	Car reflections	128	Edge size in pixels of the live reflection cube map (16 to 2048).	Larger is sharper car reflections but costs GPU time and memory.
+FH1_ENVCUBE_SIZE_T	Car reflections	0.06	Minimum apparent size (radius over distance) a mesh needs to appear in the reflection cube; default comes from the track settings.	Lower includes more distant objects in reflections at higher cost.
+FH1_EXHAUST_PER_PIPE	Effects	on	One flame per exhaust pipe. Set to 0 to merge pipes closer than 11 cm into one flame.	Twin-pipe cars get a flame from each pipe.
+FH1_FAR	Scenery/props/zones	off	Set to 1 to draw the distant backdrop in the old tile-streaming mode.	Shows far scenery but may add stray pieces near the play area; only relevant when zones are off.
+FH1_FAST_EXIT	Perf/logging	on	Set to 0 to shut down normally instead of ending the process quickly once logs are saved.	Off can make quitting take several seconds with a big world loaded.
+FH1_FFMPEG	Audio/radio	unset	Path to the ffmpeg program used to decode console audio; otherwise ffmpeg on PATH is used.	Only matters when converting game audio during setup.
+FH1_FILE_CACHE	Perf/logging	on	Set to 0 to turn off the in-memory cache of game files read by the renderer.	0 means more disk reads and likely hitches when loading cars and effects.
+FH1_FILE_CACHE_MB	Perf/logging	2048	Size in megabytes of the RAM cache that holds car files (textures, shader settings, models) so spawning a car does not read the disk mid-frame.	Larger keeps more cars in RAM and avoids spawn hitches; smaller saves memory.
+FH1_FLAME_BRIGHT	Effects	1.0	Brightness multiplier of the backfire flame sprites.	Higher gives brighter, bolder flames.
+FH1_FLAME_LIGHT	Effects	on	Flames light up the bumper and road with a brief flash. Set to 0 to disable the flash.	Backfire bangs briefly illuminate the surroundings.
+FH1_FLAME_LIGHT_LM	Effects	300000	Peak brightness (lumens) of the backfire flash light.	Higher makes bang flashes brighter on the road and car.
+FH1_FLAME_STYLE	Effects	unset	Set to old to use the earlier cone-shaped flame meshes instead of the flame shader.	Changes the look of exhaust flames.
+FH1_FOG_TEMPLATE	Dev hooks	unset	Name of a fog template from the track's fog list to force everywhere instead of letting zones pick their own.	Testing only: fog look stays fixed across the whole map.
+FH1_FPS_CAP	Perf/logging	unset	Frames-per-second limit (a number above 1); setting it also turns the frame pacer on.	Caps fps to lower heat/power use or even out pacing.
+FH1_FRAMEPACE	Perf/logging	off	Set to 1 (or ab) to enable the CPU frame pacer that waits to even out frame delivery.	Measured to worsen frame jitter, so it is off; may change smoothness.
+FH1_FRAMETIME	Perf/logging	off	Any value logs mean and max frame time every 2 seconds.	No visible change; adds log lines.
+FH1_FRICTION_TORQUE_MOD	Drivetrain/assists	on	Applies the game's friction-torque modification to tyre yaw torque in Normal steering; set to 0 for unmodified torque.	Changes how much the car rotates or resists rotating when steering hard.
+FH1_FX_DEBUG	Dev hooks	unset	Shader debug: <effect hash hex>:<mode> replaces that effect's output with a debug colour; append +nocull for two-sided draw.	Testing only: one surface type shows debug colours.
+FH1_FX_DECAL_BIAS	Scenery/props/zones	on	Set to 0 to remove the small depth offset given to road decals and other blended track surfaces.	Without it some decals flicker or fight with the road where they face the camera.
+FH1_FX_DUMP	Dev hooks	unset	Path of a shader file that a unit test translates and prints (cargo test only).	Testing only: no effect in the game.
+FH1_FX_HALF_DEPTH_TOL	Effects	0.1	How different in distance (relative) the half-resolution samples may be from a pixel before the blend switches from smooth to nearest-depth at edges.	Higher = smoother but haloes around car and scenery edges; lower = crisper edges but blockier smoke.
+FH1_FX_HALF_FLAMES	Effects	off	Set to 1 to draw the exhaust backfire flames in the half-resolution effects pass too (default: full resolution, they are small and sharp).	1 makes flames softer for a negligible saving.
+FH1_FX_HALF_MIN_SIZE	Effects	0.2	Smallest particle effect (largest quad size in metres) that goes to the half-resolution effects pass; smaller effects (dirt, grass, gravel, leaves, litter, sparks) stay at full resolution.	Lower = more effects soft and cheaper; higher = more effects sharp and costlier.
+FH1_FX_HALF_RES	Effects	on	Draws tyre smoke, volume smoke and the larger surface particles at half resolution and blends them into the frame in one pass before glass and other transparents; 0 = every effect drawn at full resolution as before.	Large smoke costs about a quarter of the fill and its draws leave the transparent pass; smoke edges are slightly softer, and glass or water behind smoke now draws over it.
+FH1_FX_MESH_CAP	Perf/logging	on	Set to 0 to use exact-size particle/effect meshes instead of power-of-two padded ones.	Padded meshes avoid GPU memory fragmentation hitches; 0 can cause occasional stutters.
+FH1_FX_OVERRIDES	Static world	on	Set to 0 to stop applying per-map shader constants for imported maps (FM4 roads and similar need them).	Off makes imported-map roads and lightmaps draw nearly black; Colorado is unaffected.
+FH1_FX_PICK	Dev hooks	unset	Distance in metres; logs the scenery meshes and materials found that far ahead of the camera.	Testing only: identifies materials for debugging; adds log lines.
+FH1_FX_RAY	Dev hooks	unset	Screen position x,y (0 to 1 fractions); logs every mesh under that pixel every 3 seconds.	Testing only: debugging aid that adds log lines.
+FH1_FX_STATS	Perf/logging	off	Set to 1 to log counts of scenery materials every 5 seconds.	No visible change; adds log lines.
+FH1_GAME_SHAPES	Vehicle/handling	on	Set to 0 to use stand-in shapes instead of the game's own collision shapes and break speeds for smashable props.	Changes how smashable props collide and how fast you must hit them to break.
+FH1_GARAGE	UI/HUD	on	Applies saved per-car customisation (paint, rims, kits) from the garage file; set to 0 to ignore it.	Cars show their stock look when off.
+FH1_GLOWS	Scenery/props/zones	on	Set to 0 to turn off all light glows and beams (street lamps, signs, animated-object lights).	Night scenes lose their glow sprites and beams; slightly faster.
+FH1_GLOW_ANIM_HZ	Scenery/props/zones	20	Updates per second for animated glow sprites (flicker/pulse); 0 updates every frame.	Higher is smoother flicker at a small CPU cost; lower saves a little CPU.
+FH1_GLOW_GUARD	Perf/logging	on	Set to 0 to re-upload every glow mesh every frame instead of only when it changed.	No visual change; 0 costs some CPU per frame and can add hitches.
+FH1_GLOW_MERGE	Perf/logging	on	Set to 0 to draw light glows as one draw per texture group (14+ in Colorado) instead of merged into one static and one moving draw.	No visual change intended; 0 adds about 12+ transparent draws per view (more render-thread cost).
+FH1_GPS_LINE	UI/HUD	off	Set to 1 to show the next-turn GPS line at the top of the screen.	Adds a turn-by-turn line to the HUD (hidden by default as the minimap navigates).
+FH1_GRASS	Scenery/props/zones	on	Set to 0 to remove the scattered grass from the world.	Grass disappears; frame time improves in grassy areas.
+FH1_GRASS_GLOBALS_SECS	Perf/logging	0.5	Seconds between updates of lighting values pushed to grass materials (0 updates on every change).	Lower is more exact grass lighting, higher saves a little render CPU time.
+FH1_GRASS_STATS	Perf/logging	off	Set to any value to log mean and worst frame time plus the number of grass blades drawn every 5 seconds.	Testing only: periodic console log lines.
+FH1_HARNESS_ABS	Dev hooks	unset	Set to on or off to force ABS state in the stats-harness test mode used for parity measurements.	Testing only: affects parity tool brake tests, not normal driving.
+FH1_HEADLIGHTS	Shadows/post/sky	unset	Headlight control: unset = automatic (on at dusk/night, off by day), 1 = always on, 0 = never.	Forces player headlights on in daytime or removes them entirely; no meaningful fps change.
+FH1_HEADLIGHT_DEBUG	Dev hooks	unset	Perf A/B for headlights: 1 skips the beam texture, 2 skips the light loop, 3 disables the lights, cycle rotates modes every 5 s.	Testing only: changes or removes headlight beams and logs frame times.
+FH1_HIDE_NODES_SCAN	Car paint/models	off	Set to 1 to scan the whole car hierarchy each time to hide replaced glTF parts instead of the cheaper targeted hide.	Safety fallback if some old body parts show through the game-shaded car; costs a little CPU.
+FH1_HUD_3D	UI/HUD	off	Set to 1 to draw the HUD with a 3D camera instead of the default 2D camera.	The 2D HUD is about 1 ms cheaper per frame; 1 restores the older path.
+FH1_HUD_ADDITIVE_ALPHA	UI/HUD	on	Additive HUD parts honour their alpha; set to 0 for the old solid-quad look.	HUD glows and fades look correct instead of solid blocks.
+FH1_HUD_REDLINE_CEIL	UI/HUD	off	Set to 1 to draw the tachometer redline at the old rounded-up value instead of the car raw redline RPM.	Slightly different redline position on the tach.
+FH1_HUD_SHARE_USAGES	Renderer	on	Copies the main camera texture settings to the HUD camera to prevent HUD ghosting; set to 0 for the old behaviour.	Avoids ghosting or smearing of the HUD.
+FH1_INST_LM	Scenery/props/zones	on	Set to 0 to disable per-instance night lightmaps on scenery.	On gives correct baked lighting on buildings at night; 0 leaves them dark.
+FH1_INTERP_WHEELS	Car paint/models	on	Set to 0 to draw wheels and drop shadow at the latest physics tick instead of smoothing between ticks.	Off can make wheels look steppy at high frame rates.
+FH1_K3_AB	Dev hooks	off	Set to 1 to switch every 5 seconds between new and old car draw paths and log mean frame times.	Testing only: periodic switching used to compare performance.
+FH1_LAUNCH	Vehicle/handling	1	The stats-harness launch (clutch slipping at 95% redline), used by the parity test mode only; 0 turns it off.	No visible effect in normal driving; only changes parity-test acceleration numbers.
+FH1_LAUNCH_SCREEN	UI/HUD	on	Show the launch screen and main menu at startup; set to 0 to load the map directly (automation runs and the --track option also skip it).	Skips straight into the game when off.
+FH1_LAUNCH_SPIN_EXIT	Drivetrain/assists	on	Ends the normal-play launch clutch slip when the driven wheels are spinning; set to 0 to keep slipping.	Launches settle sooner into full engagement instead of staying half-clutched.
+FH1_LAZY_CASTERS	Shadows/post/sky	off	Set to 1 to hide shadow casters that cannot reach any cascade split.	Measured slightly slower, so it stays off.
+FH1_LAZY_CASTER_MARGIN	Shadows/post/sky	100	Margin in metres used by the lazy caster hiding (only with FH1_LAZY_CASTERS=1).	Only matters when lazy casters are on.
+FH1_LAZY_COLLISION_VIEW	Perf/logging	on	Set to 0 or off to build the collision debug view at load instead of when first toggled.	On shortens loading; 0 builds it up front.
+FH1_LINE_LOCK	Drivetrain/assists	on	Holding brake and throttle together locks the front brakes for burnouts; set to 0 to brake all four wheels as the original does.	Lets you do burnouts; off makes brake plus throttle just brake.
+FH1_LITE	Renderer	unset	Not a real variable; it is an internal shader define set when the Lite renderer is active (choose Lite with the renderer setting instead).	No effect when set; use the Lite renderer option.
+FH1_LITE_AMBIENT	Renderer	1.0	Scale of the flat ambient light in the Lite renderer, which stands in for the sky lighting.	Higher makes the Lite renderer brighter and flatter; lower is darker and more contrasty.
+FH1_LITE_METALLIC	Renderer	0.15	Maximum metallic value allowed on materials in the Lite renderer (clearcoat is removed too).	Higher gives shinier metal in Lite but darker, less lit looking surfaces without reflections.
+FH1_LOADING	UI/HUD	on	Show loading covers; set to 0 to disable them (they are auto-disabled in test runs).	Without covers you see the world building in.
+FH1_LOADING_DETAIL	UI/HUD	off	Set to 1 to show background-work detail on the loading card, such as Preparing traffic n/N.	Extra progress text on the loading screen.
+FH1_LOADING_MIN	Dev hooks	unset	Minimum number of seconds to keep the startup loading card on screen.	Testing only: lets you screenshot the loading card.
+FH1_LOADING_PRELOAD	UI/HUD	on	Preloads menu and loading images while the window is hidden; set to 0 to disable.	Smoother first menu frames; off may show pop-in on the menu.
+FH1_LOADING_SETTLE	UI/HUD	on	The loading cover waits until the world is ready and the frame rate is calm before fading; set to 0 to fade as soon as ready.	Less stutter right after loading, at the cost of a slightly longer loading card.
+FH1_LOD0_ONLY	Car paint/models	on	Set to 0 to skip drawing the extra parts that exist only in a car's highest-detail model.	0 hides some small body parts that only exist in the LOD0 model.
+FH1_LOG_PIPE	Perf/logging	on	Set to 0 to write console and log output directly instead of through a background writer thread.	Off can make the game freeze briefly if the log file write is slow.
+FH1_LOOK	Dev hooks	unset	Degrees (0 ahead, 90 right, 180 back); holds the look-around stick in that direction.	Testing only: forces the camera to look in a fixed direction.
+FH1_LSD	Drivetrain/assists	on	Limited-slip differential lock torques; set to 0 for open differentials.	With it on, power can push the rear out (power oversteer); with 0 cars are more neutral.
+FH1_MAIN_MENU	Dev hooks	unset	Opens the main menu on a given screen at startup: modes or worlds.	Testing only: used for UI screenshots.
+FH1_MANUAL_CLUTCH	Drivetrain/assists	on	Lets the clutch pedal work in Manual gearbox mode too; set to 0 for Manual without clutch control.	Manual cars can be clutched by hand; with 0 the clutch pedal is ignored.
+FH1_MAP_DISCOVERY	UI/HUD	on	Roads become revealed on the map as you drive them; set to 0 to disable discovery tracking.	The map shows everything instead of discovered roads when off.
+FH1_MAP_POIS	UI/HUD	unset	Set to all to show every point of interest on the minimap, not just free-roam ones.	More icons on the minimap.
+FH1_MAP_ROADS	UI/HUD	on	Draws roads on the world map; set to 0 to hide them.	Cleaner but less informative map when off.
+FH1_MAP_TOUR	Dev hooks	unset	Comma-separated map ids to switch through automatically one after another.	Testing only: the game keeps changing map by itself.
+FH1_MAP_TOUR_S	Dev hooks	25	Seconds between automatic map switches during a map tour.	Testing only: pace of the map tour.
+FH1_MARKER_MERGE	AI/traffic/races	on	Set to 0 to draw race markers (light columns, gates, chevrons, pass ripples) as one entity and draw call per piece instead of one merged mesh.	Same look; on saves about 13-29 transparent draws per frame; 0 = the old per-piece path.
+FH1_MENU	Dev hooks	unset	Opens the pause menu on a given page at startup (options, cars, travel, maps, or main).	Testing only: skips the launch screen and loading covers and opens a menu page immediately.
+FH1_MENU_AUDIO_GATE	Audio/radio	on	Keeps menu and loading audio silent until the card reveals; set to 0 to disable that gating.	Prevents audio playing over loading screens.
+FH1_MENU_DOWN_AT	Dev hooks	unset	Seconds after start at which a single Down press is injected into the menu.	Testing only: automation hook for menu focus-animation tests.
+FH1_MENU_MAP	Dev hooks	unset	Map id the car/map browsers open on when a menu page is forced (defaults to colorado).	Testing only: used with the forced menu page for screenshots.
+FH1_MESH_ADD_MB	Scenery/props/zones	0	Megabytes of new mesh data allowed per frame while streaming (0 = unlimited).	A cap can spread out mesh uploads but was measured to slow rendering and starve roads, so it is unlimited by default.
+FH1_MESH_PROP_SHARE	Scenery/props/zones	0.5	Fraction (0 to 1) of the per-frame mesh upload budget that merged props may use; only matters if a mesh budget is set.	Lower leaves more room for roads and terrain to load; 1 shares the budget freely.
+FH1_MESH_SLAB	Perf/logging	off	Set to 1 to pre-size the GPU mesh allocator in big blocks instead of the small engine default.	Uses more VRAM; measured no fewer hitches, so it is off.
+FH1_MESH_SLAB_MB	Perf/logging	16	Starting size in megabytes of each GPU mesh allocation block when FH1_MESH_SLAB=1.	Larger uses more VRAM; has no effect unless the slab option is on.
+FH1_MINIMAP_AB	Perf/logging	off	Set to 1 to cycle the minimap through different update modes and record frame times for comparison.	Testing only: changes minimap update behaviour while measuring.
+FH1_MINIMAP_HZ	UI/HUD	20	How many times per second the minimap is redrawn when something changed; 0 means every frame.	Higher values give smoother minimap motion at a small fps cost; lower saves GPU time.
+FH1_MINIMAP_MSAA	UI/HUD	on	Minimap is rendered with 4x MSAA; set to 0 to turn it off.	Smoother minimap edges; off saves a little GPU time.
+FH1_MINIMAP_RES	UI/HUD	unset	Fixes the minimap texture size in pixels (64 to 2048); by default it is picked from the on-screen size (256 to 1024).	Higher values give a sharper minimap at more GPU cost.
+FH1_MIPGEN	Renderer	on	Set to 0 to stop generating mipmaps and anisotropic filtering for textures that ship without them.	Off brings back shimmering/grainy textures in the distance; saves a little load time.
+FH1_MIPGEN_ASYNC	Perf/logging	on	Set to 0 to build texture mipmaps on the main thread instead of background threads.	Off causes frame hitches (20-30 ms) while cars and maps load.
+FH1_MIRROR	UI/HUD	off	Set to 1 to enable the HUD rear-view mirror.	Adds a small mirror view in supported camera views; costs a little GPU time.
+FH1_MIRROR_ALL	Dev hooks	off	Set to 1 to render the full scene into the rear-view mirror instead of only big scenery meshes.	Testing only: mirror shows more detail but costs more performance.
+FH1_MIRROR_EVERY	UI/HUD	2	Render the rear-view mirror every N-th frame.	Higher saves GPU time but the mirror updates less smoothly.
+FH1_NAME	Net	unset	Player name shown in multiplayer; falls back to your Windows user name, then Driver.	Changes the name other players see above your car.
+FH1_NOTIFY	Dev hooks	unset	Posts a test HUD notification at 3 seconds; separate lines with the pipe character.	Testing only: shows a fake notification.
+FH1_NO_CPU_CULL	Perf/logging	off	Set to 1 to skip CPU visibility culling for static scenery pieces.	Testing showed slower render-thread work and more shadow draws, so it is off by default.
+FH1_NVML	Perf/logging	on	Reads GPU and VRAM usage through NVIDIA's driver. Set to 0 to skip it.	The diagnostics overlay shows n/a for GPU; avoids driver freezes if they occur.
+FH1_OCCLUSION	Renderer	off	Set to 1 to enable Bevy experimental GPU occlusion culling on the main camera.	May cut GPU work in dense areas but is experimental and can cause missing objects.
+FH1_OWNERSHIP	AI/traffic/races	on	Set to 0 to let you drive every car without owning it.	Off unlocks the full car list in Change car regardless of the garage.
+FH1_P2_	Dev hooks	unset	Any variable starting with FH1_P2_ counts as an automated perf-test run and turns off the launch screen and loading covers.	Testing only: skips menus and loading cards when any such variable is set.
+FH1_P2_AB	Dev hooks	off	Set to 1 to alternate scenery modes (such as hiding props) and compare frame times.	Testing only: scenery visibly toggles every few seconds.
+FH1_P2_BURST	Dev hooks	unset	Takes a burst of consecutive screenshots after a delay, then exits (start seconds, frame count, output).	Testing only: writes screenshots and quits the game.
+FH1_P2_FLY	Dev hooks	unset	Scripted camera/car fly-through for scenery timing tests (comma-separated settings).	Testing only: moves the car automatically along a test path.
+FH1_P2_STATS	Perf/logging	off	Set to 1 to log detailed render timings every 2 seconds.	Adds diagnostic overhead and log lines; no gameplay change.
+FH1_P6_AB	Dev hooks	unset	1 or a comma list of mode names: cycles performance options on a timer and logs the frame time of each.	Testing only: settings change automatically while it runs.
+FH1_P6_SECS	Dev hooks	6	Seconds spent in each mode during the FH1_P6_AB comparison (minimum 2).	Testing only: longer gives steadier timing numbers.
+FH1_P6_START	Dev hooks	20	Seconds after start before the FH1_P6_AB comparison begins.	Testing only: delays the benchmark cycle.
+FH1_PAINT	Dev hooks	unset	Forces a body paint as rrggbb[,metallic 0/1[,sequence]] (hex colour) for any car.	Testing only: overrides the car's paint colour with the given colour and ignores garage paint choices.
+FH1_PAINT_SEQ	Dev hooks	unset	Forces the stock paint colour row number (Combo_Colors sequence) for any car.	Testing only: picks a different factory colour from the game's colour list.
+FH1_PARTICLES	Effects	on	Set to 0 to turn off the whole particle system (smoke, dust, surface effects).	No tyre smoke or dust; saves some CPU/GPU.
+FH1_PARTICLES_STATS	Perf/logging	off	Set to 1 to log live particle count and CPU time every 2 seconds.	No visible change; adds log lines.
+FH1_PARTICLE_LAG_FIX	Effects	on	Set to 0 to bring back the old particle drawing that lagged behind the car and jumped when an effect restarted.	Smoke and dust may visibly jump or trail with 0.
+FH1_PARTICLE_LIGHT	Effects	1	Multiplier on how strongly scene lighting tints particles.	Above 1 makes smoke and dust brighter, below 1 darker.
+FH1_PARTICLE_MAX_SCREEN	Effects	on	Set to 0 to ignore each effect's maximum on-screen size cap.	Particles close to the camera can grow to fill the screen with 0.
+FH1_PARTICLE_SHAPE	Effects	on	Set to 0 to draw every particle as a square upright quad instead of using each effect's own aspect and orientation.	Smoke, dust and sparks look blockier with 0.
+FH1_PARTICLE_SPREAD_RAD	Effects	off	Set to 1 to read particle spread angles as radians (the old, wrong behaviour) instead of degrees.	Smoke jets become huge wide cones; leave off.
+FH1_PART_MERGE	Static world	on	Set to 0 to stop merging same-material scenery parts into one mesh (one entity per part again).	Merging reduces draw and entity overhead; turning it off costs performance.
+FH1_PDB_DIR	Dev hooks	unset	Extra folder searched for debug symbol files when resolving stack traces in stall reports.	Testing only: gives readable function names in freeze reports.
+FH1_PERF_LOG	Perf/logging	off	Set to 1 to print frame-time, render-thread and hitch reports to the log.	No visual change; extra log output and a small overhead.
+FH1_PERF_REC	Perf/logging	off	Set to 1 to record gameplay performance logs (frame times, hitches) into the data/perf_logs folder.	No visual change; writes log files and adds slight overhead.
+FH1_PERF_TOUR	Dev hooks	unset	With FH1_PERF_LOG=1, 1 flies the car through a fixed tour of map stops and drive makes it drive between them.	Testing only: the car moves on its own for benchmarking.
+FH1_PHOTO_PITCH	Dev hooks	3	Camera pitch in degrees for the automated photo-mode shot (used with the photo yaw hook).	Testing only: sets the angle of the automated screenshot camera.
+FH1_PHOTO_YAW	Dev hooks	unset	Degrees; enters photo mode two seconds after start with the camera orbiting at that angle.	Testing only: forces an orbit camera shot at startup.
+FH1_PHOTO_ZOOM	Dev hooks	0.8	Camera zoom for the automated photo-mode shot (used with the photo yaw hook).	Testing only: sets the distance of the automated screenshot camera.
+FH1_PI_HEADER	UI/HUD	on	Shows the performance index header in the customisation menu; set to 0 to hide it.	Removes the PI readout and its background calculation from the garage menu.
+FH1_PLAY_LAUNCH	Drivetrain/assists	1	The game's launch auto-clutch for normal play: 1 = on, 2 = always use the late (settled) engine targets, 0 = off (old idle bog).	Changes how the engine revs and the clutch slips when pulling away from a stop.
+FH1_POOL	Perf/logging	on	Set to 0 to use the engine default CPU thread split instead of the game tuned I/O and compute thread caps.	Off may change load and streaming smoothness; default leaves more cores for compute.
+FH1_POST_AB	Perf/logging	off	Set to 1 to alternate the post chain between unoptimised and optimised modes and log GPU times (needs FH1_P2_STATS=1).	Testing only: frame time varies every few seconds.
+FH1_POST_DEFAULT_LUT	Shadows/post/sky	on	Set to 0 to use an identity colour grade outside special zones instead of the game's default day/night LUTs.	Colours look flatter and less graded outside zones with 0.
+FH1_POST_FILMIC_NIGHT	Shadows/post/sky	on	Set to 0 to always use the daytime filmic tone curve instead of blending in the night curve.	Night scenes look different (brighter/less contrasty) with 0.
+FH1_POST_GAMMA_RAMP	Shadows/post/sky	on	Set to 0 to disable the game's display gamma ramp applied at the end of the post chain.	0 gives a slightly darker, lower-contrast image with different mid-tones.
+FH1_POST_LOG	Perf/logging	off	Any value logs post-processing zone, light-ray and vignette values about every 120 frames.	No visible change; adds log lines.
+FH1_POST_LR_GAME	Shadows/post/sky	on	Set to 0 to use the old fixed light-ray (sun shaft) strength instead of scaling by how directly you face the sun.	Sun rays are stronger or more constant regardless of view angle.
+FH1_POST_LR_MASK	Shadows/post/sky	on	Set to 0 to use the old depth-based light-ray occlusion, which lets rays leak past distant objects.	Sun shafts may leak through scenery with 0.
+FH1_POST_LR_SKIP	Perf/logging	0	Peak-strength threshold below which the light-ray passes are skipped; 0 skips only when rays are off.	Higher saves GPU time but faint sun rays disappear.
+FH1_POST_WGSL	Dev hooks	unset	Folder path; each post-processing pass's translated shader is written there as a file.	Testing only: no visual change, writes shader files to disk.
+FH1_PRESENT	Renderer	unset	Present mode: mailbox, immediate, auto, or ab (compare); unset uses FIFO (standard vsync).	Changes latency and tearing; FIFO measured smoothest on the dev machine.
+FH1_PROGRESSION	AI/traffic/races	on	Set to 0 to disable the career (all events open, nothing saved or paid).	Off gives a sandbox with no XP, credits or unlocks.
+FH1_PROP_COLLISION	Vehicle/handling	on	Set to 0 to turn off collision with props such as signs and fences.	The car passes through props; slightly cheaper.
+FH1_PROP_FADE	Scenery/props/zones	on	Set to 0 to make props cut abruptly between detail levels and at their cull distance instead of dithering smoothly.	On hides pop-in with a soft fade; 0 gives the old hard pop.
+FH1_PROP_FAR_MAX	Scenery/props/zones	800	Farthest distance in metres that large props like barriers, fences and trees keep drawing (0 = off).	Higher reduces visible pop-in of big props at a modest cost in draw calls.
+FH1_PROP_LEVEL_STREAM	Scenery/props/zones	on	Set to 0 to keep every prop detail level loaded for as long as its tile is loaded.	On saves entities and memory by loading detail levels by distance; 0 is the old behaviour.
+FH1_PROP_LOD_SCALE	Scenery/props/zones	1.25	Multiplier on the distances at which roadside props switch to lower detail (1 = the game's own distances).	Higher keeps props detailed further away at some GPU cost; lower shows LOD changes sooner.
+FH1_PROP_MIN_FADE	Scenery/props/zones	100	Minimum distance in metres before any prop is allowed to fade out (0 = use the scaled game distances).	Higher stops props popping out in plain view; lower saves a little GPU work.
+FH1_PROP_WALLS	Vehicle/handling	on	Set to 0 to remove solid collision on fences, walls and barriers that lack one.	Without it you can drive through those barriers.
+FH1_RACE	Dev hooks	unset	Race id or index to start automatically a few seconds after launch.	Testing only: you are dropped straight into that race.
+FH1_RACES	AI/traffic/races	on	Set to 0 to disable the race system entirely.	Off removes race markers, starts and results.
+FH1_RACE_AI	AI/traffic/races	on	Set to 0 to run races with no AI opponents.	Off gives solo races with an empty grid.
+FH1_RACE_AUTOFINISH	Dev hooks	unset	Seconds after GO at which the race finishes automatically.	Testing only: the race ends by itself without you driving.
+FH1_RACE_AUTOFINISH_PAGE	Dev hooks	3	Seconds between automatic page advances on the post-race results screens in autofinish mode.	Testing only: speeds or slows the automatic results flow.
+FH1_RACE_BARRIERS	AI/traffic/races	on	Set to 0 to keep free-roam collision during races (no event barriers closing roads).	Off lets you drive through race barriers and closed roads.
+FH1_RACE_BARRIER_TRIS	AI/traffic/races	on	Set to 0 to use the older race walls that block every road triangle with the event bit on the whole map.	Off can leave invisible walls where a race has no barrier.
+FH1_RACE_CANNONS	Effects	on	Set to 0 to disable the cannon effects fired at race starts and finishes.	Off removes the cannon effects.
+FH1_RACE_FX	AI/traffic/races	on	Set to 0 to draw race markers as the old simple debug lines instead of light columns and gates.	Off gives plain debug markers on race routes.
+FH1_RACE_GHOST_SOLIDS	AI/traffic/races	off	Set to 1 to use the old event colliders: an invisible wall for every race object even if its model is missing.	On may cause invisible walls on race routes.
+FH1_RACE_HUD_OLD	UI/HUD	off	Set to 1 to use the plain-text race panel instead of the Forza Horizon style race HUD.	Swaps the race HUD look.
+FH1_RACE_NAV_RESTORE	AI/traffic/races	off	Set to 1 to restore your previous waypoint and objective after a race instead of keeping the race own.	Changes what the GPS and objective show after finishing a race.
+FH1_RADIO	Audio/radio	on	Set to off to disable the in-game radio entirely.	Radio stations and DJs stop playing; saves a little loading and CPU.
+FH1_RADIO_LANG	Audio/radio	EN	Two-letter language code for radio DJ and ident lines (default EN).	Changes which language the DJ chatter and station idents are spoken in.
+FH1_RADIO_MODS	Audio/radio	unset	Folder to load custom radio stations from, or "off" to ignore mods; by default mods/radio/stations is searched.	Adds your own stations to the radio, or hides them with off.
+FH1_RADIO_STATION	Audio/radio	unset	Station number to tune to at startup instead of the default station.	The radio starts on the chosen station rather than the normal one.
+FH1_RADIO_VOLUME	Audio/radio	1.0	Radio volume multiplier applied on top of the settings menu volume (1.0 = unchanged).	Makes the radio louder or quieter than the menu setting allows.
+FH1_RANKUP_NOTIFY	UI/HUD	unset	Set to all to show a notification for every leaderboard rank gained; otherwise only milestone ranks are shown.	More rank-up pop-ups appear during races and skill play.
+FH1_RAW_CACHE_SWEEP	Perf/logging	on	Set to 0 to keep every viewed car's materials and textures in memory instead of freeing unused ones.	0 uses a lot more RAM/VRAM after browsing many cars in car select.
+FH1_REAR_SLIDE_SLIP	Vehicle/handling	50	How many times the rear's peak slip it takes before steering falls back to countersteer (game value 50; 3 = old).	At 50 the speed-based steering lock is kept; at 3 fronts could jump to full lock and spin the car.
+FH1_REGISTRY	Net	unset	Web address of the multiplayer server registry; overrides the saved setting and the built-in default.	Changes which server list the ONLINE browser shows.
+FH1_RENDERER	Renderer	unset	Chooses the renderer: remaster, lite or faithful; normally set automatically from the Options > Renderer setting at startup.	Switches between the full remaster look, a cheaper Lite look and the translated original shaders; needs a restart.
+FH1_RENDER_EXEC	Perf/logging	unset	Render-graph executor choice: single forces single-threaded execution, ab alternates between modes, anything else keeps the default.	Performance comparison tool; single may lower or raise render thread time.
+FH1_RENDER_SCALE	Renderer	unset	Overrides the Options render scale with a number from 0.5 to 1.0 (Lite caps it at 0.75 by default).	Lower values render fewer pixels for more fps but a softer image.
+FH1_REVERSE_FIX	Drivetrain/assists	on	Fixed rules for choosing reverse in Automatic (brake-to-reverse latch); set to 0 for the old rules.	Fixes the "dead throttle" after stopping; with 0 reversing can stick again.
+FH1_REVLIMIT	Vehicle/handling	1	1 uses the game's rev limit, halfway between redline and peak-torque RPM; 0 uses the older redline times 1.146.	Changes how high engines rev before the limiter bounces.
+FH1_RIM_FIX	Car paint/models	on	Set to 0 to use the old rim folder (always FH1's) and uniform LOD0 rim scaling.	0 can give imported cars the wrong rims and rims that stick out past the tyre.
+FH1_RM_ATMOSPHERE	Shadows/post/sky	on	Set to 0 to turn off the physically based atmosphere (sky, aerial haze); always off in Lite.	Off removes atmospheric haze and sun/moon scattering and saves GPU time.
+FH1_RM_BLACK_GLASS_ALPHA	Car paint/models	1.0	Opacity multiplier for dark glass such as the black band round the windscreen.	Lower makes dark glass see-through, which can show gaps.
+FH1_RM_BLOOM	Shadows/post/sky	0.12	Bloom (glow) intensity; set to 0 to turn bloom off (always off in Lite).	Higher values add more glow around bright lights; 0 removes it and saves GPU time.
+FH1_RM_BLOOM_MIP	Shadows/post/sky	256	Size in pixels of the largest bloom blur level (64 to 2048); 512 is the old Bevy default.	Smaller is cheaper with a softer glow; larger costs more GPU time.
+FH1_RM_CABIN_SHADOW	Car paint/models	off	Set to 1 to let the car interior receive roof shadows seen through the windows.	Default shows a lit interior through glass; 1 makes the cabin near-black.
+FH1_RM_CAR	Car paint/models	on	Enables the remaster car paint renderer; set to 0 to use plain glTF materials.	Cars look PBR-styled; with 0 they look flatter.
+FH1_RM_CAR_FILL	Car paint/models	0.8	Strength of the fill light on cars (sky and ground ambient); 0 uses the environment map only.	Higher brightens shaded car sides, lower makes them darker.
+FH1_RM_CAR_PROBE	Car reflections	on	Live reflection probe that captures the surroundings for the car's paint; 0 = the baked sky environment only (on again since the 2026-10-08 P15 build freed GPU time).	With 0 cars use the static sky reflection and save GPU time; on they reflect nearby scenery.
+FH1_RM_CAR_PROBE_BOX	Car reflections	2.9,2.25,6.75	Size in metres (width,height,length) of the reflection box that turns with the car.	Changes how local reflections of the road and buildings are projected on the car.
+FH1_RM_CAR_PROBE_DIST	Car reflections	10	Metres the car must travel before a new reflection bake is allowed early.	Lower values rebake reflections sooner when driving, costing GPU time.
+FH1_RM_CAR_PROBE_DOWN_FAR	Car reflections	8	Far clip in metres for the downward face of the car reflection bake (only the road under the car is needed).	Larger values draw more distant ground into the bottom face; slightly slower bakes.
+FH1_RM_CAR_PROBE_EVERY	Car reflections	4 x quality gap (1 s on High)	Seconds between car reflection re-bakes while moving fast.	Lower values keep reflections fresher at the cost of more GPU work and possible hitches.
+FH1_RM_CAR_PROBE_EVERY_PARKED	Car reflections	16 x quality gap (4 s on High)	Seconds between car reflection re-bakes while the car is nearly stopped.	Lower values refresh a parked car's reflections more often; costs a little GPU time.
+FH1_RM_CAR_PROBE_FADE	Car reflections	0.5	Seconds to crossfade between old and new reflection captures; 0 swaps instantly.	Smooth reflection updates; 0 may pop visibly.
+FH1_RM_CAR_PROBE_FALLOFF	Car reflections	0.12	Edge falloff of the car reflection probe volume (0.1 for the car-shaped box mode).	Changes how softly the car's reflections fade into the world probe at the volume edge.
+FH1_RM_CAR_PROBE_FAR	Car reflections	300	Far clip distance in metres for the car reflection bake cameras (the live bake uses 80 for its faces).	Smaller values drop distant scenery from car reflections and bake slightly faster.
+FH1_RM_CAR_PROBE_FLOOR	Car reflections	0	Vertical offset in metres of the bottom of the car-shaped reflection box relative to the body bottom.	Moves the box up or down; changes whether the road under the car is lit by its reflection.
+FH1_RM_CAR_PROBE_FOLLOW	Car reflections	on	Set to 0 to bake the reflection cube from the car position at bake start instead of following the car during the bake.	Following keeps reflections centred on the car; off can show slight offsets while moving.
+FH1_RM_CAR_PROBE_GAP	Car reflections	0.25 (quality preset)	Minimum seconds between car reflection bakes when the car has moved far enough.	Lower values refresh reflections faster; higher values reduce bake cost.
+FH1_RM_CAR_PROBE_HEIGHT	Car reflections	1.9	Height in metres of the car-shaped reflection box (minimum 0.5).	Taller boxes give more of the car's surroundings influence; shorter ones limit reflection to the body.
+FH1_RM_CAR_PROBE_NEAR	Car reflections	3.0	Near clip distance in metres of the camera that bakes the car reflection cube; hides the car's own lamps from the bake.	Lower values let the car's own lights bleed into its reflections.
+FH1_RM_CAR_PROBE_PARALLAX	Car reflections	60	Distance in metres used to parallax-correct the car's reflection cube.	Changes how reflections slide across the body as the car moves; lower looks more local.
+FH1_RM_CAR_PROBE_RES	Car reflections	256	Reflection cube face size in pixels (32-512, power of two); overrides the quality preset when set.	Higher sharper reflections but costs more GPU time and VRAM.
+FH1_RM_CAR_PROBE_SIZE	Car reflections	7.0	Size in metres of the cube-shaped car reflection probe volume (only used when the car-shaped box is disabled).	Larger volumes light more of the road around the car with its reflection, which can tint the ground.
+FH1_RM_CAR_PROBE_SLEEP	Car reflections	on	The probe camera sleeps between captures; set to 0 to keep it awake.	Saves a little CPU; mostly a debugging switch.
+FH1_RM_CAR_PROBE_SPREAD	Car reflections	2	Frames over which each reflection face is spread (1 = all six faces back to back).	Higher means smoother frames but slower reflection updates.
+FH1_RM_CAR_SUN	Car paint/models	on	Cars get the game's reduced share of direct sun; set to 0 for full sun on cars.	Cars look less harshly lit; with 0 sunlit panels are brighter.
+FH1_RM_CAR_TRANSP_LOD	Car paint/models	on	Car glass and lamps switch to a cheaper non-blended look at long distance; set to 0 to blend at every distance.	Saves fps on distant cars; with 0 transparency is always on.
+FH1_RM_CAR_TRANSP_LOD_M	Car paint/models	60	Distance in metres at which car glass and lamps switch to the cheap non-blended look.	Larger keeps nice glass farther out at some fps cost.
+FH1_RM_CASCADES	Shadows/post/sky	2 (quality preset)	Number of sun shadow cascades (1 to 4), or old for the previous 3 cascades at 1024 pixels; overrides the graphics quality preset.	More cascades sharpen mid-distance shadows but add a shadow view (render-thread and GPU time); old restores the previous layout.
+FH1_RM_CASCADE_CACHE	Shadows/post/sky	on	Set to 0 to stop reusing the farthest shadow cascade between frames.	Off redraws far shadows every frame, costing GPU time but avoiding any stale far shadows.
+FH1_RM_CASCADE_CACHE_FRAMES	Shadows/post/sky	4 (quality preset)	Maximum number of frames the cached far shadow cascade is kept before being redrawn (1 = redraw every frame); overrides the graphics quality preset.	Higher is faster but far shadows update less often; lower updates more often.
+FH1_RM_CASCADE_CACHE_MARGIN	Shadows/post/sky	0.15	Extra size fraction given to the cached far shadow cascade so it stays valid while the camera moves.	Larger margins keep the cache valid longer but slightly blur far shadows.
+FH1_RM_CASCADE_CACHE_MOVE	Shadows/post/sky	2	Redraws the cached far shadow cascade once the camera has moved this many of its texels since it was drawn (0 = only on fit, turn, light change or frame count).	Keeps moving shadows near the player from lagging behind; 0 saves a little more time at speed but shadows past 9 m may trail moving cars.
+FH1_RM_CASCADE_PRUNE	Shadows/post/sky	on	Set to 0 to keep empty shadow cascade entries for secondary views that cannot see the sun.	Default saves a little CPU time per frame; 0 restores the old behaviour.
+FH1_RM_CONTACT_LENGTH	Shadows/post/sky	0.4	Maximum length in metres of contact shadow rays.	Longer values extend small contact shadows farther from objects.
+FH1_RM_CONTACT_SHADOWS	Shadows/post/sky	on	Set to 0 to turn off screen-space contact shadows (always off in Lite).	Off removes the small crisp shadows near objects and saves a little GPU time.
+FH1_RM_CONTACT_STEPS	Shadows/post/sky	8	Number of ray-march steps for contact shadows (1 to 32).	More steps give cleaner contact shadows at a small GPU cost.
+FH1_RM_CONTACT_THICKNESS	Shadows/post/sky	0.15	Assumed thickness in metres of surfaces for contact shadow tracing.	Larger values make contact shadows heavier and may cause false shadowing.
+FH1_RM_DECAL_BIAS	Scenery/props/zones	256	Constant depth bias for decal layers in depth units.	Raise to stop decals flickering or vanishing into the ground; too high makes them hover.
+FH1_RM_DECAL_MASK	Scenery/props/zones	off	Set to 1 to draw decals as alpha-tested opaque instead of sorted transparent (cutoff 0.5).	Saves about 1 ms per frame but soft decal edges (road wear, dirt) turn hard.
+FH1_RM_DECAL_MASK_CUTOFF	Static world	0.5	Alpha cutoff (0-1) used for decal materials when the opt-in alpha-mask decal mode (FH1_RM_DECAL_MASK=1) is on.	Only matters with decal masking enabled; higher values cut more of each decal away.
+FH1_RM_DECAL_SLOPE	Scenery/props/zones	1.0	Slope-scaled depth bias for decal layers (road wear, dirt patches).	Raise to stop decals z-fighting on slopes; too high makes them float.
+FH1_RM_DEFROST_MASK	Car paint/models	on	Rear-window defrost lines use their alpha mask; set to 0 to draw the sheet opaque.	Rear window stays see-through with thin lines instead of a solid panel.
+FH1_RM_DUSK_AMBIENT	Shadows/post/sky	on	Set to 0 to remove the extra ambient light added through dusk.	Off makes dusk scenes and cars darker, possibly nearly black at twilight.
+FH1_RM_DUSK_EV	Shadows/post/sky	-1.4	Exposure offset (in stops) blended in during dusk/dawn twilight in the remaster renderer.	More negative makes twilight scenes darker; positive brightens them.
+FH1_RM_EMISSIVE_NITS	Static world	1.0	Brightness scale of the scenery night lightmaps (lit windows, signs) in the remaster; 1 = as in the game.	Higher values make night-time building lights glow stronger; lower dims them.
+FH1_RM_ENV	Shadows/post/sky	on	Set to 0 to turn off the sky-derived environment lighting and reflection map; always off in Lite.	Off makes surfaces and metals lose sky reflections and ambient fill, and saves GPU time.
+FH1_RM_ENV_EVERY	Shadows/post/sky	off	Set to 1 to regenerate the sky environment map every frame instead of only when the time of day changes.	On is more accurate while the sun moves but costs noticeable GPU time.
+FH1_RM_ENV_INTENSITY	Shadows/post/sky	1.0	Brightness multiplier of the sky environment light.	Higher brightens ambient light and reflections from the sky; lower darkens them.
+FH1_RM_ENV_SIZE	Shadows/post/sky	128	Face size in pixels of the sky environment map (32 to 1024, power of two).	Larger gives sharper sky reflections at higher cost; smaller is cheaper and blurrier.
+FH1_RM_EVICT	Scenery/props/zones	on	Set to 0 to disable the periodic sweep that frees unused remaster scenery materials and textures.	0 keeps everything loaded (more VRAM, no reloads); default frees memory as you drive away.
+FH1_RM_EV_BIAS	Shadows/post/sky	0	Manual exposure offset in stops added on top of automatic exposure.	Positive values brighten the whole image; negative values darken it.
+FH1_RM_EV_COMPRESS	Shadows/post/sky	0.72	How strongly auto-exposure follows scene brightness (0 constant daylight exposure, 1 fully physical).	Higher makes night darker and day more contrasty; lower keeps all hours closer in brightness.
+FH1_RM_FILMIC_EV	Shadows/post/sky	-2.2	Exposure input (in stops) fed to the game's filmic tone curve in the remaster grade pass.	Shifts overall brightness and highlight roll-off; also rescales emissive lights to match.
+FH1_RM_FLAKE	Car paint/models	0.12	Strength of metallic flake sparkle in paint.	Higher gives more glittery metallic paint; 0 removes flakes.
+FH1_RM_FOG	Shadows/post/sky	1.0	Distance fog density scale; 0 removes fog, higher is thicker.	Changes how hazy the distance looks; 0 shows distant scenery clearly but exposes pop-in.
+FH1_RM_FRAME_EV	Shadows/post/sky	0.4	Overall exposure offset (in stops) applied to the whole frame at all times of day in the remaster renderer.	Raises or lowers overall scene brightness.
+FH1_RM_GAME_SKY	Shadows/post/sky	on	Set to 0 in the Remaster renderer to use Bevy's atmosphere sky instead of the game's dome, fog sky and sun.	Sky look changes from the game's original sky to a generic atmosphere.
+FH1_RM_GLASS_ALPHA	Car paint/models	0.55	Opacity multiplier for normal car windows (1 = model value).	Lower shows the interior more clearly, higher makes glass look opaque.
+FH1_RM_GLASS_CULL	Car paint/models	on	Culls back faces of car glass; set to 0 to draw glass two-sided.	Avoids frosted double-pane windows on roadsters; 0 brings the frosted look back.
+FH1_RM_GLASS_F0	Car paint/models	0.5	Extra multiplier on glass base reflectivity.	Higher makes windows more mirror-like, lower more transparent.
+FH1_RM_GLASS_FRESNEL	Car paint/models	on	Uses the game's glass Fresnel values for reflectivity; set to 0 for the old fixed value.	Windows reflect the sky more like the original.
+FH1_RM_GROUND_REFLECTANCE	Scenery/props/zones	0.35	Cap on specular reflectance for ground (1 disables the cap).	Higher makes ground more reflective at glancing angles.
+FH1_RM_GROUND_ROUGHNESS	Scenery/props/zones	0.9	Minimum roughness for off-road ground (0 disables the floor).	Lower makes dirt and grass look glossy; higher keeps it matte.
+FH1_RM_GROUND_SPEC	Scenery/props/zones	0.45	Scale of sky-reflection specular on ground and roads (1 = no reduction).	Higher brings back shiny sky reflections on roads and dirt.
+FH1_RM_HAZE	Shadows/post/sky	0.12	Strength of FH1's atmospheric haze (ground extinction per metre) added to the remaster sky scattering.	Higher values give a hazier, foggier distance; 0 gives clearer air.
+FH1_RM_HEADLIGHT_LM	Shadows/post/sky	250000	Brightness (lumens) of the player car's two remaster headlight spotlights.	Higher values light the road further and brighter at night; lower values dim the beams.
+FH1_RM_HEADLIGHT_SHADOWS	Shadows/post/sky	off	Set to 1 to let the remaster headlight spotlights cast shadows.	Adds shadows from the beams at night but costs extra GPU time.
+FH1_RM_KEEP	Scenery/props/zones	on	Set to 0 to go back to the old rule that evicts idle scenery textures and materials, instead of keeping everything resident under a budget.	Default uses more VRAM but avoids reloads when you revisit areas; 0 saves VRAM but can cause pop-in.
+FH1_RM_LAMP	Car paint/models	20000	Physical lamp brightness in nits before the exposure cap.	Higher makes lit lamps brighter if not capped.
+FH1_RM_LAMP_BLEND	Car paint/models	on	Lamp covers blend using the lights atlas alpha like the game; set to 0 for the old method.	Lamp covers look glassy rather than solid.
+FH1_RM_LAMP_CAP	Car paint/models	3.0	Caps lamp brightness at this many times display white for the current exposure; 0 disables the cap.	Lower stops headlights and taillights blowing out; higher makes them glare.
+FH1_RM_LAMP_COAT	Car paint/models	1.0	Clearcoat strength of the clear plastic over lamp lenses and covers; 0 removes it.	Lamps look glossier and more reflective; 0 makes them matte.
+FH1_RM_LAMP_NITS	Static world	3.0	Brightness of street-lamp emissive maps in the remaster; the default 3 lets lamp heads bloom.	Higher values make streetlamps glare more at night; lower values dim them.
+FH1_RM_LAMP_TINT	Car paint/models	on	Tints unlit tail, fog and indicator lamps by their lamp colour; set to 0 for the untinted atlas.	Red and amber lamps keep their colour when off.
+FH1_RM_LIGHT_LOG	Perf/logging	off	Set to any value to print the sun, moon, exposure and lux values to the log every 2 seconds.	Testing only: log output about lighting, no visual change.
+FH1_RM_LUT	Shadows/post/sky	1.0	Strength of the game's colour-grading LUT in the remaster grade pass; 0 disables the whole grade pass (and the game tonemap).	Lower values wash out FH1's colour grade; 0 gives an ungraded look.
+FH1_RM_MATTE	Car paint/models	on	Cars with a matte paint finish render matte; set to 0 to make every paint glossy.	Matte-paint cars look flat instead of shiny.
+FH1_RM_MAT_KEEP	Scenery/props/zones	24000	Maximum number of scenery materials kept resident before idle ones are evicted.	Higher keeps more materials in memory (fewer rebuild hitches); lower saves memory.
+FH1_RM_MB_FULL	Shadows/post/sky	16	View distance in metres at which camera motion blur reaches full strength (it starts at FH1_RM_MB_START).	Smaller blurs mid-distance scenery as much as the horizon; larger keeps more of the road sharp.
+FH1_RM_MB_MAX	Shadows/post/sky	unset	Longest motion-blur trail as a fraction of the screen width (unset = the Options level: Low 0.02, Medium 0.03, High 0.04).	Higher allows longer streaks at speed; lower caps them.
+FH1_RM_MB_SHUTTER	Shadows/post/sky	unset	Motion-blur trail length as a fraction of a 60 fps frame of camera motion (unset = the Options level: Low 0.3, Medium 0.55, High 0.9).	Higher gives longer, stronger blur; the look does not change with frame rate.
+FH1_RM_MB_SMOOTH	Shadows/post/sky	3	Taps of the second motion-blur pass that smooths the first pass's steps (1 = no second pass).	1 saves a full-screen pass but shows stepped trails; higher is smoother and slightly costlier.
+FH1_RM_MB_START	Shadows/post/sky	4	View distance in metres below which nothing is motion blurred.	Lower blurs nearer scenery; higher keeps more of the foreground sharp.
+FH1_RM_MB_TAPS	Shadows/post/sky	unset	Samples per pixel of the main motion-blur pass, 2 to 32 (unset = the Options level: Low 4, Medium 6, High 8).	More samples give smoother trails at more GPU cost.
+FH1_RM_MOON_LUX	Shadows/post/sky	2.0	Peak moonlight illuminance in lux.	Brighter values make nights lighter; lower makes them darker.
+FH1_RM_MOTION_BLUR	Shadows/post/sky	unset	Forces the camera motion blur level: 0 off (the old frame, nothing runs), 1 low, 2 medium, 3 high; unset = Options > Graphics > Motion blur.	Scenery beyond a few metres streaks behind camera movement (the player car stays sharp); 0 saves the two full-screen passes.
+FH1_RM_NIGHT_ALL	Perf/logging	off	Set to 1 to update all scenery materials for dusk/dawn in a single frame instead of in batches.	Restores the old behaviour; causes a hitch when the day/night switch happens.
+FH1_RM_NIGHT_AMBIENT	Shadows/post/sky	0.3	Strength of the faint flat ambient floor used at night and dusk.	Higher lifts shadows and dark areas at night; lower makes nights blacker.
+FH1_RM_NIGHT_BATCH	Perf/logging	256	Number of scenery materials updated per frame during the dusk/dawn night switch.	Lower spreads the change over more frames (smoother, slower fade-in); higher is quicker but may hitch.
+FH1_RM_NIGHT_EV	Shadows/post/sky	-1.0	Exposure offset (in stops) blended in at full night in the remaster renderer.	More negative makes nights darker; positive brightens them.
+FH1_RM_PAINTCOLOR	Car paint/models	on	Tints non-body painted parts (plastics, emblems) with their ShaderSettings colour; set to 0 to skip.	Trim and badges take their proper colours.
+FH1_RM_PAINTSCALE	Car paint/models	on	Applies the game's per-surface paint scale (darkens rear panel, emblems, lamps); set to 0 for scale 1.	Some trim and panels look darker like the original; with 0 they use full paint brightness.
+FH1_RM_PAINT_ALBEDO	Car paint/models	1.0	Multiplier on paint colour brightness (0.6 was the old value).	Higher brightens body paint, lower darkens it.
+FH1_RM_PAINT_DEBUG	Dev hooks	unset	Set to "mirror" to make car bodies white chrome mirrors.	Testing only: shows what environment light the car receives.
+FH1_RM_PAINT_METALLIC	Car paint/models	0.3	How metallic body paint is (0 to 1) in the sheen finish.	Higher gives shinier metal reflections, lower more plain gloss.
+FH1_RM_PAINT_METAL_ROUGH	Car paint/models	0.55	Roughness of metallic body paint in the sheen finish.	Lower gives sharper reflections, higher blurrier ones.
+FH1_RM_PAINT_SHEEN	Car paint/models	on	Uses the softer metallic paint finish tuned to the game's look; set to 0 for the older glossy mirror-like metal.	Metallic paint looks less glaring and acid-bright.
+FH1_RM_PHASE_STATS	Perf/logging	off	Set to 1 to print a summary of the transparent render phase every 300 frames.	Testing only: log spam for diagnosing transparent-pass cost; no visual change.
+FH1_RM_PREPASS	Renderer	off	Set to 1 to enable the depth prepass for remaster scenery materials.	On costs roughly twice the scenery draws; only needed if something reads prepass depth.
+FH1_RM_PROBE_ATMOSPHERE	Car reflections	on	Reflection captures include the main view's atmosphere; set to 0 for the old method.	Reflections match the time of day sky more closely.
+FH1_RM_PROBE_CHEAP	Car reflections	on	Keeps small scenery out of the reflection cube; set to 0 to include everything.	Better fps; with 0 reflections include small props at some cost.
+FH1_RM_PROBE_CLAMP	Car reflections	4.0	Brightness cap applied to the car reflection bake so lamps and sun do not blow out the cube.	Higher values give brighter, hotter reflections of lights; lower values look flatter.
+FH1_RM_PROBE_CLEAR_EV	Car reflections	on	Reflection capture background follows scene exposure; set to 0 for a fixed dark tone.	Avoids overly bright or dark ground in reflections at night.
+FH1_RM_PROBE_CUBE_SKY	Car reflections	on	Reflection captures use the game's own env-cube sky pass; set to 0 for the main view sky parts.	Sky and clouds in reflections look like the original; 0 is the older look.
+FH1_RM_PROBE_EVEN	Car reflections	off	Set to 1 to update one reflection cube face every frame instead of bursts of six.	Smoother frame times at a steady fps cost.
+FH1_RM_PROBE_EVEN_RES	Car reflections	64	Face size in pixels cap (32-512) for the even-cadence reflection probe.	Higher sharper reflections, lower cheaper per frame.
+FH1_RM_PROBE_FOG_SKY	Car reflections	on	Draws the fog sky in reflection captures; set to 0 to leave it out.	Prevents a green horizon band appearing on car panels at dusk and night.
+FH1_RM_PROBE_LEAN	Car reflections	on	Reflection captures only draw big opaque scenery; set to 0 for full content.	Cheaper captures and fewer slow frames; with 0 reflections are richer but slower.
+FH1_RM_PROBE_MIN_RADIUS	Car reflections	4	Scenery pieces smaller than this radius in metres are left out of the lean reflection captures.	Higher is cheaper but drops more detail from reflections.
+FH1_RM_PROBE_OWN_LIGHTS	Car reflections	on	Hides the player's own headlights from the car reflection cube; set to 1 to include them.	Avoids self-lit reflections; with 1 your own lights appear in reflections.
+FH1_RM_PROBE_REST	Car reflections	on	Even-cadence probe stops rendering faces while the car is parked; set to 0 to keep rendering.	Saves fps when parked; with 0 reflections keep refreshing.
+FH1_RM_PROBE_REST_REFRESH	Car reflections	10	Seconds a stopped car waits before refreshing its reflection after the first settled bake.	Lower values refresh a parked car's reflections more often; costs GPU time.
+FH1_RM_PROBE_STATIC_ONLY	Car reflections	on	Reflection faces use the static world only; set to 0 so they draw every normal scene mesh.	Cheaper reflections; with 0 they include more objects at a cost.
+FH1_RM_ROAD_ROUGHNESS	Scenery/props/zones	0.82	Minimum surface roughness for roads and ground (0 to 1).	Lower makes roads shinier and more reflective; higher looks matte.
+FH1_RM_SHADOWS	Shadows/post/sky	on	Set to 0 to turn off sun shadow casting entirely; always off in Lite.	Off removes all dynamic shadows and gives a large GPU saving.
+FH1_RM_SHADOW_DIST	Shadows/post/sky	300	Maximum distance in metres at which sun shadows are drawn (202 matches the original game).	Shorter distances cut shadow draws and cost but make far shadows vanish sooner.
+FH1_RM_SHADOW_FILTER	Shadows/post/sky	gaussian	Shadow edge filtering: hard (cheapest), gaussian (default) or temporal.	Hard gives jagged edges; gaussian soft edges; temporal smoother but may shimmer or ghost.
+FH1_RM_SHADOW_NEAR	Shadows/post/sky	9	Distance in metres where the first, sharpest shadow cascade ends.	Smaller gives the nearby car sharper shadows; larger spreads detail but blurs the car shadow.
+FH1_RM_SHADOW_RES	Shadows/post/sky	2048 (quality preset)	Shadow map size per cascade in pixels (rounded to a power of two, 512 to 8192); overrides the graphics quality preset.	Higher gives sharper shadows with more VRAM and GPU cost; lower is faster but blockier.
+FH1_RM_SMALL_CASTERS	Shadows/post/sky	on	Set to 0 to let grass and small scenery pieces cast shadows into the Remaster sun cascades.	Off adds shadows from grass and small objects at some cost in fps; default skips them.
+FH1_RM_STATS	Perf/logging	off	Set to 1 to log scenery entity, material and mesh statistics every 5 seconds.	Testing only: prints scenery counters to the log; no visual change.
+FH1_RM_SUN_DIR	Shadows/post/sky	unset	Set to shadow to aim the sun along the track's fixed shadow direction instead of the time-of-day sun.	Shadows fall in the game's fixed layout, but scenes and cars can end up back-lit and darker.
+FH1_RM_SUN_LUX	Shadows/post/sky	120000	Peak sun illuminance in lux.	Brighter or dimmer daylight (exposure also follows it, so the overall effect is moderated).
+FH1_RM_SUN_TINT	Shadows/post/sky	0.5	How much of the time-of-day sun colour is mixed into the sunlight (0 white, 1 full game colour).	Higher makes mornings and evenings more orange; lower looks whiter.
+FH1_RM_TEX_BUDGET_MB	Scenery/props/zones	4096	Megabytes of compressed scenery texture data kept resident before idle ones are evicted.	Higher uses more VRAM and avoids texture reloads; lower saves VRAM but can cause reload pop-in.
+FH1_RM_TONEMAP	Shadows/post/sky	game	Tone mapping curve: game (the game's own filmic curve, default) or agx, aces, none; anything else gives TonyMcMapface.	Changes the overall contrast, colour and highlight look of the whole image.
+FH1_RM_TWILIGHT	Shadows/post/sky	on	Set to 0 to disable the dusk sun sinking (sun stays at its game elevation and dusk ambient is skipped).	Off keeps the sky orange longer in the evening instead of going to blue hour.
+FH1_RM_TWILIGHT_HOLD	Shadows/post/sky	on	Set to 0 to restore the old behaviour where the sun briefly climbs back up during the sun-to-moon swap at dusk.	Fixes a brightness blink at dusk; 0 brings the old flicker back.
+FH1_RM_VBLEND_DECAL	Scenery/props/zones	on	Set to 0 to restore the old decal alpha handling on vertex-blended surfaces.	Changes how road wear and dirt decals blend into the ground.
+FH1_RM_VBLEND_NOISE	Scenery/props/zones	on	Set to 0 to restore the old vertex-blend weighting on blended ground.	Changes how ground materials blend into each other, as in older builds.
+FH1_RM_VERTEX_SHADE	Scenery/props/zones	on	Set to 0 to ignore vertex alpha shading on opaque ground, roads and blends.	Off makes ground lose its baked shading and look flatter and lighter.
+FH1_RM_VIGNETTE	Shadows/post/sky	0.22	Strength of the screen-edge darkening (vignette) in the remaster grade pass.	Higher values darken the corners more; 0 removes the vignette.
+FH1_RM_WATER	Scenery/props/zones	unset	Set to flat to draw water as a plain debug colour instead of shaded water.	Testing only: water becomes a flat colour.
+FH1_RM_WATER_BUMP	Scenery/props/zones	0.35	Strength of the water ripple normal map.	Higher gives choppier water; lower gives calmer water.
+FH1_RM_WATER_CULL	Scenery/props/zones	off	Set to 1 to cull water sheet back faces as the data says instead of drawing water two-sided.	On can make river and lake surfaces disappear when viewed from some angles.
+FH1_RM_WATER_MIN_ALPHA	Scenery/props/zones	0.55	Minimum water opacity (0 to 1) so shallow water never becomes fully clear.	Lower shows more of the bottom in shallows; higher keeps water murkier.
+FH1_RM_WATER_OPACITY	Scenery/props/zones	1.0	Opacity scale for water surfaces (0 to 1).	Lower makes water more transparent so you see the bed.
+FH1_ROBSCALE	Vehicle/handling	on	The fitted boost system's scale lowers engine power as in the game. Set to 0 to ignore it.	Stock turbo and supercharged cars make slightly less power.
+FH1_ROUTE	Dev hooks	unset	Forces a satnav target at engine coordinates x,z in metres.	Testing only: draws a route line to a fixed point on the minimap.
+FH1_RTX	Renderer	off	Set to 1 to enable RTX path tracing with DLSS on the Remaster renderer (RTX builds only); normally set via Options > Renderer.	Ray-traced lighting with upscaling; much heavier on the GPU and still has known visual issues.
+FH1_RTX_DLSS	Renderer	unset	DLSS Ray Reconstruction quality mode under RTX: dlaa, quality, balanced, performance or ultra; anything else = auto.	Trades sharpness for fps in RTX mode; only applies with RTX and DLSS support.
+FH1_RTX_EV	Renderer	0	Exposure offset (in stops) on the camera under the experimental RTX ray-traced renderer.	Brightens or darkens the ray-traced image; only has effect with RTX on.
+FH1_RTX_PROXY_ALL	Renderer	off	Set to 1 to restore the old RTX behaviour of proxying every material class (layer A only) into the ray-traced scene.	Changes how road and blended materials look under RTX; testing/compat toggle for RTX only.
+FH1_RTX_SKY	Renderer	1.0	Multiplier on the sky light that escaped rays pick up from the baked atmosphere under RTX.	Higher values make the RTX scene brighter from sky light; only applies in RTX mode.
+FH1_SCENERY_EVICT	Scenery/props/zones	on	Set to 0 to keep all scenery materials and textures in memory instead of freeing unused ones.	0 uses more RAM/VRAM over a long drive but avoids reloading.
+FH1_SC_BOOST	Vehicle/handling	on	Superchargers add boost power. Set to 0 to ignore them.	Supercharged cars are faster; 0 makes them behave as naturally aspirated.
+FH1_SERVER	Net	unset	Address of a multiplayer server to connect to at startup (host:port).	Joins that server session on launch; unset means no automatic connection.
+FH1_SERVER_PASSWORD	Net	unset	Password sent when connecting to the server given by FH1_SERVER.	Needed only for password-protected servers.
+FH1_SETUP_SCALES	Vehicle/handling	unset	Set to "override" to build brake and steering tables with the stats-harness tyre scales instead of the compound's own.	Testing only: changes brake capacity and steering lock to match the dev stats screen.
+FH1_SHADOWS	Shadows/post/sky	on	Set to 0 to turn off world shadows.	No shadows; noticeably faster.
+FH1_SHADOW_AB	Perf/logging	unset	Comma list of shadow modes (off, mainonly, nomask, or a texel count) cycled one second each, logging frame times.	Testing only: shadows change every second.
+FH1_SHADOW_BIG	Dev hooks	unset	With FH1_SHADOW_STATS=1, also logs which shaders the large split-0 shadow casters use.	Testing only: adds log lines.
+FH1_SHADOW_FIT_HOLD	Shadows/post/sky	on	Set to 0 to let the shadow cascade size follow the speed-based field of view every frame.	With 0 the world's shadows can jump while accelerating or braking.
+FH1_SHADOW_MAINONLY	Shadows/post/sky	on	Set to 0 to build shadow cascades for every camera, not just the main one.	0 costs render-thread time for no visible gain.
+FH1_SHADOW_MASKPASS	Shadows/post/sky	off	Set to 1 to use the old screen-space shadow mask pass with a depth prepass.	Old path had holes where alpha-tested geometry is discarded; mostly for comparison.
+FH1_SHADOW_MIN_TEXELS	Shadows/post/sky	3	Smallest object size, in shadow texels, that still casts a shadow in a cascade split.	Higher drops small objects' shadows (faster); lower adds small shadows (slower).
+FH1_SHADOW_PROXY	Shadows/post/sky	on	Set to 0 for the old per-material shadow casters, or opaque for proxies on opaque casters only.	Proxies batch shadow draws for speed; 0 is slower.
+FH1_SHADOW_RES	Shadows/post/sky	1024	Shadow cascade texture size in pixels (256 to 4096); 512 matches the original game.	Higher gives finer shadows and smoother moving shadows at more GPU cost.
+FH1_SHADOW_SMALL_CULL	Static world	on	Small distant scenery pieces stop casting shadows; set to 0 to let them all cast.	Faster frames; with 0 tiny props keep distant shadows at a cost in fps.
+FH1_SHADOW_SMALL_DIST	Static world	80	Distance in metres beyond which small scenery pieces stop casting shadows.	Larger values keep small shadows farther out at some fps cost.
+FH1_SHADOW_STATS	Perf/logging	off	Set to 1 to log shadow caster counts every 2 seconds.	No visible change; adds log lines.
+FH1_SHIFT_LIGHT	UI/HUD	off	Set to 1 to drive the HUD shift light with the old guessed rule (the original game never lights it).	A shift light flashes near the rev limit.
+FH1_SHOT	Dev hooks	unset	File path for a PNG screenshot saved automatically after a delay, after which the game quits.	Testing only: the game takes a screenshot, skips the launch menu and exits.
+FH1_SHOT2	Dev hooks	unset	File path for a second PNG screenshot taken about 0.1 s after the FH1_SHOT one.	Testing only: used to compare two frames for flicker.
+FH1_SHOT_AT	Dev hooks	4	Seconds after start at which the FH1_SHOT screenshot is taken.	Testing only: changes when the automatic screenshot happens.
+FH1_SKIDMARKS	Effects	on	Set to 0 to turn off tyre skid marks.	No skid marks are left on the road; slightly cheaper.
+FH1_SKID_CULL	Effects	on	Set to 0 to disable bounds-based culling of skid mark meshes.	On saves GPU work by skipping unseen marks; 0 always draws them.
+FH1_SKID_GAIN	Effects	2.0	Strength multiplier for tyre skid marks on the road.	Higher makes skid marks darker and more visible; lower makes them subtle.
+FH1_SKILLS	AI/traffic/races	on	Set to 0 to turn off skill-point chains (drifts, near misses etc.) and the skill HUD.	Off removes skill scoring and its rewards.
+FH1_SKILL_HUD	UI/HUD	on	Uses the Forza skill and popularity HUD; set to 0 for the plain text version.	Changes how skill chains and popularity are displayed.
+FH1_SKILL_MULT_EXT	AI/traffic/races	off	Set to 1 to allow skill multipliers x4 and x5 beyond the original game x3 cap.	Higher multipliers mean faster skill score and XP gain.
+FH1_SKILL_WINDOW	AI/traffic/races	3	Seconds you have to keep a skill chain alive before it banks.	Longer makes chains easier to keep going.
+FH1_SKY	Shadows/post/sky	on	Set to 0 to turn off the game's sky rendering.	Sky disappears; slightly faster.
+FH1_SKY_CLOCK_SECS	Shadows/post/sky	0.5	Real seconds between sky colour/sun updates as the clock moves; 0 updates every change.	Higher is cheaper but sky colours change in small steps; lower is smoother.
+FH1_SKY_CLOUDS	Shadows/post/sky	on	Set to 0 to turn off only the clouds.	No clouds in the sky or reflections; slightly faster.
+FH1_SKY_CUBE_AB	Perf/logging	off	Set to 1 to toggle the reflection-cube cloud pass every 5 seconds and log frame times.	Testing only: clouds in reflections flip on and off.
+FH1_SKY_DUMP	Dev hooks	unset	File prefix; each sky part's translated shader is written there.	Testing only: writes shader files to disk.
+FH1_SKY_LOG	Perf/logging	off	Any value logs sky camera direction and per-part shader constants.	No visible change; adds log lines.
+FH1_SKY_SCROLL_HZ	Shadows/post/sky	10	How many times per second the cloud scroll is written to the GPU; 0 means every frame.	Higher is marginally smoother clouds at more CPU cost; lower saves a bit.
+FH1_SKY_SKIP	Dev hooks	unset	Comma list of sky parts to leave out (e.g. fogsky, atmosphere) for debugging.	Testing only: listed sky parts vanish.
+FH1_SLIDING_INSTABILITY	Vehicle/handling	on	Adds the game's slight load wobble when tyres slide; set to 0 to turn it off.	Slides feel a bit livelier and less smooth.
+FH1_SLIPCLAMP	Vehicle/handling	1	The stats-harness wheel slip clamp, used in parity test mode only; 0 turns it off.	No visible effect in normal driving; only changes parity-test numbers.
+FH1_SLIP_AXIS	Vehicle/handling	on	Applies the game's tyre slip-axis scale. Set to 0 to use the curves' own peaks as before.	Changes how tyres behave at the grip limit and in slides.
+FH1_SLIP_CLAMP	Vehicle/handling	off	Set to 1 to clamp normalised tyre slip at 2.5 times peak as before 2026-10-06; the game itself has no clamp.	Locked or spinning wheels lose grip differently; mainly a parity A/B switch.
+FH1_SLIP_FLOOR	Vehicle/handling	6.0	Minimum speed in m/s used when computing tyre slip ratio (the game uses 6.0).	Lower values make tyres more sensitive to wheelspin at low speed; higher values soften launches.
+FH1_SMASH_FRAMES	Dev hooks	unset	Folder path where the smash test saves screenshot frames.	Testing only: writes PNG files.
+FH1_SMASH_INDEX	Dev hooks	0	Which candidate prop (nearest first) the smash test drives into.	Testing only: picks the test target.
+FH1_SMASH_SPEED	Dev hooks	15	Speed in m/s the car is launched at in the smash test.	Testing only: sets crash test speed.
+FH1_SMASH_STATS	Perf/logging	off	Set to any value to log prop collision query timings every 2 seconds.	Adds log lines only.
+FH1_SMASH_TEST	Dev hooks	unset	Runs an automated crash test against a chosen kind of prop and exits.	Testing only: moves the car and takes screenshots.
+FH1_SMOKE	Effects	on	Choose the tyre smoke style: unset = new smoke, old = the previous game-effect smoke, 0 or off = no smoke.	Changes the look of tyre smoke or removes it entirely.
+FH1_SMOKE_AMOUNT	Effects	1.0	Multiplier on how much tyre smoke is emitted.	Higher gives thicker smoke clouds; 0 gives none.
+FH1_SMOKE_BREAKUP	Effects	on	Set to 0 to emit smoke in an even stream of uniform puffs.	On gives uneven, wispy smoke; 0 looks more regular and artificial.
+FH1_SMOKE_BURNOUT	Effects	on	Set to 0 to turn off the fixes for smoke during standing burnouts.	On gives bigger, rising smoke clouds for standing burnouts and a lower puff cap.
+FH1_SMOKE_DEBUG	Perf/logging	off	Set to 1 to print tyre smoke debug information.	Adds log lines only.
+FH1_SMOKE_LIFE	Effects	1.0	Multiplier on how long tyre smoke puffs last.	Longer life leaves smoke hanging in the air longer.
+FH1_SMOKE_MAX	Effects	1200	Maximum number of tyre smoke puffs alive at once (100 to 20000).	Higher gives denser smoke but costs fps; lower is cheaper and thinner.
+FH1_SMOKE_OLD	Effects	off	Set to 1 to use the first-draft tyre smoke tuning (bigger puffs, all spawned at one point) instead of the game-XML sizes; only matters with the legacy game smoke.	Testing only: tyre smoke puffs look larger and clumpier.
+FH1_SMOKE_OPACITY	Effects	1.0	Multiplier on tyre smoke opacity (0 to 3).	Higher makes smoke more solid; lower makes it more transparent.
+FH1_SMOKE_PUSH	Effects	on	Set to 0 to stop smoke being pushed aside by the car's body.	On keeps smoke from passing through the car.
+FH1_SMOKE_SIZE	Effects	1.0	Multiplier on tyre smoke puff size.	Larger puffs look bigger and fuller.
+FH1_SMOKE_SLIP_RATIO	Effects	0.22	Slip-to-speed ratio (about 13 degrees) above which sliding makes smoke.	Higher needs a bigger drift angle before smoke appears.
+FH1_SMOKE_SPEED_SLIP	Effects	0.05	Extra slip in m/s needed to start smoke for each m/s of car speed.	Higher makes smoke start later at speed; lower makes it easier to trigger.
+FH1_SMOKE_STILL_RATE	Effects	6.0	Smoke puffs per second per wheel when the car is stationary (burnout).	Higher gives thicker smoke from standing burnouts.
+FH1_SMOKE_STRETCH	Effects	0.06	Seconds of screen motion each smoke puff is smeared over.	Higher gives longer streaky puffs; 0 gives round puffs.
+FH1_SMOKE_STRICT	Effects	on	Set to 0 to allow tyre smoke on brief or mild slips again.	On means only real sliding smokes, not tyre squeal around corners.
+FH1_SMOKE_SUSTAIN	Effects	on	Set to 0 to make smoke start immediately instead of after sustained slip.	On means brief traction breaks do not smoke; 0 smokes on any slip.
+FH1_SMOKE_VOLUME	Effects	on	Set to 0 to disable the car-shaped volume smoke shading.	On makes smoke wrap around and shade against the car; 0 is the simpler old look.
+FH1_SPANS	Perf/logging	off	Set to 1 to track how long each game system runs, even without the performance recorder.	Adds overhead; only useful for finding what causes a stall.
+FH1_SPAWN	Dev hooks	unset	Number of the map start location to spawn at; unset uses the map home position.	Testing only: you start at a different spot on the map.
+FH1_SPEED_GRIP	Vehicle/handling	on	Reduces tyre grip at very low speeds the way the game does; set to 0 to disable.	Changes how cars grip and creep at walking pace.
+FH1_STALL_ALL_THREADS	Perf/logging	on	Set to 0 to record stack traces of the main thread only when a stall is detected.	Only affects the detail of freeze reports.
+FH1_STALL_STACKS	Perf/logging	on	Set to 0 to report stalls without suspending threads to sample their stacks.	Off avoids a tiny pause during a stall but gives less diagnostic detail.
+FH1_STALL_WATCH	Perf/logging	on	Set to 0 to disable the watchdog that records long freezes and what the game was doing.	Off removes freeze diagnostics; no visible change.
+FH1_STANDSTILL_HOLD	Vehicle/handling	on	The car automatically holds itself with brakes and static friction at a standstill; set to 0 to disable the hold.	Stopped cars stay put on slopes; with 0 they can creep or roll.
+FH1_STATIC_AABB	Static world	on	Set to 0 to let Bevy compute bounding boxes for static scenery instead of skipping them.	Default saves main-thread CPU time each frame; 0 is slower but the old behaviour.
+FH1_STATIC_KEEP_MESHES	Static world	off	Set to 1 to keep full CPU meshes for scenery already packed into the static GPU arena.	Uses more memory and upload time; only useful for debugging the static world renderer.
+FH1_STATIC_WORLD	Static world	on	Set to 0 to turn off the GPU-arena static scenery renderer and use ordinary per-entity scenery drawing.	0 is slower and uses more CPU but is the fallback path; it is also off automatically under RTX.
+FH1_STATIC_WORLD_COMPACT	Static world	on	Set to 0 to disable compaction of the static-world draw lists.	Changes draw submission efficiency only; 0 can cost performance.
+FH1_STATIC_WORLD_CULL	Static world	on	Set to 0 to disable GPU culling of the static scenery.	0 draws everything in range, costing GPU/CPU performance.
+FH1_STATIC_WORLD_HIZ	Static world	on	Set to 0 to disable the depth-pyramid occlusion test in the static world renderer.	Off draws everything in view even if hidden behind other objects, costing GPU time.
+FH1_STATIC_WORLD_PROBE	Static world	on	Set to 0 to stop drawing static scenery into the car reflection probe faces.	0 removes scenery from car reflections but saves a little GPU time.
+FH1_STATIC_WORLD_REBIND	Static world	on	Set to 0 to stop re-resolving static-world materials when they change (e.g. at the dusk/night switch).	0 can leave static scenery with stale or wrong materials after a change; mainly a debugging toggle.
+FH1_STATIC_WORLD_SHADOWS	Static world	on	Set to 0 to stop static scenery from being drawn into the shadow cascades.	0 removes shadows from buildings and props and saves GPU time.
+FH1_STM	Drivetrain/assists	on	Allows stability management (STM) when selected in assists; set to 0 to disable it regardless of setting.	With 0, the STM assist option does nothing.
+FH1_STREAM_BUDGET	Scenery/props/zones	on	Limits how many scenery entities spawn or despawn per frame; 0 removes the limit, ab alternates on/off every 20 s for comparison.	On smooths streaming hitches while driving; 0 can cause stutter when new areas load.
+FH1_STREAM_MS	Scenery/props/zones	3	Milliseconds per frame the main thread may spend placing props and finishing zone models (0 = entity limits only).	Higher loads scenery faster but can cause frame hitches; lower is smoother but pop-in lasts longer.
+FH1_SURFACE_FX	Effects	on	Set to 0 to turn off the dirt, dust, gravel, grass and leaf particles thrown up by tyres on non-tarmac surfaces.	Off removes tyre surface particles; slightly less CPU work.
+FH1_SURFACE_FX_LOG	Perf/logging	off	Set to any value to print periodic log lines about surface particle effects (dust, dirt, grass, gravel) emitted from the tyres.	Testing only: extra console log lines, no visual change.
+FH1_SURFACE_TYRE	Vehicle/handling	on	Each surface uses its own tyre terms (dirt, grass etc); set to 0 to use asphalt's terms with only a friction scale.	Off-road surfaces feel more distinct; with 0 they differ only by grip level.
+FH1_SUSP_GAME	Vehicle/handling	on	Uses the game full suspension model (wheel vertical motion, tyre spring, damper limits, bump stops); set to 0 for the old simple raycast suspension.	More faithful body roll and ride; off gives a stiffer, simpler feel.
+FH1_SUSP_X1000	Vehicle/handling	off	Set to 1 to use the old suspension stiffness guess of 1000 instead of scaling by car mass.	Makes suspension much stiffer or softer, changing roll and ride.
+FH1_SW_BATCH_OPS	Static world	on	Set to 0 to disable batched uploads of static-world changes and rebuild lists on every fade step.	0 causes heavier frames/hitches at zone switches; default is smoother.
+FH1_SW_DRAW_ORDER	Static world	on	Set to 0 to draw the static scenery in the old material-group order instead of near cutouts, near occluders, near opaque, far opaque, far cutouts.	The new order lets near trees / fences and buildings hide what is behind them earlier, saving GPU shading; looks identical.
+FH1_SW_MASK_NEAR_DIST	Static world	80	Distance in metres within which cutout scenery (trees, fences) is drawn first in the static world pass.	Performance tuning only; no visual change.
+FH1_SW_NEAR_DIST	Static world	150	Distance in metres that splits opaque static scenery into a near group (drawn first) and a far group.	Performance tuning only; no visual change.
+FH1_SW_PREPASS	Static world	on	Set to 0 to turn off the depth-only pre-pass of big nearby ground, road and building scenery.	The pre-pass makes the main pass shade those pixels once and skip what they hide; 0 = old behaviour. Needs FH1_SW_DRAW_ORDER on.
+FH1_SW_PREPASS_DIST	Static world	120	Distance in metres within which big opaque static scenery goes into the depth pre-pass.	Larger = more pre-pass cost, fewer hidden pixels shaded.
+FH1_SW_PREPASS_RADIUS	Static world	4	Minimum half-size in metres of static scenery that goes into the depth pre-pass.	Smaller = more (and smaller) objects in the pre-pass.
+FH1_SW_SHADOW_DITHER	Static world	on	Set to 0 to stop dithering static scenery shadows while props and zones fade between detail levels.	On: shadows fade with the object instead of both detail levels casting at once and popping; 0 = old.
+FH1_TCS_YAW_GATE	Drivetrain/assists	on	Traction control is forced on past 50 degrees of body slip and off between 20 and 50; set to 0 to use only your TCS setting.	Changes when TCS steps in during big slides.
+FH1_TELEPORT	Dev hooks	unset	Comma list x,y,z[,yaw degrees] of a map position where the car is held every frame.	Testing only: the car is pinned at that spot and the launch menu is skipped.
+FH1_THUMB_RENDER	UI/HUD	on	Renders live car photos for the car browser; set to 0 to disable them.	Car thumbnails appear in the browser; off saves GPU and loading work.
+FH1_TOD	Dev hooks	unset	Starts the in-game clock at a given time, written hh:mm (e.g. 20:30).	Testing only: sets the starting time of day (sky, lighting, headlights).
+FH1_TOD_SPEED	Dev hooks	unset	Speed of the day/night clock: 1 is the game's own rate, 0 freezes time, larger runs faster.	Testing only: day turns to night faster or stays frozen.
+FH1_TRAFFIC	AI/traffic/races	on	Set to 0 to turn off free-roam traffic.	No traffic cars on the roads; faster loading and less CPU.
+FH1_TRAFFIC_ALL_PAINTS	AI/traffic/races	off	Set to 1 to let traffic use every paint colour, including loud ones, in the older paint rule.	Traffic gets more colourful (only matters with dull paints on).
+FH1_TRAFFIC_DEBUG	AI/traffic/races	off	Set to any value to print extra traffic debugging information to the log.	Testing only: log output only, no visible gameplay change.
+FH1_TRAFFIC_DENSITY	AI/traffic/races	1.0	Multiplier on the game's traffic density.	Higher fills the roads with more cars; 0 removes them.
+FH1_TRAFFIC_DIRECT_STEER	AI/traffic/races	on	Set to 0 to make traffic steer through the player's steering controller instead of direct steering.	Changes how smoothly traffic follows lanes.
+FH1_TRAFFIC_DRAW	AI/traffic/races	350	Distance in metres beyond which traffic cars are not drawn.	Larger values show traffic from further away (more cars drawn, small cost); smaller values make traffic pop in closer.
+FH1_TRAFFIC_DULL_PAINTS	AI/traffic/races	off	Set to 1 to give traffic only everyday dull colours (greys, whites, dark tones).	Traffic cars look plainer instead of using most factory colours.
+FH1_TRAFFIC_FESTIVAL	AI/traffic/races	on	Set to 0 to disable festival-area traffic cars.	No extra festival cars near the festival site.
+FH1_TRAFFIC_FRESH	AI/traffic/races	4.0	Seconds between spawns that need a newly built car body.	Lower fills traffic variety faster but causes more frame hitches.
+FH1_TRAFFIC_LANE_FIT	AI/traffic/races	on	Set to 0 to stop fitting traffic lanes to the measured paved road width.	Without it traffic may drive closer to road edges.
+FH1_TRAFFIC_LAZY_PATH	AI/traffic/races	on	Traffic cars compute their lane path lazily; set to 0 for the old eager path building.	Lower CPU cost and fewer hitches when traffic spawns.
+FH1_TRAFFIC_MAX	AI/traffic/races	16	Maximum number of traffic cars on the road at once.	Higher gives busier roads at some CPU cost; lower gives emptier roads.
+FH1_TRAFFIC_NEAR	AI/traffic/races	110	Distance in metres within which traffic cars run full physics instead of simple path-following.	Larger values give more physical traffic near you at a higher CPU cost.
+FH1_TRAFFIC_PLACE_REST	AI/traffic/races	on	Traffic cars are placed at rest height on their springs when they appear; set to 0 to drop them from 0.3 m as before.	Traffic cars no longer visibly drop and bounce when they spawn in view.
+FH1_TRAFFIC_RACE	AI/traffic/races	off	Set to 1 to keep traffic on the road during races.	Races have road traffic mixed in; off means traffic disappears while racing.
+FH1_TRAFFIC_SYNC_GEAR	AI/traffic/races	on	When a far traffic car enters full physics it gets the right gear and a locked clutch for its speed; set to 0 for the old first-gear start.	Removes a jolt/engine-braking jerk on traffic cars appearing near you.
+FH1_TRAFFIC_WARM_FAST	AI/traffic/races	off	Set to 1 to build the traffic car pool faster (only 2 cars per frame) behind the startup card, ignoring the usual frame-time throttle.	Shorter traffic pre-build on the loading screen, but the loading card may stutter more.
+FH1_TRAFFIC_WARM_SCENE	AI/traffic/races	on	In the Remaster renderer, a pooled traffic car counts as ready once its body model has spawned; set to 0 to count only the game-shaded body flag.	Avoids the loading card lifting while traffic cars are still instantiating (pop-in of traffic).
+FH1_TRAFFIC_XTRACK	AI/traffic/races	0.8	Strength of traffic cars' correction back toward the lane centre (0 = pure pursuit only).	Higher keeps traffic tighter to the lane; 0 lets them drift more.
+FH1_TRANSP_CENSUS	Perf/logging	on	Counts visible transparent objects each frame for the performance logger; set to 0 to disable the counting.	No visual change; tiny CPU saving when off.
+FH1_TURBO_GAME	Drivetrain/assists	on	Turbo boost follows the game's rules. Set to 0 for the older simplified boost model.	Changes turbo lag and how power builds with boost.
+FH1_TYRE_REC	Dev hooks	unset	Path to a recorded tyre capture file used by a physics comparison test.	Testing only: no effect in the game itself.
+FH1_TYRE_SCALES	Vehicle/handling	on	Uses the game's per-compound tyre grip scales in play; set to 0 for the dev-screen grip (all scales 1.0).	Cars grip as in the real game; with 0 grip matches the stats screen instead.
+FH1_TYRE_SMOKE	Effects	on	Set to 0 to disable the legacy game-data tyre smoke, or force to make every wheel smoke on any surface; only applies when the old smoke mode is selected.	Tyre smoke disappears (0) or appears constantly (force); the default Remaster smoke is unaffected.
+FH1_TYRE_VIS_LIFT	Car paint/models	on	Set to 0 to stop lifting drawn wheels by the tyre squash so they no longer sit slightly above the ground.	Off lets tyres sink about 1 cm into the road visually; physics unchanged.
+FH1_TYRE_WIDTH	Vehicle/handling	on	Applies tyre width to grip. Set to 0 to drop the width scaling.	Narrow and wide tyres stop differing in grip when 0.
+FH1_UI_DEBUG	Dev hooks	unset	Seconds after start at which all placed UI parts are logged once.	Testing only: log output only.
+FH1_UI_EVENTS	Dev hooks	unset	Comma-separated UI events to fire on the scene chosen with the UI scene variable.	Testing only: scripted UI animation checks.
+FH1_UI_FASTPATH	UI/HUD	on	Only re-evaluates and places UI scenes that changed; set to 0 to update every scene every frame.	Faster HUD (less CPU); 0 is the slow old path.
+FH1_UI_LANG	UI/HUD	EN	Two-letter language code of the game UI text to load (defaults to EN).	Changes the language of the in-game UI text if that language was installed.
+FH1_UI_SCENE	Dev hooks	unset	Name of a single UI scene to show on its own for inspection.	Testing only: displays an isolated UI scene and skips the launch screen and loading covers.
+FH1_UI_SLIDES	Dev hooks	unset	Comma-separated component=slide pairs to jump UI scene components to a given slide.	Testing only: scripted UI scene screenshots.
+FH1_UPGRADES	Vehicle/handling	on	Applies saved performance upgrades to the car physics; set to 0 to drive stock (menu still shows them).	Upgraded cars handle and accelerate like stock when off.
+FH1_UPG_RULES	Vehicle/handling	on	Upgrade parts follow the game's rules for weight, boost and tyre size. Set to 0 for the older approximations.	Changes how upgrades alter car weight and performance.
+FH1_UPLOAD_MB	Perf/logging	0	Megabytes of new textures/images uploaded to the GPU per frame; 0 means no limit.	A cap spreads upload hitches but caused missing road and barrier textures, so it is off.
+FH1_VIEWS_AB	Dev hooks	unset	Set to 1 or a comma list of render-pass names to run an automatic A/B test that cycles which views/cameras render and logs frame times.	Testing only: periodically switches off render views while measuring performance; will look glitchy.
+FH1_VIEWS_SECS	Dev hooks	4	Seconds spent on each mode in the views A/B test (minimum 2).	Testing only: duration per step of the views performance test.
+FH1_VIEWS_START	Dev hooks	20	Seconds to wait before the views A/B test (FH1_VIEWS_AB) starts cycling modes.	Testing only: delay for the views performance test.
+FH1_VIEW_FX	Effects	on	In-car camera effects such as shake and movement from the game's camera physics. Set to 0 for rigid views.	Cameras feel alive by default; 0 locks them rigid.
+FH1_VSYNC	Renderer	on	Set to 0 to turn vsync off (no-vsync present mode).	Off lifts the monitor refresh cap and may cause tearing; fps can go higher.
+FH1_WARM_PROGRAMS	Perf/logging	on	Set to 0 to compile scenery shaders on first sight instead of up front during loading.	On makes loading a little longer but avoids big frame hitches when driving into new areas.
+FH1_WAYPOINT_CHEVRONS	UI/HUD	on	Draws guidance chevrons toward your waypoint; set to 0 to hide them.	Fewer navigation markers on screen when off.
+FH1_WHEELS_AB	Perf/logging	off	Set to 1 to cycle wheel modes (game-shaded, no wheel shadow proxies, glTF) every 5 seconds and log frame times.	Testing only: wheels change look every few seconds.
+FH1_WINDOW	Renderer	unset	Window mode: borderless (borderless fullscreen), fullscreen (exclusive), or windowed/unset (1280x720 window).	Changes how the game window is shown; fullscreen modes use your whole monitor.
+FH1_WORLDMAP	UI/HUD	on	Enables the full-screen world map; set to 0 to disable it.	No world map screen when off.
+FH1_WORLD_AUTOPICK	Dev hooks	unset	Map id to select automatically on the world picker shortly after launch.	Testing only: skips choosing a world in the main menu.
+FH1_XEX_KEY	Dev hooks	unset	The 32-hex-digit Xbox 360 retail key needed to decrypt the game executable during setup.	Testing only: setup/shader loading needs it if no key file exists; no effect while playing.
+FH1_XEX_KEY_EMBED	Dev hooks	unset	Build-time only: embeds the XEX key into a release build.	Testing only: has no effect when running the game.
+FH1_ZONES	Scenery/props/zones	on	Set to 0 to stop using the game's visibility zones and stream plain 256 m tiles instead.	Zones match the original draw logic; 0 gives the older tile look and different performance.
+FH1_ZONE_CULL_SCALE	Scenery/props/zones	1.6	Multiplier on the game's zone model cull distances where no coarser detail takes over (1 = game distances).	Higher draws world pieces such as barriers further out, reducing pop-in but costing fps.
+FH1_ZONE_FADE	Scenery/props/zones	0.6	Seconds that world zone models take to fade in and out when their detail level changes (0 = hard switch).	Longer fades hide pop-in more softly; 0 shows abrupt changes.
+FH1_ZONE_PARK	Scenery/props/zones	6000	Number of unloaded zone models kept in memory for quick reuse (0 = off).	Higher makes revisiting areas faster and smoother at the cost of RAM and VRAM; 0 re-reads from disk.
+FH1_ZONE_PRELOAD	Scenery/props/zones	on	Set to 0 to stop preloading zone models ahead of the car.	On reduces pop-in while driving; 0 loads only when needed and shows more pop-in.
+FH1_ZONE_STATS	Perf/logging	off	Set to any value to print zone streaming statistics to the log.	Testing only: adds log lines, no visible change.
+FH1_ZONE_UNION	Scenery/props/zones	900	Radius in metres within which neighbouring zones' model lists are combined for drawing (0 = off).	Larger values reduce missing or popping distant scenery at some memory and draw cost.

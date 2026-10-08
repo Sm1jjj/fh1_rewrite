@@ -47,7 +47,8 @@ struct MainStamps {
 pub fn plugin(app: &mut App) {
     let log = std::env::var("FH1_PERF_LOG").is_ok_and(|v| v == "1");
     // The gameplay recorder (perf/record.rs) reads the same splits without the log lines.
-    if !log && !super::record::on() {
+    // The stall watchdog (always on, record.rs `stall_watch`) needs the phase beats too.
+    if !log && !super::record::on() && !super::record::stall_watch() {
         return;
     }
     let rs = RenderStamps::default();

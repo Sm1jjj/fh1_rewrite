@@ -1,6 +1,7 @@
 use bevy_camera::{MainPassResolutionOverride, Viewport};
 use bevy_ecs::system::Res;
 use bevy_math::{UVec2, Vec3Swizzles};
+use bevy_render::diagnostic::RecordDiagnostics;
 use bevy_render::{
     camera::ExtractedCamera,
     extract_component::DynamicUniformIndex,
@@ -58,12 +59,16 @@ pub fn atmosphere_luts(
         return;
     };
 
+    // FH1 patch: pass timing for the perf recorder (RenderDiagnosticsPlugin).
+    let recorder = ctx.diagnostic_recorder();
+    let diagnostics = recorder.as_deref();
     let command_encoder = ctx.command_encoder();
 
     let mut luts_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("atmosphere_luts"),
         timestamp_writes: None,
     });
+    let pass_span = diagnostics.pass_span(&mut luts_pass, "atmosphere_luts");
 
     fn dispatch_2d(compute_pass: &mut ComputePass, size: UVec2) {
         const WORKGROUP_SIZE: u32 = 16;
@@ -136,6 +141,7 @@ pub fn atmosphere_luts(
     );
 
     dispatch_2d(&mut luts_pass, settings.aerial_view_lut_size.xy());
+    pass_span.end(&mut luts_pass);
 }
 
 pub fn render_sky(
@@ -172,6 +178,9 @@ pub fn render_sky(
         return;
     }; //TODO: warning
 
+    // FH1 patch: pass timing for the perf recorder (RenderDiagnosticsPlugin).
+    let recorder = ctx.diagnostic_recorder();
+    let diagnostics = recorder.as_deref();
     let command_encoder = ctx.command_encoder();
 
     let mut render_sky_pass = command_encoder.begin_render_pass(&RenderPassDescriptor {
@@ -208,5 +217,7 @@ pub fn render_sky(
             lights_uniforms_offset.offset,
         ],
     );
+    let pass_span = diagnostics.pass_span(&mut render_sky_pass, "render_sky");
     render_sky_pass.draw(0..3, 0..1);
+    pass_span.end(&mut render_sky_pass);
 }

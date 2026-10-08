@@ -26,6 +26,7 @@ mod grass;
 mod crowd;
 mod effects;
 mod effects_surface;
+mod flags;
 mod fx_overrides;
 mod imported;
 mod mipgen;
@@ -121,6 +122,9 @@ struct SafePose {
 }
 
 fn main() -> AppExit {
+    // First of all, single-threaded: settings.json `flags` values become FH1_* environment variables (unless the real
+    // environment already sets them) and the documented section is rewritten (flags.rs). Everything below may read them.
+    flags::apply_startup();
     // Before anything logs: stdout/stderr through a buffered pipe so no game thread waits on the log file (logpipe.rs).
     logpipe::install();
     let mut data_dir = PathBuf::from("data");
@@ -246,6 +250,7 @@ fn main() -> AppExit {
         .add_plugins(scenery::P2Plugin)
         .add_plugins(ui::UiPlugin { settings_path: data_dir.join("settings.json") })
         .add_plugins(diag::DiagPlugin)
+        .add_systems(Startup, flags::log_startup)
         .init_resource::<PendingCar>()
         .add_systems(Startup, (setup_world, (track::setup, spawn_car).run_if(ui::world_load::world_ready)))
         .add_systems(

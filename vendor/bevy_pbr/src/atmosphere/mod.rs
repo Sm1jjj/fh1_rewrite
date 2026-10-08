@@ -78,7 +78,7 @@ use environment::{
     prepare_atmosphere_probe_bind_groups, prepare_atmosphere_probe_components,
     prepare_probe_textures, AtmosphereEnvironmentMap,
 };
-use node::{atmosphere_luts, render_sky};
+pub use node::{atmosphere_luts, render_sky};
 use resources::{
     prepare_atmosphere_transforms, prepare_atmosphere_uniforms, queue_render_sky_pipelines,
     AtmosphereTransforms, GpuAtmosphere, RenderSkyBindGroupLayouts,

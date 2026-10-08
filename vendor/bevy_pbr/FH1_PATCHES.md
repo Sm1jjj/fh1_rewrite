@@ -30,3 +30,19 @@ Rebase them when Bevy is upgraded (or drop them if upstream gains shadow caching
    each x 10 material types in the user's log 20261008_154403, mostly task-pool scope cost for a handful of tick checks.
    Now a serial walk when the material has <= 4096 entities (`Query<(), With<MeshMaterial3d<M>>>::iter().len()`, cheap).
    `FH1_SPEC_PAR=1` = always parallel (upstream).
+
+5. **Pass timing spans** (orchestrator, 2026-10-08 night, 200 fps push): `RecordDiagnostics::pass_span` around each
+   directional / point shadow pass (`src/render/light.rs` `view_shadow_pass`, named by the pass name) and the atmosphere
+   LUT compute pass + `render_sky` pass (`src/atmosphere/node.rs`), so the gameplay recorder's GPU table (fh1-engine
+   perf/record.rs) covers them. No-ops without `RenderDiagnosticsPlugin`.
+
+4. **Atmosphere buffer with several atmosphere cameras** (orchestrator, 2026-10-08, car probe face atmosphere).
+   `write_atmosphere_buffer` (`src/atmosphere/resources.rs`) took `Query<&GpuAtmosphere, With<Camera3d>>::single()`. With
+   the car probe face camera also carrying `AtmosphereSettings` it found two, returned early, the global
+   `AtmosphereBuffer` was never written, and every view's mesh view bind group dropped bindings 31-33 while the pipeline
+   key kept ATMOSPHERE (validation error in the static world draw). Now the first camera's copy is written: the buffer is
+   global and holds the planet (one `Atmosphere` entity in FH1), identical for every camera.
+
+6. **Atmosphere node re-export** (orchestrator for worker B, 2026-10-08 night, P15-B): `atmosphere/mod.rs` re-exports `node::{atmosphere_luts, render_sky}` (`pub use`) so
+fh1-render's half-res effects composite (fx_half_res.rs) can order itself `.after(bevy::pbr::render_sky)`; `resources.rs` makes `AtmosphereBindGroups`, `AtmosphereLutPipelines` and
+`RenderSkyPipelineId` `pub` (they appear in `render_sky`'s signature, else the path is a private type from outside).

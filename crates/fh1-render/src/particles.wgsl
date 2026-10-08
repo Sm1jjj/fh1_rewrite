@@ -5,8 +5,14 @@
 // it was spawned on (stand-in for the `_soft` variant's depth fade). The colour is written into the FH1 post chain's
 // sqrt-encoded buffer (the CPU encodes the light; squared back when the post chain is off).
 
+// Large effects are drawn by the half-res effects pass instead (fx_half_res.rs, FX_HALF_RES): world-space quads, its own
+// view bindings, the identity transform.
+#ifdef FX_HALF_RES
+#import fh1_render::fx_half::{view, get_world_from_local}
+#else
 #import bevy_pbr::mesh_view_bindings::view
 #import bevy_pbr::mesh_functions::get_world_from_local
+#endif
 
 struct ParticleParams {
     fog: vec4<f32>,
@@ -29,7 +35,7 @@ struct ParticleParams {
 
 struct In {
     @builtin(instance_index) instance: u32,
-    // Particle centre relative to the batch entity.
+    // Particle centre relative to the batch entity (world space under FX_HALF_RES).
     @location(0) pos: vec3<f32>,
     // Corner (+-1, +-1).
     @location(1) corner: vec2<f32>,

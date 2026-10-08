@@ -11,8 +11,14 @@
 // test does not cut the part of the puff in front of a surface. Lighting uses the sphere: entry-point normal + noise
 // bumps, and the sun's path length through the puff for self-shadowing.
 
+// Half-res effects pass (fh1-render fx_half_res.rs, FH1_FX_HALF_RES=0 = off): same shader, our own view bindings and
+// world-space vertices (identity get_world_from_local), material at group 1.
+#ifdef FX_HALF_RES
+#import fh1_render::fx_half::{view, globals, get_world_from_local}
+#else
 #import bevy_pbr::mesh_view_bindings::{view, globals}
 #import bevy_pbr::mesh_functions::get_world_from_local
+#endif
 
 struct SmokeParams {
     // xyz toward the sun, w = sun lux.

@@ -144,6 +144,9 @@ pub struct Smoke {
     size: f32,
     life: f32,
     draw: Option<(Entity, Handle<Mesh>, Handle<SmokeMaterial>)>,
+    /// Half-res effects pass (fh1-render fx_half_res.rs): the noise texture and smoke.wgsl, made on first use.
+    half_noise: Option<Handle<Image>>,
+    half_shader: Option<Handle<Shader>>,
     // Scratch.
     order: Vec<(f32, u32)>,
     pos: Vec<[f32; 3]>,
@@ -168,6 +171,8 @@ impl Default for Smoke {
             size: knob("FH1_SMOKE_SIZE", 1.0).max(0.1),
             life: knob("FH1_SMOKE_LIFE", 1.0).max(0.1),
             draw: None,
+            half_noise: None,
+            half_shader: None,
             order: Vec::new(),
             pos: Vec::new(),
             corner: Vec::new(),
@@ -640,6 +645,7 @@ fn draw(
     cars: Query<(Option<&Car>, Option<&AiCar>)>,
     fixed: Res<Time<Fixed>>,
     time: Res<Time>,
+    (mut half, assets): (Option<ResMut<fh1_render::fx_half_res::FxHalfRes>>, Res<AssetServer>),
 ) {
     let smoke = &mut *smoke;
     let cam = cams.iter().find(|c| c.1.is_active).map_or(Vec3::ZERO, |c| c.0.translation());
@@ -745,6 +751,51 @@ fn draw(
     smoke.order = order;
     // Quads actually drawn (camera-faded puffs are skipped).
     let n = smoke.pos.len() / 4;
+    if let Some(half) = half.as_deref_mut().filter(|_| fh1_render::fx_half_res::on()) {
+        // Half-res effects pass (fh1-render fx_half_res.rs; FH1_FX_HALF_RES=0 = the mesh below): the same quads in world
+        // space, drawn at quarter the pixel count against the half-res min/max depth and composited before Bevy's
+        // transparent pass. Smoke is the talk's textbook case: large, soft, low frequency, heavy overdraw in a burnout.
+        if let Some((ent, ..)) = smoke.draw {
+            if let Ok((mut v, ..)) = vis.get_mut(ent) {
+                v.set_if_neq(Visibility::Hidden);
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        use fh1_render::fx_half_res::{FxBatch, FxBlend, FxVertex};
+        let noise = smoke.half_noise.get_or_insert_with(|| images.add(noise_image())).clone();
+        let shader = smoke.half_shader.get_or_insert_with(|| assets.load("embedded://fh1_engine/smoke.wgsl")).clone();
+        let verts = (0..smoke.pos.len())
+            .map(|i| FxVertex {
+                pos: (Vec3::from(smoke.pos[i]) + centroid).to_array(),
+                corner: smoke.corner[i],
+                size_rot: smoke.size_rot[i],
+                colour: smoke.colour[i],
+                extra: smoke.extra[i],
+            })
+            .collect();
+        half.push(FxBatch {
+            shader,
+            blend: FxBlend::Premul,
+            tex0: Some(noise),
+            tex1: None,
+            params: FxBatch::uniform(&params),
+            verts,
+            dist2: centroid.distance_squared(cam),
+        });
+        return;
+    }
+    if n == 0 && fh1_render::particles::fx_mesh_cap_on() {
+        // Every puff camera-faded: hide instead of writing an empty mesh (Bevy's allocator skips an empty vertex buffer
+        // but still copies it: two "Use-after-free" errors per frame in the user's log). FH1_FX_MESH_CAP=0 = old.
+        if let Some((ent, ..)) = smoke.draw {
+            if let Ok((mut v, ..)) = vis.get_mut(ent) {
+                v.set_if_neq(Visibility::Hidden);
+            }
+        }
+        return;
+    }
     match &smoke.draw {
         Some((ent, mesh, mat)) => {
             if let Some(mut m) = meshes.get_mut(mesh) {
@@ -796,6 +847,7 @@ fn fill(m: &mut Mesh, s: &Smoke, n: usize) {
         dst.clear();
         dst.extend_from_slice(src);
     }
+    let prev = fh1_render::particles::quad_mesh_capacity(m);
     if let Some(VertexAttributeValues::Float32x3(v)) = m.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
         put(v, &s.pos);
     }
@@ -812,13 +864,8 @@ fn fill(m: &mut Mesh, s: &Smoke, n: usize) {
         put(v, &s.extra);
     }
     if let Some(Indices::U32(idx)) = m.indices_mut() {
-        let want = n * 6;
-        if idx.len() > want {
-            idx.truncate(want);
-        }
-        for q in idx.len() / 6..n {
-            let b = q as u32 * 4;
-            idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
-        }
+        fh1_render::particles::quad_indices(idx, n);
     }
+    // Stable allocation size (fh1-render particles.rs `fx_mesh_cap_on`; FH1_FX_MESH_CAP=0 = old).
+    fh1_render::particles::pad_quad_mesh(m, n, prev);
 }

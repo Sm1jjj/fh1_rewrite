@@ -57,6 +57,7 @@ use bevy_render::{
     mesh::allocator::MeshAllocator,
     view::{NoIndirectDrawing, RetainedViewEntity},
 };
+use bevy_render::diagnostic::RecordDiagnostics;
 use bevy_render::{
     mesh::RenderMesh,
     render_asset::RenderAssets,
@@ -2930,6 +2931,10 @@ fn view_shadow_pass<const IS_LATE: bool>(
 
     let depth_stencil_attachment = Some(view_light.depth_attachment.get_attachment(StoreOp::Store));
 
+    // FH1 patch: GPU / CPU time of each shadow pass for the perf recorder (RenderDiagnosticsPlugin).
+    let recorder = ctx.diagnostic_recorder();
+    let diagnostics = recorder.as_deref();
+
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some(&view_light.pass_name),
         color_attachments: &[],
@@ -2938,10 +2943,12 @@ fn view_shadow_pass<const IS_LATE: bool>(
         occlusion_query_set: None,
         multiview_mask: None,
     });
+    let pass_span = diagnostics.pass_span(&mut render_pass, view_light.pass_name.clone());
 
     if let Err(err) = shadow_phase.render(&mut render_pass, world, view_light_entity) {
         error!("Error encountered while rendering the shadow phase {err:?}");
     }
+    pass_span.end(&mut render_pass);
 }
 
 /// Creates the [`ClusterableObjectType`] data for a point or spot light.

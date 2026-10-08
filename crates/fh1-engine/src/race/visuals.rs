@@ -7,12 +7,23 @@
 //! HDR colour so bloom catches it, a 1.2 Hz pulse, near / far distance fades (no depth prepass in the remaster, so no
 //! scene-depth soft edges: shapes fade out at their foot instead of cutting into the ground). Shares its look with
 //! the world map's road chevrons (e4): track pink for the race, tier colours for event starts, group blue for street.
+//!
+//! Merged draw (P14, 2026-10-08 night; `FH1_MARKER_MERGE=0` = the old path, one entity + one sorted transparent draw
+//! per piece: 3-4 per visible event marker, 13 for the two gates + chevrons, 1 per pass ripple): every piece is baked
+//! into ONE world-space mesh on ONE entity with ONE material (one transparent draw), rebuilt only when the set of
+//! pieces changes (marker visible / look, gate progress, a pass ripple starting or ending). Per-piece colour,
+//! intensity, fades and emphasis ride in vertex attributes; pulse, sweeps and the pass ripple's growth are animated
+//! in the shader from `globals.time`, so nothing is rewritten per frame. The mesh is padded to power-of-two vertex /
+//! triangle capacities (as fh1-render particles `pad_quad_mesh`) so the mesh allocator reuses the freed range.
+//! Gameplay (gate crossing in race.rs) never reads these entities.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use bevy::asset::embedded_asset;
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
-use bevy::mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology};
+use bevy::math::Affine3A;
+use bevy::mesh::{Indices, MeshVertexAttribute, MeshVertexBufferLayoutRef, PrimitiveTopology, VertexFormat};
 use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -29,6 +40,24 @@ pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FH1_RACE_FX").map_or(true, |v| v != "0"))
 }
+
+/// `FH1_MARKER_MERGE=0`: one entity / draw per marker piece (the path before P14) instead of one merged mesh.
+pub fn merge_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_MARKER_MERGE").map_or(true, |v| v != "0"))
+}
+
+/// Merged mesh: per-piece colour (rgb display-linear HDR, a = intensity).
+const ATTRIBUTE_MARKER_COLOUR: MeshVertexAttribute = MeshVertexAttribute::new("Fh1_MarkerColour", 0x4648_0060, VertexFormat::Float32x4);
+/// Merged mesh: near fade start / end, far fade start / end (m).
+const ATTRIBUTE_MARKER_FADE: MeshVertexAttribute = MeshVertexAttribute::new("Fh1_MarkerFade", 0x4648_0061, VertexFormat::Float32x4);
+/// Merged mesh: x pulse Hz, y template-local height (beam bands), z emphasis, w pass-ripple birth (wrapped seconds,
+/// `globals.time` clock) or -1 for a static piece.
+const ATTRIBUTE_MARKER_K: MeshVertexAttribute = MeshVertexAttribute::new("Fh1_MarkerK", 0x4648_0062, VertexFormat::Float32x4);
+/// Pass ripple: scale grows by `exp(FLASH_GROW * age)` for `FLASH_LIFE` s (the old per-frame `scale *= 1 + 1.5 dt`,
+/// despawned after 0.9 s). Mirrored in marker.wgsl.
+const FLASH_GROW: f32 = 1.5;
+const FLASH_LIFE: f32 = 0.9;
 
 /// Shared with the map's chevrons (e4): MapProfileFullscreen.xml "track" pink and group-route blue, x2 HDR.
 fn pink() -> LinearRgba {
@@ -71,12 +100,29 @@ impl Material for MarkerMaterial {
         false
     }
     fn specialize(_: &MaterialPipeline, d: &mut RenderPipelineDescriptor, layout: &MeshVertexBufferLayoutRef, _: MaterialPipelineKey<Self>) -> Result<(), SpecializedMeshPipelineError> {
-        d.vertex.buffers = vec![layout.0.get_layout(&[
-            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
-            Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
-            Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
-            Mesh::ATTRIBUTE_UV_1.at_shader_location(3),
-        ])?];
+        if layout.0.contains(ATTRIBUTE_MARKER_K) {
+            // The merged mesh (see the module docs): per-piece parameters per vertex.
+            d.vertex.buffers = vec![layout.0.get_layout(&[
+                Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+                Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+                Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
+                Mesh::ATTRIBUTE_UV_1.at_shader_location(3),
+                ATTRIBUTE_MARKER_COLOUR.at_shader_location(4),
+                ATTRIBUTE_MARKER_FADE.at_shader_location(5),
+                ATTRIBUTE_MARKER_K.at_shader_location(6),
+            ])?];
+            d.vertex.shader_defs.push("MARKER_MERGED".into());
+            if let Some(f) = d.fragment.as_mut() {
+                f.shader_defs.push("MARKER_MERGED".into());
+            }
+        } else {
+            d.vertex.buffers = vec![layout.0.get_layout(&[
+                Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+                Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+                Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
+                Mesh::ATTRIBUTE_UV_1.at_shader_location(3),
+            ])?];
+        }
         d.primitive.cull_mode = None;
         if let Some(f) = d.fragment.as_mut() {
             for t in f.targets.iter_mut().flatten() {
@@ -104,7 +150,12 @@ impl Plugin for RaceVisualsPlugin {
         app.add_plugins(MaterialPlugin::<MarkerMaterial>::default())
             .init_resource::<Visuals>()
             .add_systems(Startup, build_meshes)
-            .add_systems(Update, (event_markers, gate_visuals, pass_flash, cannons).after(super::race_update));
+            .add_systems(Update, cannons.after(super::race_update));
+        if merge_on() {
+            app.init_resource::<Merged>().add_systems(Update, merged_markers.after(super::race_update));
+        } else {
+            app.add_systems(Update, (event_markers, gate_visuals, pass_flash).after(super::race_update));
+        }
     }
 }
 
@@ -167,38 +218,54 @@ impl Builder {
 
 /// Open cylinder along +Y (radius 1, height 1; scale it), uv = (around, up).
 fn cylinder(style: u8) -> Mesh {
+    cylinder_b(style).build()
+}
+
+fn cylinder_b(style: u8) -> Builder {
     let mut b = Builder::new();
     b.grid(32, 8, style, 0.0, |u, w| {
         let a = u * std::f32::consts::TAU;
         let n = Vec3::new(a.cos(), 0.0, a.sin());
         (n + Vec3::Y * w, n)
     });
-    b.build()
+    b
 }
 
 /// Flat annulus on y = 0 from radius `r0` to 1, uv = (around, radial 0..1).
 fn annulus(r0: f32, style: u8) -> Mesh {
+    annulus_b(r0, style).build()
+}
+
+fn annulus_b(r0: f32, style: u8) -> Builder {
     let mut b = Builder::new();
     b.grid(64, 4, style, 0.0, |u, w| {
         let a = u * std::f32::consts::TAU;
         let r = r0 + (1.0 - r0) * w;
         (Vec3::new(a.cos() * r, 0.0, a.sin() * r), Vec3::Y)
     });
-    b.build()
+    b
 }
 
 /// Vertical quad across X (-0.5..0.5) and up Y (0..1), facing Z.
 fn curtain(style: u8) -> Mesh {
+    curtain_b(style).build()
+}
+
+fn curtain_b(style: u8) -> Builder {
     let mut b = Builder::new();
     b.grid(16, 8, style, 0.0, |u, w| (Vec3::new(u - 0.5, w, 0.0), Vec3::Z));
-    b.build()
+    b
 }
 
 /// Floor quad (X -0.5..0.5, forward = -Z 0..1); uv.y grows forwards.
 fn floor_quad(style: u8, phase: f32) -> Mesh {
+    floor_quad_b(style, phase).build()
+}
+
+fn floor_quad_b(style: u8, phase: f32) -> Builder {
     let mut b = Builder::new();
     b.grid(2, 2, style, phase, |u, w| (Vec3::new(u - 0.5, 0.0, -w), Vec3::Y));
-    b.build()
+    b
 }
 
 #[derive(Resource, Default)]
@@ -213,7 +280,13 @@ struct Visuals {
     gates: Option<((usize, u32), Entity)>,
 }
 
-fn build_meshes(mut v: ResMut<Visuals>, mut meshes: ResMut<Assets<Mesh>>) {
+fn build_meshes(mut v: ResMut<Visuals>, mut meshes: ResMut<Assets<Mesh>>, merged: Option<ResMut<Merged>>) {
+    if let Some(mut m) = merged {
+        // Merged path: CPU templates only (indexed by the T_* constants), baked into the merged mesh.
+        m.templates = vec![cylinder_b(BEAM), cylinder_b(BAR), annulus_b(0.7, RING), annulus_b(0.05, RIPPLE), curtain_b(CURTAIN), curtain_b(FINISH)];
+        m.templates.extend((0..5).map(|k| floor_quad_b(CHEVRON, k as f32)));
+        return;
+    }
     v.meshes.insert("beam", meshes.add(cylinder(BEAM)));
     v.meshes.insert("bar", meshes.add(cylinder(BAR)));
     v.meshes.insert("ring", meshes.add(annulus(0.7, RING)));
@@ -513,6 +586,354 @@ fn cannons(mut st: Local<CannonState>, rs: Res<RaceState>, events: Res<Events>, 
                 s.ground_y = pos.y;
                 fx.spawn(id, &s);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- merged draw (FH1_MARKER_MERGE, default on)
+
+/// Template indices into [`Merged::templates`] (built in [`build_meshes`]); chevron k = `T_CHEVRON + k`.
+const T_BEAM: usize = 0;
+const T_BAR: usize = 1;
+const T_RING: usize = 2;
+const T_RIPPLE: usize = 3;
+const T_CURTAIN: usize = 4;
+const T_FINISH: usize = 5;
+const T_CHEVRON: usize = 6;
+
+/// Marks the one merged marker entity.
+#[derive(Component)]
+struct MergedMarkers;
+
+/// One piece of the merged mesh: a template placed in the world with its material parameters (the per-entity
+/// path's `material(..)` arguments).
+#[derive(Clone, Copy)]
+struct Piece {
+    tpl: usize,
+    xf: Affine3A,
+    colour: LinearRgba,
+    intensity: f32,
+    fade: [f32; 4],
+    emphasis: f32,
+    /// Pass ripple: `Some(birth)` (wrapped seconds); `xf` is then the ripple at its final scale.
+    flash: Option<f32>,
+}
+
+impl Piece {
+    fn new(tpl: usize, xf: Affine3A, colour: LinearRgba, intensity: f32, fade: [f32; 4], emphasis: f32) -> Self {
+        Self { tpl, xf, colour, intensity, fade, emphasis, flash: None }
+    }
+}
+
+/// A pass ripple in flight.
+#[derive(Clone, Copy)]
+struct Flash {
+    centre: Vec3,
+    /// Start scale (the gate's clamped half width).
+    scale: f32,
+    /// Birth on the wrapped clock (`globals.time` in the shader).
+    birth: f32,
+    /// End on the elapsed clock.
+    until: f32,
+}
+
+#[derive(Resource, Default)]
+struct Merged {
+    templates: Vec<Builder>,
+    entity: Option<Entity>,
+    mesh: Handle<Mesh>,
+    material: Option<Handle<MarkerMaterial>>,
+    /// Ground point under each event marker (by race index) and the event list they were found for.
+    grounds: Vec<Vec3>,
+    grounds_for: Option<usize>,
+    /// Gate progress (race, gates_done) the gate pieces are for, and those pieces.
+    gates_key: Option<(usize, u32)>,
+    gate_pieces: Vec<Piece>,
+    flashes: Vec<Flash>,
+    /// Signature of the pieces in the mesh now (0 = nothing built).
+    sig: u64,
+    /// Padded capacities of the mesh now (vertices, triangles).
+    vcap: usize,
+    tcap: usize,
+}
+
+/// Power-of-two capacity for `n` items given the current capacity `cur` (from `min`; grown at once, shrunk only below
+/// a quarter), like fh1-render particles `quad_capacity`.
+fn capacity(n: usize, cur: usize, min: usize) -> usize {
+    let want = n.max(1).next_power_of_two().max(min);
+    if want > cur || want.saturating_mul(4) <= cur {
+        want
+    } else {
+        cur
+    }
+}
+
+fn tf(t: Transform) -> Affine3A {
+    t.compute_affine()
+}
+
+/// The pieces of the gates for (race, gates_done): the same layout and parameters as [`gate_visuals`], in world space.
+fn gate_pieces(def: &super::RaceDef, done: u32, track: &crate::track::Track) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let total = total_gates(def);
+    for k in 0..2u32 {
+        let n = done + k;
+        if n >= total {
+            break;
+        }
+        let g = *gate(def, n);
+        let last = n + 1 == total;
+        let strength = if k == 0 { 1.0 } else { 0.35 };
+        let colour = if last { LinearRgba::rgb(1.8, 1.8, 1.8) } else { pink() };
+        let hw = g.half_width.clamp(6.0, 18.0);
+        let base = ground(track, g.centre);
+        let root = tf(Transform::from_translation(base).with_rotation(Quat::from_rotation_y(yaw_of(g.forward))));
+        let height = 7.5;
+        let posts_i = 1.1 * strength;
+        let posts_f = [3.0, 10.0, 1100.0, 1500.0];
+        let veil_c = if last { pink() } else { colour };
+        let veil_e = if k == 0 { 0.5 } else { 0.0 };
+        for s in [-1.0, 1.0] {
+            let t = Transform::from_xyz(s * hw, 0.0, 0.0).with_scale(Vec3::new(0.28, height, 0.28));
+            out.push(Piece::new(T_BAR, root * tf(t), colour, posts_i, posts_f, 0.0));
+        }
+        // Top bar: the unit cylinder laid along X.
+        let top = Transform::from_xyz(-hw, height, 0.0).with_rotation(Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2)).with_scale(Vec3::new(0.22, hw * 2.0, 0.22));
+        out.push(Piece::new(T_BAR, root * tf(top), colour, posts_i, posts_f, 0.0));
+        let cur = if last { T_FINISH } else { T_CURTAIN };
+        let veil = Transform::from_scale(Vec3::new(hw * 2.0, height, 1.0));
+        out.push(Piece::new(cur, root * tf(veil), veil_c, 0.9 * strength, [3.0, 12.0, 900.0, 1300.0], veil_e));
+        if k == 0 {
+            // Floor chevrons leading into the gate, each on the ground.
+            let fwd = Vec3::new(g.forward.x, 0.0, g.forward.y);
+            let rot = Quat::from_rotation_y(yaw_of(g.forward));
+            for j in 0..5usize {
+                let back = 6.0 + (4 - j) as f32 * 6.0;
+                let p = ground(track, g.centre - fwd * back) + Vec3::Y * 0.12;
+                let t = Transform::from_translation(p).with_rotation(rot).with_scale(Vec3::new(4.0, 1.0, 3.0));
+                out.push(Piece::new(T_CHEVRON + j, tf(t), colour, 1.0, [2.0, 6.0, 70.0, 140.0], 0.0));
+            }
+        }
+    }
+    out
+}
+
+/// The pieces of one event marker standing at ground point `p` (same layout and parameters as [`event_markers`]).
+fn marker_pieces(out: &mut Vec<Piece>, p: Vec3, colour: LinearRgba, intensity: f32, emph: f32, ripple: bool, height: f32) {
+    let root = Affine3A::from_translation(p);
+    let beam = Transform::from_scale(Vec3::new(1.4, height, 1.4));
+    let halo = Transform::from_scale(Vec3::new(4.0, height * 0.7, 4.0));
+    let ring = Transform::from_xyz(0.0, 0.15, 0.0).with_scale(Vec3::splat(10.0));
+    out.push(Piece::new(T_BEAM, root * tf(beam), colour, intensity, [10.0, 40.0, 1800.0, 2500.0], emph));
+    out.push(Piece::new(T_BEAM, root * tf(halo), colour, intensity * 0.22, [10.0, 40.0, 1500.0, 2200.0], emph));
+    out.push(Piece::new(T_RING, root * tf(ring), colour, intensity * 0.9, [2.0, 6.0, 300.0, 500.0], emph));
+    if ripple {
+        // Over the game's 25 m TriggerZone.
+        let t = Transform::from_xyz(0.0, 0.12, 0.0).with_scale(Vec3::splat(super::MARKER_RADIUS));
+        out.push(Piece::new(T_RIPPLE, root * tf(t), colour, intensity * 0.6, [2.0, 6.0, 250.0, 400.0], 0.0));
+    }
+}
+
+/// Bakes `pieces` (world space) into one mesh in the frame of `anchor`, padded to power-of-two capacities.
+fn bake(m: &mut Merged, pieces: &[Piece], anchor: Vec3) -> Mesh {
+    let (mut nv, mut nt) = (0usize, 0usize);
+    for p in pieces {
+        if let Some(t) = m.templates.get(p.tpl) {
+            nv += t.pos.len();
+            nt += t.idx.len() / 3;
+        }
+    }
+    m.vcap = capacity(nv, m.vcap, 1024);
+    m.tcap = capacity(nt, m.tcap, 1024);
+    let (vcap, tcap) = (m.vcap, m.tcap);
+    let mut pos: Vec<[f32; 3]> = Vec::with_capacity(vcap);
+    let mut nrm: Vec<[f32; 3]> = Vec::with_capacity(vcap);
+    let mut uv: Vec<[f32; 2]> = Vec::with_capacity(vcap);
+    let mut shape: Vec<[f32; 2]> = Vec::with_capacity(vcap);
+    let mut colour: Vec<[f32; 4]> = Vec::with_capacity(vcap);
+    let mut fade: Vec<[f32; 4]> = Vec::with_capacity(vcap);
+    let mut k: Vec<[f32; 4]> = Vec::with_capacity(vcap);
+    let mut idx: Vec<u32> = Vec::with_capacity(tcap * 3);
+    let to_local = Affine3A::from_translation(-anchor);
+    for p in pieces {
+        let Some(t) = m.templates.get(p.tpl) else { continue };
+        let base = pos.len() as u32;
+        let xf = to_local * p.xf;
+        let c = [p.colour.red, p.colour.green, p.colour.blue, p.intensity];
+        for (vi, v) in t.pos.iter().enumerate() {
+            let lp = Vec3::from_array(*v);
+            pos.push(xf.transform_point3(lp).into());
+            nrm.push(match p.flash {
+                // The ripple vertex's offset from its centre at the final scale: the shader pulls it in by age.
+                Some(_) => p.xf.transform_vector3(lp).into(),
+                // The old vertex shader's `normalize(m * n)` (the model matrix, as before).
+                None => p.xf.transform_vector3(Vec3::from_array(t.nrm[vi])).normalize_or_zero().into(),
+            });
+            uv.push(t.uv[vi]);
+            shape.push(t.shape[vi]);
+            colour.push(c);
+            fade.push(p.fade);
+            k.push([PULSE_HZ, lp.y, p.emphasis, p.flash.unwrap_or(-1.0)]);
+        }
+        idx.extend(t.idx.iter().map(|i| base + i));
+    }
+    // Padding: unused vertices on the first vertex (keeps the auto Aabb tight), degenerate (0, 0, 0) triangles.
+    let first = pos.first().copied().unwrap_or([0.0; 3]);
+    pos.resize(vcap, first);
+    nrm.resize(vcap, [0.0, 1.0, 0.0]);
+    uv.resize(vcap, [0.0; 2]);
+    shape.resize(vcap, [0.0; 2]);
+    colour.resize(vcap, [0.0; 4]);
+    fade.resize(vcap, [0.0; 4]);
+    k.resize(vcap, [0.0, 0.0, 0.0, -1.0]);
+    idx.resize(tcap * 3, 0);
+    Mesh::new(PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::RENDER_WORLD)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, nrm)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uv)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, shape)
+        .with_inserted_attribute(ATTRIBUTE_MARKER_COLOUR, colour)
+        .with_inserted_attribute(ATTRIBUTE_MARKER_FADE, fade)
+        .with_inserted_attribute(ATTRIBUTE_MARKER_K, k)
+        .with_inserted_indices(Indices::U32(idx))
+}
+
+/// Every race marker piece in one mesh / one draw (see the module docs). Same rules as [`event_markers`],
+/// [`gate_visuals`] and [`pass_flash`]; the mesh is rebuilt only when the signature of the pieces changes.
+#[allow(clippy::too_many_arguments)]
+fn merged_markers(
+    mut commands: Commands,
+    mut m: ResMut<Merged>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut mats: ResMut<Assets<MarkerMaterial>>,
+    events: Res<Events>,
+    rs: Res<RaceState>,
+    cat: Option<Res<EventCatalog>>,
+    track: Res<crate::track::Track>,
+    time: Res<Time>,
+    cars: Query<&Car>,
+    mut ent: Query<(&mut Visibility, &mut Transform), With<MergedMarkers>>,
+) {
+    if m.templates.is_empty() {
+        return;
+    }
+    let now = time.elapsed_secs();
+    let mut sig = std::hash::DefaultHasher::new();
+
+    // Event start markers: shown when idle and within MARKER_SHOW_M of the player.
+    let on = super::races_on() && track.id == "colorado" && !events.races.is_empty();
+    let ptr = std::ptr::from_ref(&*events) as usize ^ events.races.len();
+    if !on {
+        m.grounds.clear();
+        m.grounds_for = None;
+    } else if events.is_changed() || m.grounds_for != Some(ptr) {
+        m.grounds = events.races.iter().map(|r| ground(&track, r.marker.0)).collect();
+        m.grounds_for = Some(ptr);
+    }
+    let car = cars.iter().next().map(|c| c.0.position);
+    let mut shown: Vec<(usize, LinearRgba, f32, f32, bool, f32)> = Vec::new();
+    if let (true, Some(pos), RacePhase::Idle) = (on, car, rs.phase) {
+        for (i, r) in events.races.iter().enumerate() {
+            if i >= m.grounds.len() || r.marker.0.distance(pos) >= MARKER_SHOW_M {
+                continue;
+            }
+            let info = cat.as_ref().and_then(|c| c.events.get(i)).filter(|e| e.race == i);
+            let street = r.kind.starts_with("Street") || r.hub > 0;
+            let (key, colour, intensity, emph, ripple, height) =
+                marker_look(info.map(|e| e.state), info.map_or(crate::progression::event_tier(r), |e| e.tier), street, info.is_some_and(|e| e.recommended), rs.prompt == Some(i));
+            (i, key).hash(&mut sig);
+            m.grounds[i].to_array().map(f32::to_bits).hash(&mut sig);
+            shown.push((i, colour, intensity, emph, ripple, height));
+        }
+    }
+
+    // Checkpoint gates (current + next) and the ripple left at a gate just passed.
+    let key = match (rs.phase, rs.race, rs.racers.first()) {
+        (RacePhase::Idle | RacePhase::Results, _, _) | (_, None, _) | (_, _, None) => None,
+        (_, Some(i), Some(p)) if p.finished_s.is_none() => Some((i, p.gates_done)),
+        _ => None,
+    };
+    if m.gates_key != key {
+        if let (Some((i, done)), Some(k)) = (m.gates_key, key) {
+            if k.0 == i && k.1 == done + 1 {
+                if let Some(def) = events.races.get(i) {
+                    let g = gate(def, done);
+                    let centre = ground(&track, g.centre) + Vec3::Y * 0.2;
+                    m.flashes.push(Flash { centre, scale: g.half_width.clamp(6.0, 18.0), birth: time.elapsed_secs_wrapped(), until: now + FLASH_LIFE });
+                }
+            }
+        }
+        m.gates_key = key;
+        m.gate_pieces = key.and_then(|(i, done)| events.races.get(i).map(|def| gate_pieces(def, done, &track))).unwrap_or_default();
+    }
+    m.flashes.retain(|f| f.until > now);
+    key.hash(&mut sig);
+    for f in &m.flashes {
+        f.birth.to_bits().hash(&mut sig);
+    }
+    let sig = sig.finish() | 1;
+    if m.entity.is_some_and(|e| ent.get(e).is_err()) {
+        // Despawned elsewhere (it is spawned by commands in an earlier frame, so it exists by now): respawn.
+        m.entity = None;
+        m.sig = 0;
+    }
+    if sig == m.sig {
+        return;
+    }
+    m.sig = sig;
+
+    // Rebuild.
+    let mut pieces = m.gate_pieces.clone();
+    for &(i, colour, intensity, emph, ripple, height) in &shown {
+        marker_pieces(&mut pieces, m.grounds[i], colour, intensity, emph, ripple, height);
+    }
+    let smax = (FLASH_GROW * FLASH_LIFE).exp();
+    for f in &m.flashes {
+        let xf = Affine3A::from_scale_rotation_translation(Vec3::splat(f.scale * smax), Quat::IDENTITY, f.centre);
+        let mut p = Piece::new(T_RIPPLE, xf, pink(), 1.2, [1.0, 4.0, 400.0, 600.0], 0.0);
+        p.flash = Some(f.birth);
+        pieces.push(p);
+    }
+    let live = m.entity.and_then(|e| ent.get_mut(e).ok());
+    if pieces.is_empty() {
+        if let Some((mut vis, _)) = live {
+            vis.set_if_neq(Visibility::Hidden);
+        }
+        return;
+    }
+    // The entity's translation is what transparent items sort by: the next gate, else the marker nearest the player.
+    let at = car.unwrap_or(Vec3::ZERO);
+    let anchor = m.gate_pieces.first().map(|p| Vec3::from(p.xf.translation)).unwrap_or_else(|| {
+        pieces.iter().map(|p| Vec3::from(p.xf.translation)).min_by(|a, b| a.distance_squared(at).total_cmp(&b.distance_squared(at))).unwrap_or(Vec3::ZERO)
+    });
+    let mesh = bake(&mut m, &pieces, anchor);
+    match live {
+        Some((mut vis, mut t)) => {
+            // Same handle, new asset: the entity keeps its draw; Bevy re-uploads and recomputes the Aabb
+            // (calculate_bounds on AssetChanged<Mesh3d>).
+            let _ = meshes.insert(&m.mesh, mesh);
+            vis.set_if_neq(Visibility::Inherited);
+            if t.translation != anchor {
+                t.translation = anchor;
+            }
+        }
+        None => {
+            // Uniform = 1 (a global multiplier in the merged shader path); per-piece values are vertex attributes.
+            let material = m.material.get_or_insert_with(|| mats.add(MarkerMaterial { params: MarkerParams { colour: Vec4::ONE, fade: Vec4::ZERO, k: Vec4::ZERO } })).clone();
+            m.mesh = meshes.add(mesh);
+            let e = commands
+                .spawn((
+                    Mesh3d(m.mesh.clone()),
+                    MeshMaterial3d(material),
+                    Transform::from_translation(anchor),
+                    Visibility::Inherited,
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                    MergedMarkers,
+                    Name::new("FH1 race markers (merged)"),
+                ))
+                .id();
+            m.entity = Some(e);
         }
     }
 }

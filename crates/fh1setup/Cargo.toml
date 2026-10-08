@@ -26,6 +26,8 @@ rayon = "1"
 zip = { version = "6", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "lzma"] }
 
 [features]
-# Optional importers for other Forza games the user owns (off by default): `fh1setup import-fh2` / `import-fm4`.
+# Importers for other Forza games the user owns: `fh1setup import-fh2` / `import-fm4`. Default features since 2026-10-08
+# (user: every build carries them); `--no-default-features` builds the FH1-only tool.
+default = ["fh2", "fm4"]
 fh2 = []
 fm4 = []

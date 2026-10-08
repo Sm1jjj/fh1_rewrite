@@ -704,6 +704,17 @@ fn draw_game_line(
         }
         k += 1;
     }
+    // Unchanged strip (parked, or the same waypoints and colours): no write, so the render world doesn't re-extract and
+    // re-allocate the mesh (fh1-render particles.rs `fx_mesh_cap_on`; FH1_FX_MESH_CAP=0 = write every frame, old).
+    if fh1_render::particles::fx_mesh_cap_on() {
+        if let Some(m) = meshes.get(&gl.mesh) {
+            let same_pos = matches!(m.attribute(Mesh::ATTRIBUTE_POSITION), Some(bevy::mesh::VertexAttributeValues::Float32x3(v)) if *v == pos);
+            let same_col = matches!(m.attribute(Mesh::ATTRIBUTE_COLOR), Some(bevy::mesh::VertexAttributeValues::Float32x4(v)) if *v == col);
+            if same_pos && same_col {
+                return;
+            }
+        }
+    }
     if let Some(mut m) = meshes.get_mut(&gl.mesh) {
         m.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
         m.insert_attribute(Mesh::ATTRIBUTE_COLOR, col);

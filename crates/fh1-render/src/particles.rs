@@ -63,6 +63,22 @@ fn light_gain() -> f32 {
     *F.get_or_init(|| std::env::var("FH1_PARTICLE_LIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
 }
 
+/// `FH1_FX_HALF_MIN_SIZE=<m>` (default 0.2): effects whose largest nominal quad (`max(Size valueX, maxValueX)`) is at
+/// least this go through the half-res effects pass (fx_half_res.rs, `FH1_FX_HALF_RES`); smaller ones stay sharp on the
+/// full-res Material path. Of the shipped effects this sends Smoke (1.0), SmokeRim0..3 (0.46), Backfire (0.42), Dust1
+/// (4.7), AMB_SparkCannon_Flare (1.0), AMB_Confetti_Smoke (2.0) and AMB_StartSparkCannon_Smoke (3.25) to half res and
+/// keeps Dirt1 (0.018), Grass1 (0.035), GravelBits (0.02), Leaf1..5 (0.06), Litter (0.16), AMB_SparkCannon_Sparks (0.16)
+/// and AMB_Confetti_Canon_Burst (0.14) at full res (sizes from the installed effects.zip XMLs, 2026-10-08).
+fn half_min_size() -> f32 {
+    static F: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("FH1_FX_HALF_MIN_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.2))
+}
+
+/// The effect is drawn by the half-res effects pass (see [`half_min_size`]).
+fn goes_half_res(d: &EffectDef) -> bool {
+    crate::fx_half_res::on() && d.size.max(d.size_max) >= half_min_size()
+}
+
 /// Soft-particle fade height above [`Spawn::ground_y`] (m). The game's `_soft` shader variant reads scene depth; the
 /// engine has no depth prepass on the main view, so particles fade near the ground they were spawned on instead.
 const SOFT_HEIGHT: f32 = 0.25;
@@ -334,6 +350,10 @@ struct Effect {
     gradient: bool,
     /// Quads in the mesh last frame (0 = hidden).
     drawn: usize,
+    /// Drawn by the half-res effects pass ([`goes_half_res`]; fixed per effect) instead of the mesh.
+    half: bool,
+    /// Half-res path: (texture, gradient), loaded on first draw.
+    textures: Option<(Handle<Image>, Option<Handle<Image>>)>,
 }
 
 #[derive(Resource)]
@@ -346,6 +366,8 @@ pub struct FxParticles {
     rng: u32,
     /// (µs, frames) since the last stats line.
     cpu: (f64, u32),
+    /// particles.wgsl for the half-res pass (the same embedded asset the Material uses).
+    half_shader: Option<Handle<Shader>>,
 }
 
 impl FxParticles {
@@ -358,6 +380,7 @@ impl FxParticles {
             live_total: 0,
             rng: 0x9E37_79B9,
             cpu: (0.0, 0),
+            half_shader: None,
         }
     }
 
@@ -378,7 +401,10 @@ impl FxParticles {
         let id = std::fs::read_to_string(root.join(format!("{name}.xml"))).ok().map(|xml| {
             let def = EffectDef::parse(name, &xml);
             let cap = (def.budget.max(1) as usize * EMITTERS_PER_EFFECT).min(MAX_PER_EFFECT);
+            let half = goes_half_res(&def);
             self.effects.push(Effect {
+                half,
+                textures: None,
                 def,
                 cap,
                 parts: Vec::with_capacity(cap),
@@ -615,9 +641,16 @@ fn draw(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
     mut vis: Query<(&mut Visibility, &mut Transform, &mut GlobalTransform), Without<crate::post::FxPostCamera>>,
+    (assets, mut half_res): (Res<AssetServer>, Option<ResMut<crate::fx_half_res::FxHalfRes>>),
 ) {
     let Some(root) = fx.root.clone() else { return };
     let t0 = std::time::Instant::now();
+    // Half-res effects (fx_half_res.rs): the effect's own shader, compiled there with FX_HALF_RES.
+    let half_shader = if crate::fx_half_res::on() && half_res.is_some() {
+        Some(fx.half_shader.get_or_insert_with(|| assets.load("embedded://fh1_render/particles.wgsl")).clone())
+    } else {
+        None
+    };
     let cam = cams.iter().find(|c| c.1.is_active).map_or(Vec3::ZERO, |c| c.0.translation());
     let cam_axes = cams.iter().find(|c| c.1.is_active).map_or((Vec3::X, Vec3::Y), |c| (c.0.right().as_vec3(), c.0.up().as_vec3()));
     let g = |n: &str| globals.as_ref().and_then(|g| g.get(n)).unwrap_or(Vec4::ZERO);
@@ -671,6 +704,29 @@ fn draw(
         params.shape.y = d.aspect;
         params.shape.z = 1.0 / d.frames.1.max(1) as f32;
         let (cam_right, cam_up) = cam_axes;
+        // Half-res path: world-space quads into one FxBatch, no mesh (the effect never gets one; a mesh left from a
+        // fallback frame is hidden).
+        let half_shader = half_shader.as_ref().filter(|_| e.half);
+        if half_shader.is_some() {
+            if let Some((ent, ..)) = e.draw {
+                if let Ok((mut v, ..)) = vis.get_mut(ent) {
+                    v.set_if_neq(Visibility::Hidden);
+                }
+            }
+            e.drawn = 0;
+            if e.textures.is_none() {
+                let texture = load_texture(&mut images, &root, &d.texture, ImageAddressMode::ClampToEdge);
+                let gradient = (!d.gradient.is_empty()).then(|| load_texture(&mut images, &root, &d.gradient, ImageAddressMode::ClampToEdge)).flatten();
+                let Some(texture) = texture else {
+                    warn!("fh1-render particles: texture {} for {} missing; effect not drawn", d.texture, d.name);
+                    e.parts.clear();
+                    continue;
+                };
+                e.gradient = gradient.is_some();
+                e.textures = Some((texture, gradient));
+            }
+        }
+        let mut half_verts: Vec<crate::fx_half_res::FxVertex> = if half_shader.is_some() { Vec::with_capacity(n * 4) } else { Vec::new() };
         e.pos.clear();
         e.corner.clear();
         e.size_rot.clear();
@@ -695,6 +751,13 @@ fn draw(
                     centre += (cam_right * dx + cam_up * dy) / l * (half * d.aspect);
                 }
             }
+            if half_shader.is_some() {
+                let pos = centre.to_array();
+                for corner in [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]] {
+                    half_verts.push(crate::fx_half_res::FxVertex { pos, corner, size_rot: [half, rot], colour, extra });
+                }
+                continue;
+            }
             let local = (centre - centroid).to_array();
             for corner in [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]] {
                 e.pos.push(local);
@@ -703,6 +766,19 @@ fn draw(
                 e.colour.push(colour);
                 e.extra.push(extra);
             }
+        }
+        if let (Some(shader), Some(half_res), Some((texture, gradient))) = (half_shader, half_res.as_deref_mut(), e.textures.as_ref()) {
+            params.flags.z = e.gradient as u32 as f32;
+            half_res.push(crate::fx_half_res::FxBatch {
+                shader: shader.clone(),
+                blend: if d.blend == Blend::Add { crate::fx_half_res::FxBlend::Add } else { crate::fx_half_res::FxBlend::Alpha },
+                tex0: Some(texture.clone()),
+                tex1: gradient.clone(),
+                params: crate::fx_half_res::FxBatch::uniform(&params),
+                verts: half_verts,
+                dist2: centroid.distance_squared(cam),
+            });
+            continue;
         }
         match &e.draw {
             Some((ent, mesh, mat)) => {
@@ -768,12 +844,85 @@ fn draw(
     fx.cpu.0 += t0.elapsed().as_secs_f64() * 1e6;
 }
 
+/// Stable GPU allocations for the per-frame quad meshes (these particles, engine smoke.rs / backfire.rs). P13
+/// (2026-10-08; `FH1_FX_MESH_CAP=0` = old, exact-size meshes). Every modified mesh is freed and re-allocated by Bevy's
+/// mesh allocator in the frame it is extracted; with the exact live count its size changed every frame, so the range
+/// rarely fitted the hole it left, fragmenting the shared u32 index slab (and the effect's vertex slab) until a slab had
+/// to grow (new buffer + copy of the whole slab: a hitch). Now a quad mesh is padded to a power-of-two quad capacity
+/// (from 64; grown at once, shrunk only below a quarter): the size changes only on a bucket step, so each frame's range
+/// reuses the one just freed. Padding = zeroed vertices that nothing indexes + degenerate (0, 0, 0) triangles, which
+/// rasterise nothing whatever the shader does.
+pub fn fx_mesh_cap_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_FX_MESH_CAP").map_or(true, |v| v != "0"))
+}
+
+/// Quad capacity for `n` live quads given the mesh's current capacity `cur` ([`fx_mesh_cap_on`]).
+pub fn quad_capacity(n: usize, cur: usize) -> usize {
+    let want = n.max(1).next_power_of_two().max(64);
+    if want > cur || want.saturating_mul(4) <= cur {
+        want
+    } else {
+        cur
+    }
+}
+
+/// Rewrites a quad mesh's u32 indices for `n` quads (quad q = vertices 4q..4q+3, two triangles), keeping the leading
+/// quads already there. A tail padded by [`pad_quad_mesh`] (degenerate zeros) is not mistaken for quads: the real
+/// prefix is found by binary search (quad q's second index is 4q + 1, a padded one's is 0).
+pub fn quad_indices(idx: &mut Vec<u32>, n: usize) {
+    let have = idx.len() / 6;
+    let (mut lo, mut hi) = (0usize, have);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if idx[mid * 6 + 1] == mid as u32 * 4 + 1 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    idx.truncate(lo.min(n) * 6);
+    for q in idx.len() / 6..n {
+        let b = q as u32 * 4;
+        idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+    }
+}
+
+/// Current quad capacity of a quad mesh (index count / 6).
+pub fn quad_mesh_capacity(m: &Mesh) -> usize {
+    m.indices().map_or(0, |i| i.len() / 6)
+}
+
+/// Pads a quad mesh holding `n` quads (4 vertices, 6 u32 indices each) to the capacity chosen from `prev` (the
+/// capacity before this frame's fill), see [`fx_mesh_cap_on`]. No-op with the flag off.
+pub fn pad_quad_mesh(m: &mut Mesh, n: usize, prev: usize) {
+    if !fx_mesh_cap_on() {
+        return;
+    }
+    let cap = quad_capacity(n, prev);
+    let verts = cap * 4;
+    for (_, values) in m.attributes_mut() {
+        match values {
+            VertexAttributeValues::Float32x2(v) if v.len() < verts => v.resize(verts, [0.0; 2]),
+            VertexAttributeValues::Float32x3(v) if v.len() < verts => v.resize(verts, [0.0; 3]),
+            VertexAttributeValues::Float32x4(v) if v.len() < verts => v.resize(verts, [0.0; 4]),
+            _ => {}
+        }
+    }
+    if let Some(Indices::U32(idx)) = m.indices_mut() {
+        if idx.len() < cap * 6 {
+            idx.resize(cap * 6, 0);
+        }
+    }
+}
+
 /// Copy the effect's vertex scratch into the mesh's own arrays (capacity kept, so no allocation after warm-up).
 fn fill_mesh(m: &mut Mesh, e: &Effect, n: usize) {
     fn put<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
         dst.clear();
         dst.extend_from_slice(src);
     }
+    let prev = quad_mesh_capacity(m);
     if let Some(VertexAttributeValues::Float32x3(v)) = m.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
         put(v, &e.pos);
     }
@@ -790,15 +939,9 @@ fn fill_mesh(m: &mut Mesh, e: &Effect, n: usize) {
         put(v, &e.extra);
     }
     if let Some(Indices::U32(idx)) = m.indices_mut() {
-        let want = n * 6;
-        if idx.len() > want {
-            idx.truncate(want);
-        }
-        for q in idx.len() / 6..n {
-            let b = q as u32 * 4;
-            idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
-        }
+        quad_indices(idx, n);
     }
+    pad_quad_mesh(m, n, prev);
 }
 
 /// `<root>/<stem>.dds` (fh1setup effects: RGBA8 with mips, the .xds texel values as stored).

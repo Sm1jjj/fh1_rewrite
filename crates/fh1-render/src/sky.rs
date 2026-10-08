@@ -306,8 +306,10 @@ fn setup_sky(
         // Remaster: the game's sky (dome, fog sky, sun, clouds, stars, moon; output gain applied) is drawn over Bevy's
         // atmosphere, which still provides the env map, sun transmittance and aerial perspective. No live cube = no cube
         // clouds. FH1_RM_GAME_SKY=0 = Bevy's atmosphere sky instead of the game's dome/fog sky/sun.
+        // Exception: the remaster car probe's faces draw the env-cube pass as their sky (fh1-remaster car_probe.rs "Time of
+        // day"; same switch as its `cube_sky_on`), the game's reflection sky instead of the main view's (green at night).
         let bevy_sky = std::env::var("FH1_RM_GAME_SKY").as_deref() == Ok("0");
-        if crate::remaster() && (part == SkyPart::CubeClouds || (bevy_sky && matches!(part, SkyPart::Atmosphere | SkyPart::FogSky | SkyPart::Sun))) {
+        if crate::remaster() && ((part == SkyPart::CubeClouds && !remaster_probe_cube_sky()) || (bevy_sky && matches!(part, SkyPart::Atmosphere | SkyPart::FogSky | SkyPart::Sun))) {
             continue;
         }
         let program = sky_program(dir, vs, ps, &states, lib.raw_output, w_from_uv, if part == SkyPart::FogSky { FOGSKY_REMAP } else { &[] })
@@ -354,6 +356,14 @@ fn setup_sky(
             e.insert(bevy::camera::visibility::RenderLayers::layer(crate::reflect::CUBE_LAYER));
         }
     }
+}
+
+/// Mirror of fh1-remaster car_probe.rs `cube_sky_on` (this crate can't depend on it): the remaster car probe is on
+/// (FH1_RM_CAR_PROBE=1, opt-in since 2026-10-08), hides the player's own lights on the main-only layer (FH1_RM_PROBE_OWN_LIGHTS != 1, which the
+/// sky parts reuse) and FH1_RM_PROBE_CUBE_SKY is not 0.
+fn remaster_probe_cube_sky() -> bool {
+    let not = |k: &str, v: &str| std::env::var(k).map_or(true, |x| x != v);
+    std::env::var("FH1_RM_CAR_PROBE").is_ok_and(|x| x == "1") && not("FH1_RM_PROBE_OWN_LIGHTS", "1") && not("FH1_RM_PROBE_CUBE_SKY", "0")
 }
 
 /// Constants of one sky draw, (register, value) per stage, and whether it draws.

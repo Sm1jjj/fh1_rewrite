@@ -13,7 +13,8 @@
 //! Hooks onto the faithful spawn (`fh1_render::car::FxCarBody` on the glTF holder); fh1-render skips its own car and
 //! wheel parts when FH1_RENDERER=remaster. `FxCarDrawn` (empty: nothing to hide) marks the body as built for the traffic
 //! pool. Flags: FH1_RM_CAR=0 leaves the glTF materials as they are; FH1_RM_LAMP=<nits> lamp emissive at full on (default 2e4; W3 exposure is physical EV, emissive in nits);
-//! FH1_RM_FLAKE=<strength> metallic flake (0 = off); FH1_RM_PAINTCOLOR=0 draws non-body atlas techniques without their
+//! FH1_RM_FLAKE=<strength> metallic flake (0 = off); FH1_RM_PAINT_SHEEN=0 = old metallic paint base (0.55 metal / 0.38 rough;
+//! new FH1_RM_PAINT_METALLIC 0.3 / FH1_RM_PAINT_METAL_ROUGH 0.55, see `restyle_car_materials`); FH1_RM_PAINTCOLOR=0 draws non-body atlas techniques without their
 //! ShaderSettings PaintColor (the old khaki matte_colors); FH1_RM_PAINTSCALE=0 ignores PaintScale; FH1_RM_LAMP_TINT=0
 //! leaves red/amber lamp parts untinted.
 //!
@@ -531,8 +532,19 @@ fn restyle_car_materials(
                     base.base_color = Color::linear_rgb(k, k, k);
                     let mut colour = colour;
                     if body_paint {
-                        base.metallic = if metallic { 0.55 } else { 0.0 };
-                        base.perceptual_roughness = if metallic { 0.38 } else { 0.42 };
+                        // Metallic paint = a clear coat over a broad, softly tinted flake sheen (FH1_RM_PAINT_SHEEN=0 = old
+                        // 0.55 / 0.38). The game's Metallic.xml body: SpecularPower2 6 / SpecularPower3 4 (Phong; GGX
+                        // roughness ~0.7) with PaintScale 0.5, the env reflection on top white x Fresnel (FresnelIndex 1.55).
+                        // At metallic 0.55 / roughness 0.38 the base layer was a tinted near-mirror: F0 = 0.57 x paint, so an
+                        // orange body (0xFF6B2B -> 1.0, 0.15, 0.02) reflected the sky and sun as pure red-orange that clipped
+                        // to yellow in the curve ("acidic light", 2026-10-08), with dark panels in between (diffuse 0.45x).
+                        let (metal, rough) = if std::env::var("FH1_RM_PAINT_SHEEN").is_ok_and(|v| v == "0") {
+                            (0.55, 0.38)
+                        } else {
+                            (env_f32("FH1_RM_PAINT_METALLIC", 0.3), env_f32("FH1_RM_PAINT_METAL_ROUGH", 0.55))
+                        };
+                        base.metallic = if metallic { metal } else { 0.0 };
+                        base.perceptual_roughness = if metallic { rough } else { 0.42 };
                         base.reflectance = 0.5;
                         base.clearcoat = 1.0;
                         base.clearcoat_perceptual_roughness = 0.03;

@@ -119,14 +119,47 @@ pub fn exit_now(code: AppExit) -> AppExit {
     std::process::exit(status)
 }
 
+/// The exit code seen this frame (0 = none, 1 = success, n + 1 = error n), for [`end_process`].
+static EXIT_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Drain the queue when the app exits (registered by PerfPlugin, always on). Writes queued later in the exit frame run
 /// in place.
 fn flush_on_exit(mut exit: MessageReader<AppExit>) {
-    if exit.read().next().is_some() {
+    if let Some(code) = exit.read().next() {
         finish();
+        let v = match code {
+            AppExit::Success => 1,
+            AppExit::Error(n) => n.get() as u32 + 1,
+        };
+        EXIT_SEEN.store(v, Ordering::Relaxed);
     }
 }
 
+/// Runs after `Last` (own schedule). On the exit frame it writes the perf recorder's tail (its Drop) and ends the
+/// process from inside the frame (2026-10-08, Fable's log analysis of 20261008_210500: closing the window hung ~40 s
+/// "Not responding" (WER AppHangTransient): bevy_winit's runner owns the App and drops the whole World / render app /
+/// wgpu inside `app.run()`, so [`exit_now`] after it came too late, and winit's window was no longer pumped).
+/// `FH1_FAST_EXIT=0` = old (normal teardown).
+fn end_process(world: &mut World) {
+    let v = EXIT_SEEN.load(Ordering::Relaxed);
+    if v == 0 || std::env::var("FH1_FAST_EXIT").is_ok_and(|v| v == "0") {
+        return;
+    }
+    super::record::drop_recorder(world);
+    let code = match std::num::NonZero::new((v - 1) as u8) {
+        None => AppExit::Success,
+        Some(n) => AppExit::Error(n),
+    };
+    exit_now(code);
+}
+
+#[derive(bevy::ecs::schedule::ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+struct EndProcess;
+
 pub(super) fn plugin(app: &mut App) {
     app.add_systems(Last, flush_on_exit);
+    let mut sched = Schedule::new(EndProcess);
+    sched.add_systems(end_process);
+    app.add_schedule(sched);
+    app.world_mut().resource_mut::<bevy::app::MainScheduleOrder>().insert_after(Last, EndProcess);
 }

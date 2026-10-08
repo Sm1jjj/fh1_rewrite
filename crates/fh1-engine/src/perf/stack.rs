@@ -43,6 +43,7 @@ impl Counters {
 }
 
 /// One thread's stack at one moment: return addresses innermost first, and its CPU time so far (kernel + user, 100 ns).
+#[derive(Clone)]
 pub struct ThreadStack {
     pub tid: u32,
     pub name: String,

@@ -199,8 +199,10 @@ impl Plugin for P2Plugin {
         if !std::env::var("FH1_P2_STATS").is_ok_and(|v| v == "1") {
             return;
         }
-        app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
-            .init_resource::<MainTime>()
+        if !app.is_plugin_added::<bevy::render::diagnostic::RenderDiagnosticsPlugin>() {
+            app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+        }
+        app.init_resource::<MainTime>()
             .add_systems(First, |mut m: ResMut<MainTime>| m.start = Some(std::time::Instant::now()))
             .add_systems(Last, main_time_report);
         render_phases(app);

@@ -86,7 +86,39 @@
 //!   the old one), the down face at 8 m; small scenery stays on the main-only layer. The face exposure follows the
 //!   lighting's EV each frame it changes by > 0.05.
 //!
-//! Anchor: the player car's `fh1_render::reflect::EnvCubeAnchor` (main.rs). Default on (FH1_RM_CAR_PROBE=0 = off, the camera's
+//! - **Time of day** (2026-10-08 late, user: "at night the car goes like a metallic green colour and when dusk hits some
+//!   weird flashing happens"):
+//!   - Green: the faces drew the MAIN view's game sky. Its horizon colours are green at night and dusk in the TOD data
+//!     (Colorado AtmosphereBottomColour 0.0134/0.0168/0.0152 at night, AtmosphereHazeColour 0.37/0.57/0.47 at 19:00),
+//!     while the game's own reflection cube draws the env-cube sky pass with the Cube* haze channels (blue 0.10/0.12/0.18
+//!     at night, orange at dusk; fh1-render sky/clouds.rs `cube_consts`). The car reflected a green horizon all round.
+//!     Now the faces render `SkyPart::CubeClouds` (CUBE_LAYER) and the main sky parts sit on the main-view-only layer
+//!     (FH1_RM_PROBE_CUBE_SKY=0 = old). Also the clear colour (the down face is all clear: the road is inside the near
+//!     plane) was a fixed exposed value, ~8x the moonlit road and brown at night; it now follows the exposed ground level
+//!     ([`face_clear`], FH1_RM_PROBE_CLEAR_EV=0 = old).
+//!   - Dusk flashes: the face camera had no atmosphere, so the sun reached its walls unattenuated: during the sunset sink
+//!     (light.rs twilight: up to 117,000 lx exo-atmospheric at 1-5 degrees, where the main view's transmittance passes a
+//!     few %) each bake lit the car far brighter than the scene, then the probe was dropped as the sun crossed the horizon
+//!     and came back at the moon swap. The face camera now carries the main view's `AtmosphereSettings` (transmittance,
+//!     aerial perspective, sky; FH1_RM_PROBE_ATMOSPHERE=0 = old), so the probe keeps baking through dusk (the drop only
+//!     applies to the old path). Cost: the atmosphere LUTs for the face view on the frames it renders (asleep otherwise).
+//!
+//! - **Static-only faces** (P13 micro-stutter, 2026-10-08; FH1_RM_PROBE_STATIC_ONLY=0 = old): the P12 static world draws
+//!   the scenery into each face itself (GPU-culled, static_world/draw.rs keys on `CarProbeFace`), so a face now renders
+//!   the ECS world only on [`PROBE_LAYER`] (sun / moon, sky parts) plus the env-cube sky. Before, every face view also took
+//!   every layer-0 ECS mesh (cars, traffic, crowds, rides: ~4k entities): visibility, queue and batching for a second view,
+//!   and on each capture's wake the re-specialisation of all of them. At speed a capture starts every ~0.3 s (the 10 m
+//!   trigger), so faces made a heavy frame every other frame for most of a drive: the micro-stutter the user felt. The cube
+//!   loses other cars / crowds / rides (64-256 px, behind a crossfade). While the lamps are on the faces take layer 0 as
+//!   before, so street lights (point lights on layer 0) still light the cube's scenery.
+//!
+//! - **Hot-spot cap** (2026-10-08 late, user: orange metallic paint "hit by acidic light"; FH1_RM_PROBE_CLAMP=0 = old): the
+//!   face -> cube blit scales texels above 4 game display units down to that level (hue kept). With the face atmosphere
+//!   the sun disk landed in the cube (~1e4-1e5 exposed units in a texel or two), doubling the analytic sun highlight and
+//!   smeared by the GGX / irradiance filter into blotches over the panels; see [`probe_clamp`].
+//!
+//! Anchor: the player car's `fh1_render::reflect::EnvCubeAnchor` (main.rs). OFF by default since 2026-10-08 (user: the best
+//! run so far was without it, ~80 fps; FH1_RM_CAR_PROBE=1 = on, the camera's atmosphere env only otherwise; before: on, 0 = off, the camera's
 //! atmosphere env only); FH1_RM_CAR_PROBE_RES=n face size (256 since 2026-10-08, was 128). The face camera gets no sun cascades: light.rs empties every
 //! non-main view's entry (it must stay present, see `main_view_cascades_only`).
 
@@ -148,11 +180,13 @@ const NO_FACE: u8 = 255;
 /// 6 since 2026-10-08 (was 4): margin for the filtered maps' GPU upload under load before a crossfade starts.
 const FILTER_FRAMES: u32 = 6;
 
-/// Default on; FH1_RM_CAR_PROBE=0 = off. The 2026-10-06 panic after the first bake (bevy_pbr render/light.rs:1831,
-/// `light.cascades.get(&view).unwrap()`) was light.rs removing the face camera's cascade entry once it switched to layer 0;
-/// it now keeps an empty one. ("Couldn't find clustered object" is only an error log in Bevy 0.19's cluster extraction.)
+/// ON by default again since 2026-10-08 late night (user: the P15 build was "the smoothest run", GPU 7.6 -> 5.0 ms, so the
+/// probe fits; FH1_RM_CAR_PROBE=0 = off). It was off for the 200 fps push earlier that day. The 2026-10-06 panic after the
+/// first bake (bevy_pbr render/light.rs:1831, `light.cascades.get(&view).unwrap()`) was light.rs removing the face camera's
+/// cascade entry once it switched to layer 0; it now keeps an empty one. ("Couldn't find clustered object" is only an error
+/// log in Bevy 0.19's cluster extraction.)
 pub fn enabled() -> bool {
-    std::env::var("FH1_RM_CAR_PROBE").map_or(true, |v| v != "0")
+    !std::env::var("FH1_RM_CAR_PROBE").is_ok_and(|v| v == "0")
 }
 
 fn env_f32(name: &str, default: f32) -> f32 {
@@ -272,6 +306,136 @@ fn rest_on() -> bool {
     std::env::var("FH1_RM_PROBE_REST").map_or(true, |v| v != "0")
 }
 
+/// FH1_RM_PROBE_ATMOSPHERE=0 = old (module doc "Time of day"): the face camera gets the main view's Bevy atmosphere.
+pub fn probe_atmosphere_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::light::atmosphere_on() && std::env::var("FH1_RM_PROBE_ATMOSPHERE").map_or(true, |v| v != "0"))
+}
+
+/// FH1_RM_PROBE_CUBE_SKY=0 = old (module doc "Time of day"): the faces draw the game's env-cube sky pass (fh1-render
+/// `SkyPart::CubeClouds` on `CUBE_LAYER`) instead of the main view's sky parts. Needs the main-view-only layer
+/// ([`own_light_layers`]); fh1-render sky.rs mirrors this switch to spawn the pass.
+pub fn cube_sky_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| own_light_layers().is_some() && std::env::var("FH1_RM_PROBE_CUBE_SKY").map_or(true, |v| v != "0"))
+}
+
+/// FH1_RM_PROBE_CLEAR_EV=0 = old (module doc "Time of day"): the faces' clear colour follows the scene's exposed ground level.
+fn clear_ev_on() -> bool {
+    std::env::var("FH1_RM_PROBE_CLEAR_EV").map_or(true, |v| v != "0")
+}
+
+/// Dark ground tone the faces clear to (exposed units, tuned by day).
+const CLEAR: Vec3 = Vec3::new(0.05, 0.045, 0.04);
+
+/// The faces' clear colour for the current lighting: [`CLEAR`] scaled by the scene's exposed ground level relative to
+/// daylight. The texels are exposed values while the exposure is compressed (light.rs EV_COMPRESS), so the scene's
+/// exposed brightness falls ~25x from day to night; a fixed clear made the cube's floor (all of the down face: the road
+/// under the car is inside the near plane) a bright brown at night, ~8x the moonlit road, and it lit the car from below.
+fn face_clear(lighting: Option<&crate::light::RemasterLighting>) -> ClearColorConfig {
+    let k = match lighting {
+        // ground / (1.2 pi 2^ev) = 2^(ev_phys - ev): 1 at the daylight exposure, ~0.04 at night, ~0.02 in blue hour.
+        Some(l) if clear_ev_on() && l.ev100.is_finite() && l.ground_lux > 0.0 => {
+            (l.ground_lux / (1.2 * std::f32::consts::PI * 2f32.powf(l.ev100)) / 0.9).clamp(0.0, 1.0)
+        }
+        _ => 1.0,
+    };
+    let c = CLEAR * k;
+    ClearColorConfig::Custom(Color::linear_rgb(c.x, c.y, c.z))
+}
+
+/// Layers a face renders while capturing: the world, plus the env-cube sky with [`cube_sky_on`]. With [`static_faces_on`]
+/// (lamps off) the "world" is [`PROBE_LAYER`] instead of layer 0: the static world draws the scenery into the face by
+/// itself, so no layer-0 ECS mesh joins the face view (module doc "Static-only faces").
+fn capture_layers() -> bevy::camera::visibility::RenderLayers {
+    let world = if static_faces_on() && !LAMPS_ON.load(std::sync::atomic::Ordering::Relaxed) { PROBE_LAYER } else { 0 };
+    if cube_sky_on() {
+        bevy::camera::visibility::RenderLayers::from_layers(&[world, fh1_render::reflect::CUBE_LAYER])
+    } else {
+        bevy::camera::visibility::RenderLayers::layer(world)
+    }
+}
+
+/// What the static-only faces see of the ECS world (module doc "Static-only faces"): the sun / moon and, without
+/// [`cube_sky_on`], the main view's sky parts. Unique number (7 UI, 8 minimap, 9 world map, 23 thumbs, 24 graphics
+/// blit, 25-31 taken).
+pub const PROBE_LAYER: usize = 22;
+
+/// Lamps on (TOD SwitchOnLights or night), set by [`static_faces_state`]: the faces take layer 0 again so the street
+/// lights (point lights on layer 0) still light the cube's scenery.
+static LAMPS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Static-only faces (P13 micro-stutter, 2026-10-08; module doc). Needs the static world's probe draw and the main-only
+/// light layers (the sun / moon then carry [`PROBE_LAYER`], light.rs `main_only_light_layers`).
+/// FH1_RM_PROBE_STATIC_ONLY=0 = old (faces take every layer-0 ECS mesh).
+pub fn static_faces_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        crate::static_world::probe_faces_on()
+            && main_only_layers().is_some()
+            && std::env::var("FH1_RM_PROBE_STATIC_ONLY").map_or(true, |v| v != "0")
+    })
+}
+
+/// Static-only faces: the lamps state for [`capture_layers`], and (without [`cube_sky_on`]) the sky parts on
+/// `[0, PROBE_LAYER]` so the faces keep the sky (the main view still sees them on layer 0).
+#[allow(clippy::type_complexity)]
+fn static_faces_state(
+    mut commands: Commands,
+    lighting: Option<Res<crate::light::RemasterLighting>>,
+    sky: Query<Entity, (With<fh1_render::sky::SkyPart>, Without<bevy::camera::visibility::RenderLayers>)>,
+) {
+    if !static_faces_on() {
+        return;
+    }
+    let lamps = lighting.as_ref().is_some_and(|l| l.lights_on > 0.05 || l.night >= 0.5);
+    LAMPS_ON.store(lamps, std::sync::atomic::Ordering::Relaxed);
+    if cube_sky_on() {
+        return;
+    }
+    for e in &sky {
+        commands.entity(e).try_insert(bevy::camera::visibility::RenderLayers::from_layers(&[0, PROBE_LAYER]));
+    }
+}
+
+/// With [`cube_sky_on`]: the main view's sky parts (dome, fog sky, sun, moon, stars, clouds) go on the main-view-only
+/// layer, so the faces see only the env-cube pass (the game's own reflection sky, as its live cube: reflect.rs).
+#[allow(clippy::type_complexity)]
+fn probe_sky_layers(
+    mut commands: Commands,
+    new: Query<(Entity, &fh1_render::sky::SkyPart), (Added<fh1_render::sky::SkyPart>, Without<bevy::camera::visibility::RenderLayers>)>,
+) {
+    if !cube_sky_on() {
+        return;
+    }
+    let Some(layers) = own_light_layers() else { return };
+    let fog_sky = probe_fog_sky_on();
+    for (e, part) in &new {
+        match part {
+            fh1_render::sky::SkyPart::CubeClouds => {}
+            // Also in the faces (CUBE_LAYER): see [`probe_fog_sky_on`].
+            fh1_render::sky::SkyPart::FogSky if fog_sky => {
+                commands.entity(e).try_insert(layers.clone().with(fh1_render::reflect::CUBE_LAYER));
+            }
+            _ => {
+                commands.entity(e).try_insert(layers.clone());
+            }
+        }
+    }
+}
+
+/// FH1_RM_PROBE_FOG_SKY=0 = old (the fog sky band in the main view only). The game's dome colours below ~40 degrees are a
+/// lerp of AtmosphereBottomColour (no blue) and AtmosphereTopColour (no red), h^ColourPower with ColourPower ~0.054
+/// (docs/SHADERS.md "Atmosphere"): at Colorado 20:00 that is (0.20, 0.26, 0.14) display units at the horizon and
+/// (1.0, 1.1, 0.13) on the ring below it, i.e. a bright green band, ~20x the exposed scene. The main view never shows it:
+/// the fog sky part lays FogColour over -3.8..9.5 degrees (density saturated at every TOD) and the far terrain covers
+/// the rest. The faces cull at FH1_RM_CAR_PROBE_FAR (300 m) and had no fog sky, so that band went all round the cube and
+/// the car's side panels (whose reflections look just below the horizon) and roof edges came out green at dusk / night
+/// (crash-check shot 20:00, 2026-10-08). The fog sky now draws in the faces as in the main view.
+fn probe_fog_sky_on() -> bool {
+    std::env::var("FH1_RM_PROBE_FOG_SKY").map_or(true, |v| v != "0")
+}
+
 fn face_spread() -> u32 {
     (env_f32("FH1_RM_CAR_PROBE_SPREAD", 2.0) as u32).max(1)
 }
@@ -299,7 +463,7 @@ impl Plugin for CarProbePlugin {
             .add_plugins(ExtractResourcePlugin::<CarProbeCube>::default())
             .init_resource::<ProbeState>()
             .add_systems(Startup, setup)
-            .add_systems(Update, deactivate_slots)
+            .add_systems(Update, (deactivate_slots, probe_sky_layers, static_faces_state.after(probe_sky_layers)))
             .add_systems(PostUpdate, drive.after(bevy::transform::TransformSystems::Propagate));
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app.add_systems(Core3d, blit.in_set(Core3dSystems::PostProcess).before(tonemapping));
@@ -309,7 +473,7 @@ impl Plugin for CarProbePlugin {
         if !enabled() {
             return;
         }
-        let shader = app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(BLIT_WGSL, "fh1_remaster/car_probe_blit.wgsl"));
+        let shader = app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(BLIT_WGSL.replace("const CAP: f32 = 0.0;", &format!("const CAP: f32 = {:?};", probe_clamp())), "fh1_remaster/car_probe_blit.wgsl"));
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app.insert_resource(BlitShader(shader));
         render_app.init_resource::<BlitPipeline>();
@@ -336,10 +500,10 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut state: R
     let target = images.add(Image::new_target_texture(size, size, FORMAT, None));
     state.target = target.clone();
     state.size = size;
-    commands.spawn((
+    let mut face = commands.spawn((
         Name::new("fh1_remaster car probe face"),
         Camera3d::default(),
-        Camera { order: -30, is_active: !sleep_on(), clear_color: ClearColorConfig::Custom(Color::linear_rgb(0.05, 0.045, 0.04)), ..default() },
+        Camera { order: -30, is_active: !sleep_on(), clear_color: ClearColorConfig::Custom(Color::linear_rgb(CLEAR.x, CLEAR.y, CLEAR.z)), ..default() },
         RenderTarget::Image(ImageRenderTarget::from(target)),
         bevy::camera::Hdr,
         Tonemapping::None,
@@ -356,6 +520,10 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut state: R
         bevy::camera::visibility::RenderLayers::layer(IDLE_LAYER),
         Transform::default(),
     ));
+    // The main view's atmosphere (module doc "Time of day"): sun / moon transmittance, aerial perspective and sky.
+    if probe_atmosphere_on() {
+        face.insert(crate::light::remaster_atmosphere_settings());
+    }
     // 6 m since 2026-10-07 (was 14): the probe lights only the car and its footprint, not the road around it (a cube
     // that caught brake / head lights tinted the ground red / white until the next bake, user report). 7 m / falloff 0.12
     // since 2026-10-08: full weight out to 2.66 m so the whole car is in the interior (the crossfade needs weight 1).
@@ -498,7 +666,9 @@ fn drive(
             // nothing takes the below-horizon sun's ~1e5 lx off walls facing it; the cube blew the car and the ground
             // around it to white at 20:00 (7x the faithful luma). Drop the probe's env (the camera's atmosphere env
             // applies) and skip captures until the sun or the moon is up.
-            let dusk = lighting.as_ref().is_some_and(|l| l.sun_dir.y <= 0.0 && l.night < 0.5);
+            // With the face camera's atmosphere (FH1_RM_PROBE_ATMOSPHERE) the sunk sun's direct light is zero in the faces as
+            // in the main view, so the probe keeps baking through dusk: no pop to the camera env and back at the moon swap.
+            let dusk = !probe_atmosphere_on() && lighting.as_ref().is_some_and(|l| l.sun_dir.y <= 0.0 && l.night < 0.5);
             if dusk {
                 if state.last_bake.is_some() {
                     state.remove.extend([slot0, slot1]);
@@ -527,6 +697,7 @@ fn drive(
                 }
                 // The face sees the scene at the main view's exposure (the cube holds exposed values).
                 commands.entity(face_e).insert(bevy::camera::Exposure { ev100 });
+                cam.clear_color = face_clear(lighting.as_deref());
             }
         }
         Phase::Capture(k) if k < 6 && state.gap > 0 => {
@@ -550,7 +721,7 @@ fn drive(
             *ft = Transform::from_translation(at).looking_to(fwd, up);
             *fg = GlobalTransform::from(*ft);
             f.set_if_neq(CarProbeFace(k));
-            layers.set_if_neq(bevy::camera::visibility::RenderLayers::layer(0));
+            layers.set_if_neq(capture_layers());
             state.phase = Phase::Capture(k + 1);
         }
         Phase::Capture(_) => {
@@ -621,7 +792,7 @@ fn drive(
 
     // ---- even cadence: one face every frame (module doc) ----
     if even {
-        let lit = lighting.as_ref().is_some_and(|l| l.sun_dir != Vec3::ZERO && !(l.sun_dir.y <= 0.0 && l.night < 0.5));
+        let lit = lighting.as_ref().is_some_and(|l| l.sun_dir != Vec3::ZERO && (probe_atmosphere_on() || !(l.sun_dir.y <= 0.0 && l.night < 0.5)));
         if !lit {
             f.set_if_neq(CarProbeFace(NO_FACE));
             layers.set_if_neq(idle.clone());
@@ -660,6 +831,7 @@ fn drive(
         if state.face_ev.is_none_or(|e| (e - ev100).abs() > 0.05) {
             state.face_ev = Some(ev100);
             commands.entity(face_e).insert(bevy::camera::Exposure { ev100 });
+            cam.clear_color = face_clear(lighting.as_deref());
         }
         let k = state.next_face % 6;
         state.next_face = (k + 1) % 6;
@@ -674,7 +846,7 @@ fn drive(
         *ft = Transform::from_translation(car_pos + Vec3::Y * 0.8).looking_to(fwd, up);
         *fg = GlobalTransform::from(*ft);
         f.set_if_neq(CarProbeFace(k));
-        layers.set_if_neq(bevy::camera::visibility::RenderLayers::layer(0));
+        layers.set_if_neq(capture_layers());
     }
 }
 
@@ -689,11 +861,34 @@ struct V { @builtin(position) pos: vec4<f32> };
     o.pos = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
     return o;
 }
-// Straight copy: the faces are aimed for Bevy's z-negated cube lookup (no mirror).
+// Copy: the faces are aimed for Bevy's z-negated cube lookup (no mirror). Texels brighter than CAP (exposed units; 0 = no
+// cap) are scaled down to it, keeping their hue ([`probe_clamp`]).
+const CAP: f32 = 0.0;
 @fragment fn fragment(v: V) -> @location(0) vec4<f32> {
-    return textureLoad(src, vec2<i32>(v.pos.xy), 0);
+    let c = max(textureLoad(src, vec2<i32>(v.pos.xy), 0), vec4<f32>(0.0));
+    let m = max(c.r, max(c.g, c.b));
+    if CAP > 0.0 && m > CAP {
+        return vec4<f32>(c.rgb * (CAP / m), c.a);
+    }
+    return c;
 }
 ";
+
+/// Brightest texel the cube keeps (exposed units, 0 = no cap); FH1_RM_PROBE_CLAMP = the cap in game display units (4; 0 =
+/// old, uncapped). 2026-10-08, user: orange metallic paint "hit by acidic light" (LAM_LP7004_12, late light):
+/// - Since the faces carry the main view's `AtmosphereSettings` (module doc "Time of day"), Bevy's sky pass draws the sun
+///   disk into every face whose pixel is still at the far plane (the game's sky parts are drawn at z = 0, so they do not
+///   hide it): `SunDisk::EARTH` = sun illuminance / 6.6e-5 sr, ~1e4-1e5 exposed units in one or two texels of a 128-256 px
+///   face. The main camera's env map has no sun (Bevy's atmosphere env bake samples the sky-view LUT only), and the paint
+///   already gets the sun's highlight from the directional light, so the cube doubled it, and the GGX / irradiance filter
+///   smeared that hot spot into large blotches on every panel facing it, tinted by the paint's metallic F0 (orange ->
+///   per-channel clip in the curve -> yellow).
+/// - 4 display units = above the brightest cube sky the TOD makes (CubeAtmosphereHaze x SkyGain 2: ~2-3) and the capped
+///   lamps (FH1_RM_LAMP_CAP 3), far below the sun disk; the sun's highlight stays the analytic one, like the main env.
+fn probe_clamp() -> f32 {
+    let display = env_f32("FH1_RM_PROBE_CLAMP", 4.0).max(0.0);
+    display * crate::post::game_unit_scale()
+}
 
 #[derive(Resource)]
 struct BlitShader(Handle<Shader>);

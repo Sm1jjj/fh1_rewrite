@@ -690,6 +690,15 @@ fn own_flames(
 // ---------------------------------------------------------------- flame shader (2026-10-08, module doc)
 
 /// `FH1_FLAME_STYLE=old`: the 2026-10-07 cone rigs instead of the flame shader.
+/// `FH1_FX_HALF_FLAMES=1`: the flame tongues + outlet glows go through the half-res effects pass (fh1-render
+/// fx_half_res.rs) like the smoke. Default off (native resolution): a tongue is 5-13 cm wide (~10-20 px in the chase
+/// camera) with high-frequency noise edges, i.e. the "fine sprite" case the half-res technique leaves at full resolution,
+/// and it lives 0.1-0.2 s, so the fill it would save is negligible next to the blur it adds.
+fn half_flames() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| fh1_render::fx_half_res::on() && std::env::var("FH1_FX_HALF_FLAMES").is_ok_and(|v| v == "1"))
+}
+
 fn old_flames() -> bool {
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OLD.get_or_init(|| std::env::var("FH1_FLAME_STYLE").is_ok_and(|v| v == "old"))
@@ -707,7 +716,8 @@ pub struct FlameParams {
 
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
 pub struct FlameMaterial {
-    #[uniform(0)]
+    /// Binding 2 (flame.wgsl): matches the half-res pass's fixed material layout (fh1-render fx_half_res.rs).
+    #[uniform(2)]
     params: FlameParams,
 }
 
@@ -777,6 +787,8 @@ struct Burning {
     flash_lm: f32,
     rng: u32,
     draw: Option<(Entity, Handle<Mesh>, Handle<FlameMaterial>)>,
+    /// flame.wgsl for the half-res pass (`half_flames`), loaded on first use.
+    half_shader: Option<Handle<Shader>>,
     pos: Vec<[f32; 3]>,
     corner: Vec<[f32; 2]>,
     size: Vec<[f32; 2]>,
@@ -795,6 +807,7 @@ impl Default for Burning {
             flash_lm: 0.0,
             rng: 0x6C8E_9CF5,
             draw: None,
+            half_shader: None,
             pos: Vec::new(),
             corner: Vec::new(),
             size: Vec::new(),
@@ -847,7 +860,8 @@ fn burn(
     mut smoke: Option<ResMut<crate::smoke::Smoke>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FlameMaterial>>,
-    mut ents: Query<(&mut Visibility, &mut Transform, &mut GlobalTransform, Option<&mut PointLight>), Without<ExhaustTips>>,
+    mut ents: Query<(&mut Visibility, &mut Transform, &mut GlobalTransform, Option<&mut PointLight>), (Without<ExhaustTips>, Without<fh1_render::post::FxPostCamera>)>,
+    (mut half, assets, cams): (Option<ResMut<fh1_render::fx_half_res::FxHalfRes>>, Res<AssetServer>, Query<(&GlobalTransform, &Camera), With<fh1_render::post::FxPostCamera>>),
 ) {
     let _watch = crate::perf::watch("burn");
     let b = &mut *burning;
@@ -983,6 +997,23 @@ fn burn(
         return;
     }
     centroid /= count as f32;
+    if let Some(half) = half.as_deref_mut().filter(|_| half_flames()) {
+        // Half-res effects pass: world-space quads (b.pos is still world space here), no entity.
+        if let Some((e, ..)) = b.draw {
+            if let Ok((mut v, ..)) = ents.get_mut(e) {
+                v.set_if_neq(Visibility::Hidden);
+            }
+        }
+        use fh1_render::fx_half_res::{FxBatch, FxBlend, FxVertex};
+        let cam = cams.iter().find(|c| c.1.is_active).map_or(centroid, |c| c.0.translation());
+        let shader = b.half_shader.get_or_insert_with(|| assets.load("embedded://fh1_engine/flame.wgsl")).clone();
+        let verts = (0..b.pos.len())
+            .map(|i| FxVertex { pos: b.pos[i], corner: b.corner[i], size_rot: b.size[i], colour: b.data[i], extra: b.axis[i] })
+            .collect();
+        let params = FlameParams { k: Vec4::new(env_f("FH1_FLAME_BRIGHT", 1.0), 0.0, 0.0, 0.0) };
+        half.push(FxBatch { shader, blend: FxBlend::AddPremul, tex0: None, tex1: None, params: FxBatch::uniform(&params), verts, dist2: centroid.distance_squared(cam) });
+        return;
+    }
     for p in b.pos.iter_mut() {
         *p = (Vec3::from(*p) - centroid).to_array();
     }
@@ -1034,6 +1065,7 @@ fn fill_flames(m: &mut Mesh, b: &Burning, n: usize) {
         dst.clear();
         dst.extend_from_slice(src);
     }
+    let prev = fh1_render::particles::quad_mesh_capacity(m);
     if let Some(VertexAttributeValues::Float32x3(v)) = m.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
         put(v, &b.pos);
     }
@@ -1050,13 +1082,8 @@ fn fill_flames(m: &mut Mesh, b: &Burning, n: usize) {
         put(v, &b.axis);
     }
     if let Some(Indices::U32(idx)) = m.indices_mut() {
-        let want = n * 6;
-        if idx.len() > want {
-            idx.truncate(want);
-        }
-        for q in idx.len() / 6..n {
-            let base = q as u32 * 4;
-            idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
+        fh1_render::particles::quad_indices(idx, n);
     }
+    // Stable allocation size (fh1-render particles.rs `fx_mesh_cap_on`; FH1_FX_MESH_CAP=0 = old).
+    fh1_render::particles::pad_quad_mesh(m, n, prev);
 }

@@ -5,7 +5,10 @@
 //!   visible-mesh counts, streaming gauges and counters), and one `hitch` row per frame over [`HITCH_MS`] with that
 //!   frame's main split, the latest render-thread split and the streaming activity of the moment.
 //! - `<same name>_summary.txt`, rewritten every [`SUMMARY_EVERY`] s and at exit: per (map, car, renderer) segment the
-//!   time, fps, frame p50 / p99 / max, the share of slow frames, and the worst hitches.
+//!   time, fps, frame p50 / p99 / max, the share of slow frames, and the worst hitches; the slowest systems; and (since
+//!   2026-10-08, the 200 fps push) the GPU time of every render pass (Bevy `RenderDiagnosticsPlugin` timestamp queries,
+//!   added by this plugin) with the CPU time spent encoding it. CSV columns `gpu_pass_ms` / `gpu_encode_ms` = the per-second
+//!   sums over the top-level passes.
 //!
 //! Cheap by design: per frame it only pushes a few numbers into memory; rows are buffered and appended to the file every
 //! [`FLUSH_EVERY`] s. Read a log with `tools/perf_report.py <csv>`.
@@ -43,12 +46,43 @@ fn file_job(job: FileJob) {
     }
 }
 
+/// `<data>/perf_logs` (created), `--data` aware.
+fn perf_dir() -> Option<PathBuf> {
+    let mut args = std::env::args();
+    let mut data = PathBuf::from("data");
+    while let Some(a) = args.next() {
+        if a == "--data" {
+            data = args.next()?.into();
+        }
+    }
+    let dir = data.join("perf_logs");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!("perf recorder: can't create {}: {e}", dir.display());
+        return None;
+    }
+    Some(dir)
+}
+
+/// Stall watchdog on without the recorder (FH1_STALL_WATCH=0 = off).
+pub fn stall_watch() -> bool {
+    !std::env::var("FH1_STALL_WATCH").is_ok_and(|v| v == "0")
+}
+
 pub fn on() -> bool {
     std::env::var("FH1_PERF_REC").is_ok_and(|v| v == "1")
 }
 
 pub fn plugin(app: &mut App) {
     if !on() {
+        // Stall watchdog without the recorder (2026-10-08: the user's pauses left no data with FH1_PERF_REC=0). Cheap: one
+        // thread polling every 50 ms, stacks only for frames over 1 s. FH1_STALL_WATCH=0 = off without the recorder (old).
+        if stall_watch() {
+            if let Some(dir) = perf_dir() {
+                let renderer = if fh1_remaster::enabled() { "remaster" } else { "faithful" };
+                let stem = format!("{}_{renderer}", utc_stamp().replace([':', '-'], "").replace('T', "_"));
+                super::watchdog::plugin(app, dir.join(format!("{stem}_stalls.txt")));
+            }
+        }
         return;
     }
     let Some(rec) = Recorder::open() else { return };
@@ -57,6 +91,10 @@ pub fn plugin(app: &mut App) {
     super::watchdog::plugin(app, stalls);
     super::draws::plugin(app);
     super::meshes::plugin(app);
+    // GPU + CPU-encode time per render pass (timestamp queries; scenery/p2.rs adds the same plugin under FH1_P2_STATS).
+    if !app.is_plugin_added::<bevy::render::diagnostic::RenderDiagnosticsPlugin>() {
+        app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+    }
     super::watchdog::set_span_totals(true);
     app.insert_resource(rec).add_systems(Last, record);
 }
@@ -65,7 +103,7 @@ const HEADER: &str = "kind,t_s,utc,map,car,renderer,state,x,y,z,speed_kmh,fps,fr
 rt_extract,rt_prepare_assets,rt_specialize,rt_queue,rt_prepare,rt_render,rt_total,main_wait,main_to_preupdate,main_to_update,\
 main_to_postupdate,main_to_last,main_busy,cpu_process,cpu_system,ram_process_mb,ram_system_mb,gpu_util,vram_mb,vram_total_mb,gpu_temp,\
 entities,meshes,meshes_visible,zones_loaded,zones_pending,prop_tiles,prop_pending,prop_placing,zone_loads,prop_tile_loads,\
-scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms,hitch_spans,mesh_uploads,mesh_upload_mb,sw_geometries,sw_instances,sw_arena_mb,sw_candidates,sw_views";
+scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms,hitch_spans,mesh_uploads,mesh_upload_mb,sw_geometries,sw_instances,sw_arena_mb,sw_candidates,sw_views,gpu_pass_ms,gpu_encode_ms";
 
 /// One (map, car, renderer) stretch of play.
 #[derive(Default)]
@@ -99,6 +137,9 @@ pub struct Recorder {
     systems: PathBuf,
     span_totals: HashMap<String, (f64, u32)>,
     span_frames: u64,
+    /// Per render pass (RenderDiagnosticsPlugin path under `render/`): summed per-second (GPU ms, CPU encode ms); seconds counted.
+    pass_totals: HashMap<String, (f64, f64)>,
+    pass_secs: u32,
     /// Mesh uploads (perf/meshes.rs): this second's count and bytes, and the previous frame's census (the render world
     /// runs a frame behind, so a hitch reports the bigger of the two).
     uploads_sec: (u32, u64),
@@ -107,18 +148,7 @@ pub struct Recorder {
 
 impl Recorder {
     fn open() -> Option<Self> {
-        let mut args = std::env::args();
-        let mut data = PathBuf::from("data");
-        while let Some(a) = args.next() {
-            if a == "--data" {
-                data = args.next()?.into();
-            }
-        }
-        let dir = data.join("perf_logs");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            warn!("perf recorder: can't create {}: {e}", dir.display());
-            return None;
-        }
+        let dir = perf_dir()?;
         let renderer = if fh1_remaster::enabled() { "remaster" } else { "faithful" };
         let stem = format!("{}_{renderer}", utc_stamp().replace([':', '-'], "").replace('T', "_"));
         let csv = dir.join(format!("{stem}.csv"));
@@ -143,6 +173,8 @@ impl Recorder {
             systems,
             span_totals: HashMap::new(),
             span_frames: 0,
+            pass_totals: HashMap::new(),
+            pass_secs: 0,
             uploads_sec: (0, 0),
             uploads_prev: Default::default(),
         })
@@ -204,8 +236,27 @@ impl Recorder {
                 out += &format!("  {:7.3}  {:>8} runs  {name}\n", ms / self.span_frames as f64, runs);
             }
         }
+        if self.pass_secs > 0 {
+            let n = self.pass_secs as f64;
+            let mut v: Vec<(&String, &(f64, f64))> = self.pass_totals.iter().collect();
+            v.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+            let top = |f: fn(&(f64, f64)) -> f64| v.iter().filter(|(k, _)| !k.contains('/')).map(|(_, x)| f(x)).sum::<f64>() / n;
+            out += &format!(
+                "\nGPU time per render pass (ms per frame, timestamp queries; top-level passes sum to {:.2} ms GPU and {:.2} ms CPU encode per frame; nested spans contain '/'):\n      gpu   encode  pass\n",
+                top(|x| x.0),
+                top(|x| x.1)
+            );
+            for (name, (g, c)) in v.into_iter().take(48) {
+                out += &format!("  {:7.3}  {:7.3}  {name}\n", g / n, c / n);
+            }
+        }
         file_job(FileJob::Write(self.summary.clone(), out));
     }
+}
+
+/// Drops the recorder (its Drop writes the CSV tail + summary in place); writer.rs `end_process` before ending the process.
+pub(super) fn drop_recorder(world: &mut World) {
+    drop(world.remove_resource::<Recorder>());
 }
 
 impl Drop for Recorder {
@@ -230,6 +281,7 @@ fn record(
     meshes: Query<(&ViewVisibility, MeshCat), With<Mesh3d>>,
     entities: Query<()>,
     menu: Option<Res<crate::ui::Menu>>,
+    store: Option<Res<bevy::diagnostic::DiagnosticsStore>>,
     mut exit: MessageReader<AppExit>,
 ) {
     let r = &mut *rec;
@@ -387,6 +439,32 @@ fn record(
             row.set("sw_arena_mb", (sw.vertex_bytes + sw.index_bytes) as f32 / (1024.0 * 1024.0), 1);
             row.text("sw_candidates", cand.to_string());
             row.text("sw_views", views.to_string());
+            // Render passes (RenderDiagnosticsPlugin): `render/<pass>/elapsed_gpu|cpu`, averaged over the store's history
+            // (~120 frames). Top-level passes (no '/' in the name) sum to the frame's GPU time; nested spans are listed too.
+            if let Some(store) = store.as_ref() {
+                let (mut gpu, mut cpu, mut any) = (0.0f64, 0.0f64, false);
+                for d in store.iter() {
+                    let Some(p) = d.path().as_str().strip_prefix("render/") else { continue };
+                    let Some(v) = d.average() else { continue };
+                    any = true;
+                    if let Some(name) = p.strip_suffix("/elapsed_gpu") {
+                        if !name.contains('/') {
+                            gpu += v;
+                        }
+                        r.pass_totals.entry(name.to_owned()).or_default().0 += v;
+                    } else if let Some(name) = p.strip_suffix("/elapsed_cpu") {
+                        if !name.contains('/') {
+                            cpu += v;
+                        }
+                        r.pass_totals.entry(name.to_owned()).or_default().1 += v;
+                    }
+                }
+                if any {
+                    r.pass_secs += 1;
+                    row.set("gpu_pass_ms", gpu as f32, 2);
+                    row.set("gpu_encode_ms", cpu as f32, 2);
+                }
+            }
             row.text("mesh_uploads", r.uploads_sec.0.to_string());
             row.set("mesh_upload_mb", r.uploads_sec.1 as f32 / (1024.0 * 1024.0), 1);
             r.uploads_sec = (0, 0);

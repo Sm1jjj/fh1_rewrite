@@ -20,6 +20,15 @@
 //! FH1_SHADOW_SMALL_DIST of the main camera; cascades in `DirectionalShadowSkipThisFrame` are left alone; cutouts
 //! alpha-tested on layer A). `FH1_STATIC_WORLD_CULL=0` = no culling (chunk 2), `FH1_STATIC_WORLD_SHADOWS=0` = no static
 //! shadows, `FH1_STATIC_WORLD_PROBE=0` = static scenery not in the probe.
+//! P15-A (docs/PERF_P15_A.md; needs culling + compaction): every (group, cull, mask) bin is split into draw classes that
+//! the cull picks per candidate and frame, and the bins are drawn class by class: near cutouts (write their own depth
+//! first; never pre-passed), pre-passed near occluders, other near opaque, far opaque, far cutouts
+//! (`FH1_SW_DRAW_ORDER=0` = old group-major order). A depth-only, position-only pre-pass of the big near opaque occluders
+//! (ground / road tiles, buildings: fully visible, no cloth, within FH1_SW_PREPASS_DIST) runs before Bevy's main opaque
+//! pass into the main depth, so the lit passes depth-reject what they hide and the Hi-Z pyramid (built from the same
+//! depth) sees them (`FH1_SW_PREPASS=0` = off). Cascades dither the LOD / zone fades like the main pass: in-band opaque
+//! records go to a dithering class, cutouts dither in their alpha-test stage (`FH1_SW_SHADOW_DITHER=0` = both levels
+//! cast fully, as before).
 
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -43,6 +52,7 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::settings::WgpuFeatures;
 use bevy::render::view::{ExtractedView, ViewDepthTexture, ViewTarget};
+use bevy::render::diagnostic::RecordDiagnostics;
 use bevy::render::{Render, RenderSystems};
 use bevy::shader::ShaderDefVal;
 
@@ -85,6 +95,60 @@ fn probe_on() -> bool {
     *V.get_or_init(|| flag_on("FH1_STATIC_WORLD_PROBE"))
 }
 
+/// P15-A draw classes / class-ordered bins (needs culling + compaction).
+fn order_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| flag_on("FH1_SW_DRAW_ORDER"))
+}
+
+/// P15-A partial depth pre-pass of the near occluders (needs the draw classes and bindless materials).
+fn prepass_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| flag_on("FH1_SW_PREPASS"))
+}
+
+/// P15-A LOD / zone fade dither in the cascades.
+fn shadow_dither_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| flag_on("FH1_SW_SHADOW_DITHER"))
+}
+
+fn env_f32(k: &str, default: f32) -> f32 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Main view class distances (m, to the record's box): x pre-pass occluders, y occluder min half-diagonal, z near opaque,
+/// w near cutouts.
+fn ring() -> Vec4 {
+    static V: std::sync::OnceLock<Vec4> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        Vec4::new(
+            env_f32("FH1_SW_PREPASS_DIST", 120.0),
+            env_f32("FH1_SW_PREPASS_RADIUS", 4.0),
+            env_f32("FH1_SW_NEAR_DIST", 150.0).max(1.0),
+            env_f32("FH1_SW_MASK_NEAR_DIST", 80.0).max(1.0),
+        )
+    })
+}
+
+/// Draw classes of a bin (draw order: near cutouts, occluders, near opaque, far opaque, far cutouts). Without the split
+/// every bin is CLASS_FAR. Shadow views use CLASS_NEAR of opaque bins for the in-band (dithered) records.
+const CLASS_FAR: u8 = 0;
+const CLASS_NEAR: u8 = 1;
+const CLASS_OCC: u8 = 2;
+/// Draw bins addressable by the packed candidate word (3 x 10 bits).
+const MAX_DRAW_BINS: usize = 1023;
+
+/// GPU culling on (static_world.rs `apply_ops`: hidden records stay list candidates only with it).
+pub(super) fn culling() -> bool {
+    cull_on()
+}
+
+/// The static world draws its scenery into the car probe faces (car_probe.rs static-only faces).
+pub(super) fn probe_faces() -> bool {
+    probe_on()
+}
+
 /// Main world: the two shaders.
 pub(super) fn register_shaders(app: &mut App) {
     let mut shaders = app.world_mut().resource_mut::<Assets<Shader>>();
@@ -103,10 +167,13 @@ pub(super) fn plugin(ra: &mut SubApp) {
         .add_systems(Render, (init_pipelines, specialize_views).chain().in_set(RenderSystems::Queue))
         .add_systems(Render, (prepare_views, prepare_bind_groups).chain().in_set(RenderSystems::PrepareBindGroups))
         .add_systems(Core3d, draw_static_shadows.after(bevy::pbr::per_view_shadow_pass::<true>).before(Core3dSystems::MainPass))
+        // P15-A pre-pass: after Bevy's own prepass (contact shadows' DepthPrepass copies the depth at its end, so their
+        // input is unchanged), before the main opaque pass.
+        .add_systems(Core3d, draw_static_prepass.after(draw_static_shadows).before(main_opaque_pass_3d).in_set(Core3dSystems::MainPass))
         .add_systems(
             Core3d,
             // Before Bevy's transparent pass too (decals / water / glass over the static ground; dc).
-            draw_static_world.after(main_opaque_pass_3d).before(bevy::core_pipeline::core_3d::main_transparent_pass_3d).in_set(Core3dSystems::MainPass),
+            draw_static_world.after(main_opaque_pass_3d).before(bevy::core_pipeline::core_3d::main_transparent_pass_3d).before(fh1_render::fx_half_res::FxHalfResSet).in_set(Core3dSystems::MainPass),
         );
 }
 
@@ -190,7 +257,7 @@ impl SpecializedRenderPipeline for SwPipeline {
     }
 }
 
-/// Depth-only cascade pipeline: [cull view uniform, arena, material].
+/// Depth-only cascade pipeline: [cull view uniform, arena, material]. Also the main view's pre-pass.
 #[derive(Resource)]
 pub(super) struct ShadowPipeline {
     view_layout: BindGroupLayoutDescriptor,
@@ -200,35 +267,65 @@ pub(super) struct ShadowPipeline {
     unclipped: bool,
 }
 
-impl SpecializedRenderPipeline for ShadowPipeline {
-    type Key = Variant;
+/// Cascade (prepass 0) or main-view pre-pass (prepass = MSAA sample count) pipeline key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct ShadowKey {
+    variant: Variant,
+    /// Cascades: LOD / zone fade dither in a fragment stage.
+    dither: bool,
+    prepass: u8,
+}
 
-    fn specialize(&self, v: Variant) -> RenderPipelineDescriptor {
+impl SpecializedRenderPipeline for ShadowPipeline {
+    type Key = ShadowKey;
+
+    fn specialize(&self, k: ShadowKey) -> RenderPipelineDescriptor {
+        let v = k.variant;
         let mut defs: Vec<ShaderDefVal> = vec![ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 2)];
         if self.bindless {
             defs.push("BINDLESS".into());
         }
-        if !self.unclipped {
+        let pre = k.prepass > 0;
+        if !self.unclipped && !pre {
             defs.push("CLAMP_DEPTH".into());
         }
         // Cutouts are alpha-tested only with bindless materials (the plain layout has no index table).
-        let mask = v.mask && self.bindless;
+        let mask = v.mask && self.bindless && !pre;
         if mask {
             defs.push("MASK".into());
         }
+        let dither = k.dither && !pre;
+        if dither {
+            defs.push("DITHER".into());
+        }
+        if pre {
+            // Pre-pass: the material table only to drop cloth / non-opaque materials in the vertex stage.
+            defs.push("PREPASS".into());
+        }
+        if mask || (pre && self.bindless) {
+            defs.push("TABLE".into());
+        }
+        let frag = mask || dither;
+        if frag {
+            defs.push("FRAG".into());
+        }
         RenderPipelineDescriptor {
-            label: Some("static world shadow".into()),
+            label: Some(if pre { "static world prepass" } else { "static world shadow" }.into()),
             layout: vec![self.view_layout.clone(), self.arena_layout.clone(), self.material_layout.clone()],
             vertex: VertexState { shader: SHADOW_SHADER, shader_defs: defs.clone(), entry_point: Some("vertex".into()), buffers: Vec::new() },
-            fragment: mask.then(|| FragmentState { shader: SHADOW_SHADER, shader_defs: defs, entry_point: Some("fragment".into()), targets: Vec::new() }),
-            primitive: PrimitiveState { cull_mode: v.face(), unclipped_depth: self.unclipped, ..default() },
+            fragment: frag.then(|| FragmentState { shader: SHADOW_SHADER, shader_defs: defs, entry_point: Some("fragment".into()), targets: Vec::new() }),
+            primitive: PrimitiveState { cull_mode: v.face(), unclipped_depth: self.unclipped && !pre, ..default() },
             depth_stencil: Some(DepthStencilState {
                 format: CORE_3D_DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::GreaterEqual),
                 stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
+                // Pre-pass: written a hair farther (reverse-Z: smaller) than the lit pass computes the same surface, so the
+                // lit pass's GreaterEqual always passes on it (different shaders, no position invariance) while anything
+                // behind is still rejected.
+                bias: if pre { DepthBiasState { constant: -16, slope_scale: -2.0, clamp: 0.0 } } else { DepthBiasState::default() },
             }),
+            multisample: bevy::render::render_resource::MultisampleState { count: k.prepass.max(1) as u32, ..default() },
             ..default()
         }
     }
@@ -309,9 +406,16 @@ fn init_pipelines(
     commands.insert_resource(SwPipeline { mesh_pipeline: mp.clone(), layout_ref, arena_layout, material_layout, bindless });
 }
 
-/// Per drawn view: the lit pipelines per variant (main / probe).
+/// Per drawn view: the lit pipelines per variant (main / probe) and the main view's pre-pass pipelines (opaque variants).
 #[derive(Component, Default)]
-pub(super) struct SwViewPipelines(HashMap<Variant, CachedRenderPipelineId>);
+pub(super) struct SwViewPipelines {
+    lit: HashMap<Variant, CachedRenderPipelineId>,
+    pre: HashMap<Variant, CachedRenderPipelineId>,
+}
+
+/// The main view runs the P15-A pre-pass this frame (prepare_views): its first cull is dispatched by draw_static_prepass.
+#[derive(Component, Clone, Copy)]
+pub(super) struct SwPrepass;
 
 /// The main 3D camera (order 0).
 fn is_main(camera: &ExtractedCamera) -> bool {
@@ -343,10 +447,30 @@ fn specialize_views(
         }
         let Some(view_key) = keys.get(&view.retained_view_entity) else { continue };
         let mesh_key = *view_key | MeshPipelineKey::from_primitive_topology_and_strip_index(bevy::mesh::PrimitiveTopology::TriangleList, None);
-        let map = variants.iter().map(|&v| (v, pipelines.specialize(&cache, &pipeline, SwKey { mesh_key, variant: v }))).collect();
-        commands.entity(e).insert(SwViewPipelines(map));
+        let lit = variants.iter().map(|&v| (v, pipelines.specialize(&cache, &pipeline, SwKey { mesh_key, variant: v }))).collect();
+        let pre = if is_main(camera) && lists.split && prepass_on() && shadow.bindless {
+            let samples = view_key.msaa_samples().clamp(1, 255) as u8;
+            variants
+                .iter()
+                .filter(|v| !v.mask)
+                .map(|&v| (v, shadow_pipelines.specialize(&cache, &shadow, ShadowKey { variant: v, dither: false, prepass: samples })))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        commands.entity(e).insert(SwViewPipelines { lit, pre });
     }
-    lists.shadow_pipelines = variants.iter().map(|&v| (v, shadow_pipelines.specialize(&cache, &shadow, v))).collect();
+    // Cascades: per variant the plain pipeline (cutouts dither in it when on) and the dithering one (in-band opaque class).
+    let dither = shadow_dither_on();
+    let mut map = HashMap::new();
+    for &v in &variants {
+        map.insert((v, false), shadow_pipelines.specialize(&cache, &shadow, ShadowKey { variant: v, dither: dither && v.mask && shadow.bindless, prepass: 0 }));
+        // Always (not only with the split): specialize_views runs before build_lists flips `split`.
+        if dither {
+            map.insert((v, true), shadow_pipelines.specialize(&cache, &shadow, ShadowKey { variant: v, dither: true, prepass: 0 }));
+        }
+    }
+    lists.shadow_pipelines = map;
 }
 
 // ---------------------------------------------------------------- draw lists (CPU, on change only)
@@ -364,6 +488,9 @@ fn resolve_materials(mut arena: ResMut<Arena>, bindings: Res<RenderMaterialBindi
     pending.sort_unstable();
     pending.dedup();
     let mut still = Vec::new();
+    // Batched uploads (static_world.rs `batch_ops_on`): one write per run of changed slots.
+    let batch = super::batch_ops_on();
+    let mut touched = Vec::new();
     for slot in pending {
         let s = slot as usize;
         let Some(Some((_, material))) = arena.slot_mesh.get(s).cloned() else { continue };
@@ -372,13 +499,18 @@ fn resolve_materials(mut arena: ResMut<Arena>, bindings: Res<RenderMaterialBindi
                 if arena.records[s].material != b.slot.0 || arena.slot_group[s] != Some(b.group.0) {
                     arena.records[s].material = b.slot.0;
                     arena.slot_group[s] = Some(b.group.0);
-                    arena.write_record(&device, &queue, slot);
+                    if batch {
+                        touched.push(slot);
+                    } else {
+                        arena.write_record(&device, &queue, slot);
+                    }
                     arena.dirty = true;
                 }
             }
             None => still.push(slot),
         }
     }
+    arena.write_records(&device, &queue, &mut touched);
     arena.pending = still;
 }
 
@@ -400,8 +532,12 @@ const ARGS_BYTES: u64 = std::mem::size_of::<Args>() as u64;
 pub(super) struct Bin {
     group: u32,
     variant: Variant,
+    /// First arg entry of the bin in a view's region (= first candidate without the class split).
     first: u32,
+    /// Arg capacity (the source bin's candidate count).
     count: u32,
+    /// CLASS_* (P15-A).
+    class: u8,
 }
 
 #[derive(Resource, Default)]
@@ -423,7 +559,10 @@ pub(super) struct DrawLists {
     /// Bumped on every candidate list rebuild (Hi-Z: the visibility bits reset).
     generation: u64,
     arena_bind_group: Option<(u32, BindGroup)>,
-    shadow_pipelines: HashMap<Variant, CachedRenderPipelineId>,
+    /// Cascade pipelines per (variant, dithering class).
+    shadow_pipelines: HashMap<(Variant, bool), CachedRenderPipelineId>,
+    /// P15-A: the bins are split into draw classes (culling + compaction + FH1_SW_DRAW_ORDER).
+    split: bool,
 }
 
 impl DrawLists {
@@ -442,32 +581,83 @@ fn build_lists(mut arena: ResMut<Arena>, mut lists: ResMut<DrawLists>, device: R
     }
     arena.dirty = false;
     let cull = cull_on();
-    let mut by_bin: HashMap<(u32, Variant), Vec<u32>> = HashMap::new();
+    // Counting sort by bin key (group, cull, mask): the rebuild runs on most frames while streaming (every membership
+    // change), and the HashMap<(group, variant), Vec> it used cost ~0.5 ms per 32-40k records (user log 164922:
+    // build_lists 0.46 ms per frame averaged over the run).
+    let key_of = |group: u32, v: Variant| group as usize * 6 + v.cull as usize * 2 + v.mask as usize;
+    let max_group = arena.slot_group.iter().flatten().copied().max().unwrap_or(0) as usize;
+    let mut counts = vec![0u32; (max_group + 1) * 6];
+    let mut rec_key: Vec<u32> = vec![u32::MAX; arena.records.len()];
     for (s, r) in arena.records.iter().enumerate() {
         // With culling, hidden records stay candidates (the GPU checks the flag): a zone switch doesn't rebuild the list.
         if r.flags & FLAG_LIVE == 0 || (!cull && r.flags & FLAG_HIDDEN != 0) || r.index_count == 0 {
             continue;
         }
         let Some(Some(group)) = arena.slot_group.get(s) else { continue };
-        by_bin.entry((*group, Variant::of(r.flags))).or_default().push(s as u32);
+        let k = key_of(*group, Variant::of(r.flags));
+        counts[k] += 1;
+        rec_key[s] = k as u32;
     }
-    let mut keys: Vec<(u32, Variant)> = by_bin.keys().copied().collect();
-    keys.sort_by_key(|(g, v)| (*g, v.cull, v.mask));
-    let mut slots: Vec<u32> = Vec::new();
-    let mut bins = Vec::new();
-    for k in keys {
-        let v = &by_bin[&k];
-        bins.push(Bin { group: k.0, variant: k.1, first: slots.len() as u32, count: v.len() as u32 });
-        slots.extend_from_slice(v);
+    // Source bins: the candidates grouped by key (candidate order).
+    let mut src: Vec<Bin> = Vec::new();
+    let mut cursor = vec![0u32; counts.len()];
+    let mut total = 0u32;
+    for (k, &n) in counts.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        cursor[k] = total;
+        src.push(Bin { group: (k / 6) as u32, variant: Variant { cull: ((k % 6) / 2) as u8, mask: k % 2 == 1 }, first: total, count: n, class: CLASS_FAR });
+        total += n;
+    }
+    let mut slots: Vec<u32> = vec![0; total as usize];
+    for (s, &k) in rec_key.iter().enumerate() {
+        if k != u32::MAX {
+            slots[cursor[k as usize] as usize] = s as u32;
+            cursor[k as usize] += 1;
+        }
+    }
+    // P15-A draw bins in draw order, each with its own arg range (capacity = the source bin's count): near cutouts,
+    // pre-passed occluders, near opaque, far opaque, far cutouts. `class_bins[i]` = draw bin of source bin i per class.
+    let n_mask = src.iter().filter(|b| b.variant.mask).count();
+    let mut split = cull && order_on() && compact_wanted() && device.features().contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT);
+    if split && n_mask * 2 + (src.len() - n_mask) * 3 > MAX_DRAW_BINS {
+        warn!("static world: {} source bins, too many for the draw classes; class split off", src.len());
+        split = false;
+    }
+    let mut bins: Vec<Bin> = Vec::with_capacity(src.len() * 3);
+    let mut class_bins = vec![[0u32; 3]; src.len()];
+    let mut entries = total;
+    if split {
+        let mut at = 0u32;
+        for (mask, class) in [(true, CLASS_NEAR), (false, CLASS_OCC), (false, CLASS_NEAR), (false, CLASS_FAR), (true, CLASS_FAR)] {
+            for (i, b) in src.iter().enumerate().filter(|(_, b)| b.variant.mask == mask) {
+                class_bins[i][class as usize] = bins.len() as u32;
+                bins.push(Bin { first: at, class, ..*b });
+                at += b.count;
+            }
+        }
+        for (i, b) in src.iter().enumerate() {
+            if b.variant.mask {
+                class_bins[i][CLASS_OCC as usize] = class_bins[i][CLASS_NEAR as usize];
+            }
+        }
+        entries = at;
+    } else {
+        for (i, b) in src.iter().enumerate() {
+            class_bins[i] = [i as u32; 3];
+            bins.push(*b);
+        }
     }
     lists.bins = bins;
+    lists.split = split;
     lists.count = slots.len() as u32;
     lists.generation += 1;
     if slots.is_empty() {
         return;
     }
     // Args: one region per view (culling) or one region (no culling). Re-created when the candidates outgrow it.
-    let region = slots.len() as u32;
+    let region = entries;
     if lists.args.is_none() || lists.region < region {
         let r = (region + region / 2).max(4096);
         let views = if cull { MAX_VIEWS } else { 1 };
@@ -494,12 +684,15 @@ fn build_lists(mut arena: ResMut<Arena>, mut lists: ResMut<DrawLists>, device: R
         }
         return;
     }
-    // Candidates as (slot, bin) pairs; the bins' first arg entries; the per-(view, bin) counts.
+    // Candidates as (slot, bin) pairs; the bins' first arg entries; the per-(view, bin) counts. With the class split the
+    // bin word packs the draw bins far | near << 10 | occluder << 20 (the cull picks one per view and frame).
     let mut pairs: Vec<u32> = Vec::with_capacity(slots.len() * 2);
-    for (b, bin) in lists.bins.iter().enumerate() {
-        for &slot in &slots[bin.first as usize..(bin.first + bin.count) as usize] {
+    for (i, b) in src.iter().enumerate() {
+        let c = class_bins[i];
+        let word = if split { c[0] | c[1] << 10 | c[2] << 20 } else { c[0] };
+        for &slot in &slots[b.first as usize..(b.first + b.count) as usize] {
             pairs.push(slot);
-            pairs.push(b as u32);
+            pairs.push(word);
         }
     }
     let firsts: Vec<u32> = lists.bins.iter().map(|b| b.first).collect();
@@ -545,6 +738,11 @@ pub(super) struct ViewUniform {
     info: UVec4,
     /// Hi-Z: x phase (0 single cull, 1 last frame's visible, 2 occlusion test), y pyramid mip levels.
     extra: UVec4,
+    /// P15-A main view class distances (`ring()`; x 0 = no pre-pass class, z 0 = no near classes).
+    ring: Vec4,
+    /// P15-A: x 1 = packed class bins, y cascade fade mode (0 off, 1 in-band opaque -> dithering class, 2 hard switch at
+    /// the band centre), z 1 = cutouts dither in their own pipeline (bindless).
+    opts: UVec4,
 }
 
 const KIND_MAIN: u32 = 0;
@@ -611,16 +809,27 @@ fn prepare_views(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     skip: Option<Res<DirectionalShadowSkipThisFrame>>,
-    cameras: Query<(Entity, &ExtractedView, &ExtractedCamera, Option<&CarProbeFace>, Option<&ViewLightEntities>), With<ViewTarget>>,
+    cameras: Query<
+        (Entity, &ExtractedView, &ExtractedCamera, Option<&CarProbeFace>, Option<&ViewLightEntities>, Has<bevy::render::camera::TemporalJitter>),
+        With<ViewTarget>,
+    >,
     lights: Query<(&ExtractedView, Option<&LightEntity>), With<ShadowView>>,
-    stale: Query<Entity, Or<(With<SwCullView>, With<SwCullViewHiz>)>>,
+    stale: Query<Entity, Or<(With<SwCullView>, With<SwCullViewHiz>, With<SwPrepass>)>>,
     depths: Query<&ViewDepthTexture>,
-    (mut hiz, hiz_pipes, cache): (ResMut<super::hiz::Hiz>, Option<Res<super::hiz::HizPipelines>>, Res<PipelineCache>),
+    (mut hiz, hiz_pipes, cache, shadow): (ResMut<super::hiz::Hiz>, Option<Res<super::hiz::HizPipelines>>, Res<PipelineCache>, Option<Res<ShadowPipeline>>),
 ) {
     // Views not drawn this frame (a cached cascade, an idle probe face) must not keep last frame's slot.
     for e in &stale {
-        commands.entity(e).remove::<(SwCullView, SwCullViewHiz)>();
+        commands.entity(e).remove::<(SwCullView, SwCullViewHiz, SwPrepass)>();
     }
+    let bindless = shadow.as_ref().is_some_and(|s| s.bindless);
+    // P15-A options: packed class bins; cascade fades dithered (class split) or switched at the band centre.
+    let fade_mode = match (shadow_dither_on(), lists.split) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => 2,
+    };
+    let opts = UVec4::new(lists.split as u32, fade_mode, bindless as u32, 0);
     hiz.active = false;
     let u = &mut *uniforms;
     u.buffer.clear();
@@ -642,7 +851,7 @@ fn prepare_views(
         Some(SwCullView { offset, base, counts })
     };
     let skip_mask = skip.map_or(0, |s| s.0);
-    for (e, view, camera, face, view_lights) in &cameras {
+    for (e, view, camera, face, view_lights, jittered) in &cameras {
         let face = probe_face(face);
         let main = is_main(camera);
         if !main && !(probe_on() && face.is_some()) {
@@ -672,6 +881,14 @@ fn prepare_views(
                 params: Vec4::new(0.0, 0.0, 0.0, n as f32),
                 info: UVec4::new(KIND_MAIN, 0, 0, 0),
                 extra: UVec4::new(if hiz_now { 1 } else { 0 }, mips, 0, 0),
+                // Near / occluder classes only with the split; the occluder class only when the pre-pass draws it.
+                ring: if lists.split {
+                    let r = ring();
+                    Vec4::new(if prepass_on() && bindless { r.x } else { 0.0 }, r.y, r.z, r.w)
+                } else {
+                    Vec4::ZERO
+                },
+                opts,
             }
         } else {
             // 47's probe rules: radius >= probe_min_radius, within the face's far plane (80 m, down face 8 m).
@@ -683,10 +900,16 @@ fn prepare_views(
                 params: Vec4::new(crate::car_probe::probe_min_radius(), far, 0.0, n as f32),
                 info: UVec4::new(KIND_PROBE, 0, 0, 0),
                 extra: UVec4::ZERO,
+                ring: Vec4::ZERO,
+                opts,
             }
         };
         if let Some(cv) = push(vu, &mut u.buffer) {
             commands.entity(e).insert(cv);
+            // Not under TAA / DLSS jitter: the cull matrix is unjittered, the pre-pass edges would not match the lit pass.
+            if main && vu.ring.x > 0.0 && !jittered {
+                commands.entity(e).insert(SwPrepass);
+            }
         }
         if hiz_now {
             if let Some(cv) = push(ViewUniform { extra: UVec4::new(2, mips, 0, 0), ..vu }, &mut u.buffer) {
@@ -710,6 +933,8 @@ fn prepare_views(
                     params: Vec4::new(0.0, 0.0, small_dist(), n as f32),
                     info: UVec4::new(KIND_SHADOW, 0, 0, 0),
                     extra: UVec4::ZERO,
+                    ring: Vec4::ZERO,
+                    opts,
                 };
                 if let Some(cv) = push(vu, &mut u.buffer) {
                     commands.entity(le).insert(cv);
@@ -775,6 +1000,11 @@ fn prepare_bind_groups(
 
 // ---------------------------------------------------------------- passes
 
+/// The cull pipeline and its bind group exist (dispatch_cull can run).
+fn cull_ready(cache: &PipelineCache, cull: &CullPipeline, uniforms: &ViewUniforms) -> bool {
+    cache.get_compute_pipeline(cull.id).is_some() && uniforms.cull_bind_group.is_some()
+}
+
 /// Culls the view's candidates into its args region.
 fn dispatch_cull(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipeline, uniforms: &ViewUniforms, lists: &DrawLists, view: &SwCullView, count: u32) -> bool {
     let (Some(p), Some(bg)) = (cache.get_compute_pipeline(cull.id), uniforms.cull_bind_group.as_ref()) else { return false };
@@ -782,16 +1012,29 @@ fn dispatch_cull(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipe
         let Some(counts) = lists.counts.as_ref() else { return false };
         ctx.command_encoder().clear_buffer(counts, view.counts as u64 * 4, Some(lists.bins_cap as u64 * 4));
     }
+    let recorder = ctx.diagnostic_recorder();
+    let diagnostics = recorder.as_deref();
     let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor { label: Some("static world cull"), timestamp_writes: None });
+    let span = diagnostics.pass_span(&mut pass, "static_world_cull");
     pass.set_pipeline(p);
     pass.set_bind_group(0, bg, &[view.offset]);
     pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+    span.end(&mut pass);
     true
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_static_world(
-    view: ViewQuery<(&ExtractedCamera, &ViewTarget, &ViewDepthTexture, &MeshViewBindGroup, Option<&SwViewPipelines>, Option<&SwCullView>, Option<&SwCullViewHiz>)>,
+    view: ViewQuery<(
+        &ExtractedCamera,
+        &ViewTarget,
+        &ViewDepthTexture,
+        &MeshViewBindGroup,
+        Option<&SwViewPipelines>,
+        Option<&SwCullView>,
+        Option<&SwCullViewHiz>,
+        Has<SwPrepass>,
+    )>,
     arena: Res<Arena>,
     lists: Res<DrawLists>,
     uniforms: Res<ViewUniforms>,
@@ -801,13 +1044,18 @@ fn draw_static_world(
     (hiz, hiz_pipes, device): (Res<super::hiz::Hiz>, Option<Res<super::hiz::HizPipelines>>, Res<RenderDevice>),
     mut ctx: RenderContext,
 ) {
-    let (camera, target, depth, view_bg, pipelines, cull_view, hiz_view) = view.into_inner();
+    let (camera, target, depth, view_bg, pipelines, cull_view, hiz_view, prepassed) = view.into_inner();
     let (Some(pipelines), Some((_, arena_bg)), Some(args), Some(ib)) = (pipelines, lists.arena_bind_group.as_ref(), lists.args.as_ref(), arena.index_buffer()) else { return };
     if lists.bins.is_empty() {
         return;
     }
     let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
     let compact = cull.as_ref().is_some_and(|c| c.compact) && cull_on();
+    // The main view uses every draw class (P15-A order); other views cull everything into CLASS_FAR.
+    let classes = lists.split && is_main(camera);
+    // GPU / CPU time of the passes for the perf recorder (RenderDiagnosticsPlugin; a no-op without it).
+    let recorder = ctx.diagnostic_recorder();
+    let diagnostics = recorder.as_deref();
     // One lit pass over every bin from `base` (+ draw counts when compacted).
     let draw = |ctx: &mut RenderContext, base: u32, counts: Option<u32>| {
         let counts = counts.and_then(|c| lists.counts.as_ref().map(|b| (b, c)));
@@ -827,15 +1075,20 @@ fn draw_static_world(
         pass.set_bind_group(1, &view_bg.binding_array, &[]);
         pass.set_bind_group(2, arena_bg, &[]);
         pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-        for bin in &lists.bins {
-            let Some(id) = pipelines.0.get(&bin.variant) else { continue };
+        let span = diagnostics.pass_span(&mut pass, "static_world");
+        for (b, bin) in lists.bins.iter().enumerate() {
+            if !classes && bin.class != CLASS_FAR {
+                continue;
+            }
+            let Some(id) = pipelines.lit.get(&bin.variant) else { continue };
             let Some(p) = cache.get_render_pipeline(*id) else { continue };
             let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
             let Some(material_bg) = slab.bind_group() else { continue };
             pass.set_render_pipeline(p);
             pass.set_bind_group(3, material_bg, &[]);
-            draw_bin(&mut pass, args, counts, base, bin, &lists);
+            draw_bin(&mut pass, args, counts, base, b as u32, bin);
         }
+        span.end(&mut pass);
     };
     // Unculled (FH1_STATIC_WORLD_CULL=0): region 0, main camera only.
     if !cull_on() {
@@ -846,7 +1099,12 @@ fn draw_static_world(
     }
     // Culled: this view's region (+ its draw counts when compacted).
     let (Some(cv), Some(cull)) = (cull_view, cull.as_ref()) else { return };
-    if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
+    // With the P15-A pre-pass, draw_static_prepass already culled this view (same readiness test).
+    if prepassed {
+        if !cull_ready(&cache, cull, &uniforms) {
+            return;
+        }
+    } else if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
         return;
     }
     draw(&mut ctx, cv.base, compact.then_some(cv.counts));
@@ -861,14 +1119,73 @@ fn draw_static_world(
     }
 }
 
-/// One bin's draws: compacted (indirect count) or every candidate (zero-instance when culled).
-fn draw_bin<'a>(pass: &mut bevy::render::render_phase::TrackedRenderPass<'a>, args: &'a Buffer, counts: Option<(&'a Buffer, u32)>, base: u32, bin: &Bin, lists: &DrawLists) {
+/// P15-A partial depth pre-pass (main view, before Bevy's main opaque pass): culls the main view (phase 1 with Hi-Z) and
+/// draws the occluder class depth-only, position-only, into the main depth. The lit pass then shades those pixels once
+/// and depth-rejects what they hide (ECS opaque included); the Hi-Z pyramid is reduced from the same depth later.
+#[allow(clippy::too_many_arguments)]
+fn draw_static_prepass(
+    view: ViewQuery<(&ExtractedCamera, &ViewDepthTexture, Option<&SwViewPipelines>, Option<&SwCullView>), With<SwPrepass>>,
+    arena: Res<Arena>,
+    lists: Res<DrawLists>,
+    uniforms: Res<ViewUniforms>,
+    cull: Option<Res<CullPipeline>>,
+    cache: Res<PipelineCache>,
+    allocators: Res<MaterialBindGroupAllocators>,
+    mut ctx: RenderContext,
+) {
+    let (camera, depth, pipelines, cull_view) = view.into_inner();
+    let (Some(cv), Some(cull)) = (cull_view, cull.as_ref()) else { return };
+    // The cull runs here whatever else is missing: draw_static_world relies on it for this view.
+    if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
+        return;
+    }
+    let (Some(pipelines), Some((_, arena_bg)), Some(args), Some(ib), Some(view_bg), Some(counts)) =
+        (pipelines, lists.arena_bind_group.as_ref(), lists.args.as_ref(), arena.index_buffer(), uniforms.shadow_view_bind_group.as_ref(), lists.counts.as_ref())
+    else {
+        return;
+    };
+    if !cull.compact || !lists.split || pipelines.pre.is_empty() {
+        return;
+    }
+    let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
+    let recorder = ctx.diagnostic_recorder();
+    let diagnostics = recorder.as_deref();
+    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("static_world_prepass"),
+        color_attachments: &[],
+        depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    if let Some(viewport) = camera.viewport.as_ref() {
+        pass.set_camera_viewport(viewport);
+    }
+    pass.set_bind_group(0, view_bg, &[cv.offset]);
+    pass.set_bind_group(1, arena_bg, &[]);
+    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+    let span = diagnostics.pass_span(&mut pass, "static_world_prepass");
+    for (b, bin) in lists.bins.iter().enumerate() {
+        if bin.class != CLASS_OCC {
+            continue;
+        }
+        let Some(id) = pipelines.pre.get(&bin.variant) else { continue };
+        let Some(p) = cache.get_render_pipeline(*id) else { continue };
+        let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
+        let Some(material_bg) = slab.bind_group() else { continue };
+        pass.set_render_pipeline(p);
+        pass.set_bind_group(2, material_bg, &[]);
+        draw_bin(&mut pass, args, Some((counts, cv.counts)), cv.base, b as u32, bin);
+    }
+    span.end(&mut pass);
+}
+
+/// One bin's draws (`b` = its index in `lists.bins`): compacted (indirect count) or every candidate (zero-instance when
+/// culled).
+fn draw_bin<'a>(pass: &mut bevy::render::render_phase::TrackedRenderPass<'a>, args: &'a Buffer, counts: Option<(&'a Buffer, u32)>, base: u32, b: u32, bin: &Bin) {
     let offset = (base + bin.first) as u64 * ARGS_BYTES;
     match counts {
-        Some((cb, cbase)) => {
-            let b = lists.bins.iter().position(|x| x.first == bin.first).unwrap_or(0) as u32;
-            pass.multi_draw_indexed_indirect_count(args, offset, cb, (cbase + b) as u64 * 4, bin.count);
-        }
+        Some((cb, cbase)) => pass.multi_draw_indexed_indirect_count(args, offset, cb, (cbase + b) as u64 * 4, bin.count),
         None => pass.multi_draw_indexed_indirect(args, offset, bin.count),
     }
 }
@@ -897,6 +1214,8 @@ fn draw_static_shadows(
     };
     let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
     let counts = if cull.compact { lists.counts.as_ref() } else { None };
+    let recorder = ctx.diagnostic_recorder();
+    let diagnostics = recorder.as_deref();
     for &le in &view_lights.lights {
         // Only the cascades prepare_views gave a slot (skipped / cached cascades have none).
         let Ok((shadow_view, Some(cv))) = lights.get(le) else { continue };
@@ -914,15 +1233,23 @@ fn draw_static_shadows(
         pass.set_bind_group(0, view_bg, &[cv.offset]);
         pass.set_bind_group(1, arena_bg, &[]);
         pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-        for bin in &lists.bins {
-            let Some(id) = lists.shadow_pipelines.get(&bin.variant) else { continue };
+        let span = diagnostics.pass_span(&mut pass, "static_world_shadow");
+        for (b, bin) in lists.bins.iter().enumerate() {
+            // Cascades: far = all casters, near = the in-band (dithered) ones (P15-A fade mode 1); no occluder class.
+            let dithered = match bin.class {
+                CLASS_FAR => false,
+                CLASS_NEAR if lists.split && shadow_dither_on() => true,
+                _ => continue,
+            };
+            let Some(id) = lists.shadow_pipelines.get(&(bin.variant, dithered)) else { continue };
             let Some(p) = cache.get_render_pipeline(*id) else { continue };
             let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
             let Some(material_bg) = slab.bind_group() else { continue };
             pass.set_render_pipeline(p);
             pass.set_bind_group(2, material_bg, &[]);
-            draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, bin, &lists);
+            draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, b as u32, bin);
         }
+        span.end(&mut pass);
     }
 }
 
@@ -950,6 +1277,8 @@ struct SwView {
     params: vec4<f32>,
     info: vec4<u32>,
     extra: vec4<u32>,
+    ring: vec4<f32>,
+    opts: vec4<u32>,
 }
 "#;
 
@@ -975,6 +1304,8 @@ struct SwView {
     params: vec4<f32>,
     info: vec4<u32>,
     extra: vec4<u32>,
+    ring: vec4<f32>,
+    opts: vec4<u32>,
 }
 struct Args {
     index_count: u32,
@@ -1032,6 +1363,7 @@ fn occluded(c: vec3<f32>, e: vec3<f32>) -> bool {
 
 const FLAG_CASTS: u32 = 1u;
 const FLAG_LIVE: u32 = 4u;
+const FLAG_MASK: u32 = 8u;
 const FLAG_HIDDEN: u32 = 32u;
 const SMALL_RADIUS: f32 = 1.5;
 
@@ -1043,7 +1375,9 @@ fn cull(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     // Candidates are (slot, bin) pairs.
     let slot = candidates[2u * i];
-    let bin = candidates[2u * i + 1u];
+    // P15-A: with the class split the bin word packs far | near << 10 | occluder << 20.
+    let packed = candidates[2u * i + 1u];
+    var bin = select(packed, packed & 1023u, view.opts.x != 0u);
     let r = records[slot];
     var visible = (r.flags & FLAG_LIVE) != 0u && (r.flags & FLAG_HIDDEN) == 0u && r.index_count > 0u;
     let c = 0.5 * (r.aabb_min.xyz + r.aabb_max.xyz);
@@ -1056,6 +1390,9 @@ fn cull(@builtin(global_invocation_id) id: vec3<u32>) {
         visible = false;
     }
     let kind = view.info.x;
+    let is_mask = (r.flags & FLAG_MASK) != 0u;
+    // Inside a LOD fade band or a zone fade (the main pass dithers it: material.rs rm_dither).
+    let in_band = r.tag != 0 || d < r.lod.y || d >= r.lod.z;
     if kind == 1u {
         // Shadow cascades: casters only; small casters only near the main camera.
         if (r.flags & FLAG_CASTS) == 0u {
@@ -1063,6 +1400,30 @@ fn cull(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         if view.params.z > 0.0 && radius < SMALL_RADIUS && d > view.params.z {
             visible = false;
+        }
+        // P15-A fades: bindless cutouts dither in their own alpha-test stage. Mode 1: other in-band records go to the
+        // dithering class (near bin). Mode 2 (no class split): one level casts, switched at the band centres (the
+        // neighbouring LOD's margins are centred on the same switch distance); zones cast while at least half drawn.
+        let own = is_mask && view.opts.z != 0u;
+        if view.opts.y == 1u && !own && in_band {
+            bin = (packed >> 10u) & 1023u;
+        }
+        if view.opts.y == 2u && !own {
+            if d < 0.5 * (r.lod.x + r.lod.y) || d >= 0.5 * (r.lod.z + r.lod.w) || r.tag <= -8 || r.tag > 8 {
+                visible = false;
+            }
+        }
+    }
+    // P15-A main view classes (distance to the box): near cutouts / near opaque, and the pre-pass occluders: big, fully
+    // drawn (no fade dither: the pre-pass would punch holes where the lit pass discards) opaque records.
+    if view.opts.x != 0u && view.ring.z > 0.0 {
+        let dbox = length(max(abs(view.eye.xyz - c) - e, vec3<f32>(0.0)));
+        if dbox < select(view.ring.z, view.ring.w, is_mask) {
+            bin = (packed >> 10u) & 1023u;
+        }
+        let solid = r.tag == 0 && d >= r.lod.y + 0.5 && d < r.lod.z - 0.5;
+        if !is_mask && view.ring.x > 0.0 && dbox < view.ring.x && radius >= view.ring.y && solid {
+            bin = (packed >> 20u) & 1023u;
         }
     }
     if kind == 2u && radius < view.params.x {
@@ -1124,7 +1485,7 @@ fn shadow_wgsl() -> String {
 @group(1) @binding(100) var<storage> sw_vertices: array<u32>;
 @group(1) @binding(101) var<storage> sw_records: array<SwRecord>;
 
-#ifdef MASK
+#ifdef TABLE
 //INDICES
 struct SceneryParams {
     uv: array<vec4<f32>, 6>,
@@ -1140,6 +1501,19 @@ struct Out {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) slot: u32,
+    @location(2) @interpolate(flat) dither: i32,
+}
+
+// P15-A: the main pass's fade level (material.rs rm_dither; Bevy's visibility range mapping) from the main camera's LOD
+// eye, which the cascade's cull uniform carries: -16 .. 0 fading in, 0 drawn, 0 .. 16 fading out; zone tags as they are.
+fn sw_dither(r: SwRecord) -> i32 {
+    if r.tag != 0 {
+        return r.tag;
+    }
+    let d = distance(view.eye.xyz, vec3<f32>(r.rows[0].w, r.rows[1].w, r.rows[2].w)) * view.eye.w;
+    let offset = select(-16, 0, d >= r.lod.z);
+    let b = select(r.lod.xy, r.lod.zw, d >= r.lod.z);
+    return offset + clamp(i32(round((d - b.x) / max(b.y - b.x, 1e-4) * 16.0)), 0, 16);
 }
 
 @vertex
@@ -1156,6 +1530,19 @@ fn vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> O
 #endif
     out.slot = r.material;
     out.uv = vec2<f32>(0.0);
+    out.dither = 0;
+#ifdef DITHER
+    out.dither = sw_dither(r);
+#endif
+#ifdef PREPASS
+    // Only what the lit pass draws solid at exactly this position: no cloth wave (vertex animated), no cutout / decal /
+    // water / additive classes, no decal mask. Collapsed to a point otherwise (no fragments).
+    let q = scenery_params[scenery_indices[r.material].material];
+    let cls = (q.info.z >> 16u) & 0xffu;
+    if (q.info.z & 0x8080u) != 0u || cls == 1u || cls == 2u || cls == 4u || cls == 5u {
+        out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+#endif
 #ifdef MASK
     let p = scenery_params[scenery_indices[r.material].material];
     let uv_set = p.info.x & 3u;
@@ -1170,15 +1557,35 @@ fn vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> O
     return out;
 }
 
-#ifdef MASK
+#ifdef DITHER
+// Bevy's DITHER_THRESHOLD_MAP (pbr_functions.wgsl), here in shadow-map texels: complementary levels of one placement
+// cover each texel once, PCF turns that into a soft fade.
+const SW_DITHER_MAP: vec4<u32> = vec4<u32>(0x0a020800u, 0x060e040cu, 0x09010b03u, 0x050d070fu);
+#endif
+
+#ifdef FRAG
 @fragment
 fn fragment(in: Out) {
+#ifdef DITHER
+    if in.dither != 0 {
+        if in.dither <= -16 || in.dither >= 16 {
+            discard;
+        }
+        let c = vec2<u32>(floor(in.position.xy)) % 4u;
+        let t = i32((SW_DITHER_MAP[c.y] >> (c.x * 8u)) & 0xffu);
+        if (in.dither >= 0 && in.dither + t >= 16) || (in.dither < 0 && 1 + in.dither + t <= 0) {
+            discard;
+        }
+    }
+#endif
+#ifdef MASK
     let ix = scenery_indices[in.slot];
     let p = scenery_params[ix.material];
     let a = textureSampleLevel(bindless_textures_2d[ix.a_texture], bindless_samplers_filtering[ix.a_sampler], in.uv, 0.0).a;
     if a < p.p[2].w {
         discard;
     }
+#endif
 }
 #endif
 "#;

@@ -36,7 +36,17 @@ pub struct CrowdSkin {
     pub figs: Handle<ShaderBuffer>,
 }
 
+/// P15-A (docs/PERF_P15_A.md): masked figures stay out of Bevy's depth prepass (it exists only for contact shadows; an
+/// alpha-tested prepass draw costs about as much as the main draw). `FH1_ECS_MASK_PREPASS=1` = old (in the prepass).
+fn mask_prepass() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_ECS_MASK_PREPASS").is_ok_and(|v| v == "1"))
+}
+
 impl MaterialExtension for CrowdSkin {
+    fn enable_prepass() -> bool {
+        mask_prepass()
+    }
     fn vertex_shader() -> ShaderRef {
         "embedded://fh1_engine/crowd_skin.wgsl".into()
     }

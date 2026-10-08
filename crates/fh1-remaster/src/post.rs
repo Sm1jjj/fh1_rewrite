@@ -12,6 +12,13 @@
 //! Env: FH1_RM_LUT=strength (default 1; 0 = pass off, Bevy tonemapper only), FH1_RM_VIGNETTE=amount (default 0.22),
 //! FH1_RM_FILMIC_EV=ev (the curve's exposure offset, default -2.2), FH1_RM_FRAME_EV=ev (whole-frame offset incl. game-shader
 //! output, default +0.4), FH1_RM_DUSK_EV / FH1_RM_NIGHT_EV (extra after sunset -1.4 / at night -1.0).
+//!
+//! Camera motion blur (post/motion_blur.rs, [`MotionBlurSettings`]): on the HDR frame before bloom, independent of this
+//! grade (registered even with FH1_RM_LUT=0).
+
+mod motion_blur;
+
+pub use motion_blur::{forced_level as motion_blur_forced_level, MotionBlurSettings};
 
 use bevy::core_pipeline::schedule::Core3d;
 use bevy::core_pipeline::tonemapping::tonemapping;
@@ -22,8 +29,8 @@ use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::binding_types::{sampler, texture_2d, texture_3d, uniform_buffer_sized};
 use bevy::render::render_resource::{
     BindGroupEntry, BindGroupLayoutDescriptor, BindingResource, Buffer, BufferDescriptor, BufferUsages, CachedRenderPipelineId, ColorTargetState,
-    ColorWrites, FragmentState, Operations, PipelineCache, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler,
-    SamplerBindingType, SamplerDescriptor, ShaderStages, TextureFormat, TextureSampleType, VertexState,
+    ColorWrites, FragmentState, LoadOp, Operations, PipelineCache, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler,
+    SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp, TextureFormat, TextureSampleType, VertexState,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::texture::GpuImage;
@@ -119,6 +126,7 @@ struct GradeCache {
 }
 
 pub(crate) fn plugin(app: &mut App) {
+    motion_blur::plugin(app);
     let strength = env_f32("FH1_RM_LUT", 1.0);
     if strength <= 0.0 {
         return;
@@ -301,7 +309,13 @@ fn grade_system(
     );
     let mut rp = ctx.command_encoder().begin_render_pass(&RenderPassDescriptor {
         label: Some("fh1_remaster_grade"),
-        color_attachments: &[Some(RenderPassColorAttachment { view: post.destination, depth_slice: None, resolve_target: None, ops: Operations::default() })],
+        // Every pixel is written (full-screen triangle, no blending): no clear (P15-C; Operations::default() cleared it).
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: post.destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations { load: LoadOp::DontCare(Default::default()), store: StoreOp::Store },
+        })],
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,

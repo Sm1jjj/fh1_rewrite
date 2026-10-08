@@ -4,6 +4,14 @@
 //! "halo" = beam). Only the free-roam groups (no event) are drawn. Shader: `glow.wgsl`.
 //! Moving sprites (the anim objects' light attachments) come in through [`DynamicGlows`], refilled by
 //! their owner every frame and drawn the same way. `FH1_GLOWS=0` turns them all off.
+//!
+//! Merged draws (default; `FH1_GLOW_MERGE=0` = one draw per (beam, texture, strip, UVScale) batch, 14 static in
+//! Colorado + one per dynamic key): every static glow goes into ONE mesh and every dynamic glow into ONE more, each
+//! with one material holding up to [`MERGE_TEX`] sprite textures and [`MERGE_STRIPS`] animation strips. A per-vertex
+//! [`ATTRIBUTE_GLOW_SEL`] picks the texture / strip / UVScale / beam that were uniforms before (`GLOW_MERGED` in
+//! glow.wgsl). Blending is additive (SRCALPHA / ONE, no depth write), so draw order inside a mesh does not matter.
+//! Static and dynamic stay apart so the per-frame dynamic re-upload never carries the ~4k static glows; more
+//! textures than the slots spill into another merged draw.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -11,7 +19,7 @@ use std::path::{Path, PathBuf};
 use bevy::asset::{embedded_asset, RenderAssetUsages};
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
-use bevy::mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology};
+use bevy::mesh::{Indices, MeshVertexAttribute, MeshVertexBufferLayoutRef, PrimitiveTopology, VertexFormat};
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError};
@@ -28,12 +36,31 @@ impl Plugin for FxGlowPlugin {
             .add_systems(Startup, setup_glows)
             // In-process map change: the new track's glows replace the old ones.
             .add_systems(Update, setup_glows.run_if(on_message::<crate::postfx::FxTrackChanged>).after(crate::postfx::reload_post))
-            .add_systems(PostUpdate, (draw_dynamic_glows, update_glows).chain().after(crate::lighting::update_time_of_day));
+            .add_systems(
+                PostUpdate,
+                (draw_dynamic_glows.run_if(|| !glow_merge()), draw_dynamic_glows_merged.run_if(glow_merge), update_glows)
+                    .chain()
+                    .after(crate::lighting::update_time_of_day),
+            );
     }
 }
 
+/// `FH1_GLOW_MERGE=0`: one draw per glow batch (the pre-2026-10-08 path). Default: merged draws (module docs).
+fn glow_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FH1_GLOW_MERGE").is_ok_and(|v| v == "0"))
+}
+
+/// Merged glows: x = sprite texture slot, y = animation strip slot + 1 (0 = none), z = UVScale index 0..3,
+/// w = 1 for beams. Its presence in the mesh layout selects `GLOW_MERGED` in glow.wgsl.
+pub const ATTRIBUTE_GLOW_SEL: MeshVertexAttribute = MeshVertexAttribute::new("Fh1_GlowSel", 0x4648_0E10, VertexFormat::Uint32x4);
+/// Sprite texture slots per merged draw (`texture`, `tex1`..`tex15`).
+pub const MERGE_TEX: usize = 16;
+/// Animation strip slots per merged draw (`anim`, `anim1`..`anim7`).
+pub const MERGE_STRIPS: usize = 8;
+
 /// `glow.wgsl` `GlowParams`.
-#[derive(Clone, Copy, ShaderType, Debug, PartialEq)]
+#[derive(Clone, Copy, ShaderType, Debug, PartialEq, Default)]
 pub struct GlowParams {
     /// x = SwitchOnLights (c157.z), y = 1 for beams, z = 1 to write raw (FH1 post chain on).
     pub p: Vec4,
@@ -41,7 +68,10 @@ pub struct GlowParams {
     pub uv_scale: Vec4,
 }
 
-#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+/// One glow batch (`FH1_GLOW_MERGE=0`) or one merged draw. Merged draws also fill `tex1..tex15` / `anim1..anim7`
+/// (slot 0 = `texture` / `anim`; their samplers serve every slot: all sprite textures share one descriptor, all strips
+/// another, see `GlowTextures::get`). Unused slots bind the fallback image.
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug, Default)]
 pub struct GlowMaterial {
     #[texture(0)]
     #[sampler(1)]
@@ -52,6 +82,88 @@ pub struct GlowMaterial {
     #[texture(3)]
     #[sampler(4)]
     pub anim: Option<Handle<Image>>,
+    #[texture(5, visibility(fragment))]
+    pub tex1: Option<Handle<Image>>,
+    #[texture(6, visibility(fragment))]
+    pub tex2: Option<Handle<Image>>,
+    #[texture(7, visibility(fragment))]
+    pub tex3: Option<Handle<Image>>,
+    #[texture(8, visibility(fragment))]
+    pub tex4: Option<Handle<Image>>,
+    #[texture(9, visibility(fragment))]
+    pub tex5: Option<Handle<Image>>,
+    #[texture(10, visibility(fragment))]
+    pub tex6: Option<Handle<Image>>,
+    #[texture(11, visibility(fragment))]
+    pub tex7: Option<Handle<Image>>,
+    #[texture(12, visibility(fragment))]
+    pub tex8: Option<Handle<Image>>,
+    #[texture(13, visibility(fragment))]
+    pub tex9: Option<Handle<Image>>,
+    #[texture(14, visibility(fragment))]
+    pub tex10: Option<Handle<Image>>,
+    #[texture(15, visibility(fragment))]
+    pub tex11: Option<Handle<Image>>,
+    #[texture(16, visibility(fragment))]
+    pub tex12: Option<Handle<Image>>,
+    #[texture(17, visibility(fragment))]
+    pub tex13: Option<Handle<Image>>,
+    #[texture(18, visibility(fragment))]
+    pub tex14: Option<Handle<Image>>,
+    #[texture(19, visibility(fragment))]
+    pub tex15: Option<Handle<Image>>,
+    #[texture(20, visibility(fragment))]
+    pub anim1: Option<Handle<Image>>,
+    #[texture(21, visibility(fragment))]
+    pub anim2: Option<Handle<Image>>,
+    #[texture(22, visibility(fragment))]
+    pub anim3: Option<Handle<Image>>,
+    #[texture(23, visibility(fragment))]
+    pub anim4: Option<Handle<Image>>,
+    #[texture(24, visibility(fragment))]
+    pub anim5: Option<Handle<Image>>,
+    #[texture(25, visibility(fragment))]
+    pub anim6: Option<Handle<Image>>,
+    #[texture(26, visibility(fragment))]
+    pub anim7: Option<Handle<Image>>,
+}
+
+impl GlowMaterial {
+    /// Sets sprite texture slot `i` (`strip` false) or animation strip slot `i` of a merged draw.
+    fn set_slot(&mut self, strip: bool, i: usize, h: Handle<Image>) {
+        if !strip && i == 0 {
+            self.texture = h;
+            return;
+        }
+        let h = Some(h);
+        let slot = match (strip, i) {
+            (true, 0) => &mut self.anim,
+            (true, 1) => &mut self.anim1,
+            (true, 2) => &mut self.anim2,
+            (true, 3) => &mut self.anim3,
+            (true, 4) => &mut self.anim4,
+            (true, 5) => &mut self.anim5,
+            (true, 6) => &mut self.anim6,
+            (true, 7) => &mut self.anim7,
+            (false, 1) => &mut self.tex1,
+            (false, 2) => &mut self.tex2,
+            (false, 3) => &mut self.tex3,
+            (false, 4) => &mut self.tex4,
+            (false, 5) => &mut self.tex5,
+            (false, 6) => &mut self.tex6,
+            (false, 7) => &mut self.tex7,
+            (false, 8) => &mut self.tex8,
+            (false, 9) => &mut self.tex9,
+            (false, 10) => &mut self.tex10,
+            (false, 11) => &mut self.tex11,
+            (false, 12) => &mut self.tex12,
+            (false, 13) => &mut self.tex13,
+            (false, 14) => &mut self.tex14,
+            (false, 15) => &mut self.tex15,
+            _ => return,
+        };
+        *slot = h;
+    }
 }
 
 impl Material for GlowMaterial {
@@ -71,14 +183,23 @@ impl Material for GlowMaterial {
         false
     }
     fn specialize(_: &MaterialPipeline, d: &mut RenderPipelineDescriptor, layout: &MeshVertexBufferLayoutRef, _: MaterialPipelineKey<Self>) -> Result<(), SpecializedMeshPipelineError> {
-        d.vertex.buffers = vec![layout.0.get_layout(&[
+        let mut attributes = vec![
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
             Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
             Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
             Mesh::ATTRIBUTE_UV_1.at_shader_location(3),
             Mesh::ATTRIBUTE_TANGENT.at_shader_location(4),
             Mesh::ATTRIBUTE_COLOR.at_shader_location(5),
-        ])?];
+        ];
+        // Merged draws: per-vertex texture / strip / UVScale / beam selection (the mesh layout keys the pipeline).
+        if layout.0.contains(ATTRIBUTE_GLOW_SEL) {
+            attributes.push(ATTRIBUTE_GLOW_SEL.at_shader_location(6));
+            d.vertex.shader_defs.push("GLOW_MERGED".into());
+            if let Some(f) = d.fragment.as_mut() {
+                f.shader_defs.push("GLOW_MERGED".into());
+            }
+        }
+        d.vertex.buffers = vec![layout.0.get_layout(&attributes)?];
         d.primitive.cull_mode = None;
         // SRCALPHA / ONE, no depth write (VERIFIED, begin pass 0x82E0A510).
         if let Some(f) = d.fragment.as_mut() {
@@ -109,10 +230,50 @@ struct Batch {
     b: Vec<[f32; 2]>,
     c: Vec<[f32; 4]>,
     colour: Vec<[f32; 4]>,
+    /// Merged draws only ([`ATTRIBUTE_GLOW_SEL`]); empty = a per-batch mesh without the attribute.
+    sel: Vec<[u32; 4]>,
     idx: Vec<u32>,
 }
 
 impl Batch {
+    /// Merged draws: appends `o`'s quads, every vertex tagged `sel`.
+    fn append(&mut self, o: &Batch, sel: [u32; 4]) {
+        let base = self.pos.len() as u32;
+        self.pos.extend_from_slice(&o.pos);
+        self.dir.extend_from_slice(&o.dir);
+        self.a.extend_from_slice(&o.a);
+        self.b.extend_from_slice(&o.b);
+        self.c.extend_from_slice(&o.c);
+        self.colour.extend_from_slice(&o.colour);
+        self.sel.resize(self.pos.len(), sel);
+        self.idx.extend(o.idx.iter().map(|i| i + base));
+    }
+
+    /// Merged draws: tags the vertices added since the last tag with `sel`.
+    fn tag(&mut self, sel: [u32; 4]) {
+        self.sel.resize(self.pos.len(), sel);
+    }
+
+    /// Pads to `quads` quads of zeros (degenerate triangles on vertex 0), keeping the mesh's buffer sizes stable so
+    /// the render world's mesh allocator reuses the slab range (particles.rs `pad_quad_mesh`).
+    fn pad(&mut self, quads: usize) {
+        let v = quads * 4;
+        if self.pos.len() < v {
+            self.pos.resize(v, [0.0; 3]);
+            self.dir.resize(v, [0.0; 3]);
+            self.a.resize(v, [0.0; 2]);
+            self.b.resize(v, [0.0; 2]);
+            self.c.resize(v, [0.0; 4]);
+            self.colour.resize(v, [0.0; 4]);
+            if !self.sel.is_empty() {
+                self.sel.resize(v, [0; 4]);
+            }
+        }
+        if self.idx.len() < quads * 6 {
+            self.idx.resize(quads * 6, 0);
+        }
+    }
+
     fn quad(&mut self, v: [([f32; 2], [f32; 2]); 4], pos: [f32; 3], dir: [f32; 3], c: [f32; 4], colour: [f32; 4]) {
         let base = self.pos.len() as u32;
         for (a, b) in v {
@@ -134,6 +295,9 @@ impl Batch {
         m.insert_attribute(Mesh::ATTRIBUTE_UV_1, self.b);
         m.insert_attribute(Mesh::ATTRIBUTE_TANGENT, self.c);
         m.insert_attribute(Mesh::ATTRIBUTE_COLOR, self.colour);
+        if !self.sel.is_empty() {
+            m.insert_attribute(ATTRIBUTE_GLOW_SEL, self.sel);
+        }
         m.insert_indices(Indices::U32(self.idx));
         m
     }
@@ -252,6 +416,84 @@ impl GlowTextures {
     }
 }
 
+/// The textures of one merged draw, by slot.
+#[derive(Default)]
+struct MergedSlots {
+    tex: Vec<(PathBuf, Handle<Image>)>,
+    strips: Vec<(PathBuf, Handle<Image>)>,
+}
+
+impl MergedSlots {
+    /// `[texture slot, strip slot + 1 (0 = none)]` for this draw, adding the textures if there is room (`.1` = added);
+    /// None when the draw is full.
+    fn slot(&mut self, tex: (&Path, &Handle<Image>), strip: Option<(&Path, &Handle<Image>)>) -> Option<([u32; 2], bool)> {
+        let ti = self.tex.iter().position(|(p, _)| p == tex.0);
+        let si = strip.map(|s| self.strips.iter().position(|(p, _)| p == s.0));
+        if (ti.is_none() && self.tex.len() >= MERGE_TEX) || (si == Some(None) && self.strips.len() >= MERGE_STRIPS) {
+            return None;
+        }
+        let mut added = false;
+        let ti = match ti {
+            Some(i) => i,
+            None => {
+                self.tex.push((tex.0.to_path_buf(), tex.1.clone()));
+                added = true;
+                self.tex.len() - 1
+            }
+        };
+        let si = match (strip, si) {
+            (_, Some(Some(i))) => i + 1,
+            (Some(s), Some(None)) => {
+                self.strips.push((s.0.to_path_buf(), s.1.clone()));
+                added = true;
+                self.strips.len()
+            }
+            _ => 0,
+        };
+        Some(([ti as u32, si as u32], added))
+    }
+
+    /// Writes the slots into `m` (uv_scale.z = 1 when any strip, so update_glows keeps advancing T).
+    fn fill(&self, m: &mut GlowMaterial) {
+        for (i, (_, h)) in self.tex.iter().enumerate() {
+            m.set_slot(false, i, h.clone());
+        }
+        for (i, (_, h)) in self.strips.iter().enumerate() {
+            m.set_slot(true, i, h.clone());
+        }
+        m.params.uv_scale.z = !self.strips.is_empty() as u32 as f32;
+    }
+
+    fn material(&self, params: GlowParams) -> GlowMaterial {
+        let mut m = GlowMaterial { params, ..default() };
+        self.fill(&mut m);
+        m
+    }
+}
+
+/// The merged draw for `(tex, strip)`: the first in `draws` with the textures or room for them, else a new one.
+/// Returns (draw index, `[texture slot, strip slot + 1]`, textures added to that draw).
+fn place(draws: &mut Vec<MergedSlots>, tex: (&Path, &Handle<Image>), strip: Option<(&Path, &Handle<Image>)>) -> (usize, [u32; 2], bool) {
+    for (i, d) in draws.iter_mut().enumerate() {
+        if let Some((s, added)) = d.slot(tex, strip) {
+            return (i, s, added);
+        }
+    }
+    let mut d = MergedSlots::default();
+    let (s, _) = d.slot(tex, strip).expect("an empty merged draw has room");
+    draws.push(d);
+    (draws.len() - 1, s, true)
+}
+
+/// Quad capacity of a re-uploaded merged mesh (particles.rs, `FH1_FX_MESH_CAP=0` = exact size).
+fn merged_capacity(n: usize, cur: usize) -> usize {
+    if crate::particles::fx_mesh_cap_on() {
+        crate::particles::quad_capacity(n, cur)
+    } else {
+        n
+    }
+}
+
 fn setup_glows(
     mut commands: Commands,
     config: Option<Res<crate::postfx::FxPostConfig>>,
@@ -278,6 +520,40 @@ fn setup_glows(
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&text) else { return };
     let raw = lib.is_some_and(|l| l.raw_output);
     let (mut n, mut animated, mut draws) = (0, 0, 0);
+    if glow_merge() {
+        // Every batch into one mesh (more textures than the slots: another), selected per vertex.
+        let (mut slots, mut merged): (Vec<MergedSlots>, Vec<Batch>) = (Vec::new(), Vec::new());
+        for ((beam, tex, anim, flags), batch) in build_batches(&json) {
+            let Some(texture) = textures.get(&mut images, Path::new(&tex), false) else { continue };
+            let anim_h = anim.as_ref().and_then(|a| textures.get(&mut images, Path::new(a), true));
+            let count = batch.pos.len() / if beam { 8 } else { 4 };
+            n += count;
+            animated += if anim_h.is_some() { count } else { 0 };
+            let strip = anim.as_deref().map(Path::new).zip(anim_h.as_ref());
+            let (i, s, _) = place(&mut slots, (Path::new(&tex), &texture), strip);
+            merged.resize_with(slots.len(), Batch::default);
+            merged[i].append(&batch, [s[0], s[1], flags.min(3), beam as u32]);
+        }
+        let params = GlowParams { p: Vec4::new(-1.0, 0.0, raw as u32 as f32, crate::output_gain()), uv_scale: Vec4::new(1.0, 1.0, 0.0, 0.0) };
+        for (s, batch) in slots.iter().zip(merged) {
+            if batch.pos.is_empty() {
+                continue;
+            }
+            draws += 1;
+            commands.spawn((
+                Glow,
+                Mesh3d(meshes.add(batch.mesh())),
+                MeshMaterial3d(materials.add(s.material(params))),
+                Transform::default(),
+                // One mesh spread over the whole map: its Aabb would never cull, and the vertex work is ~20k verts.
+                NoFrustumCulling,
+                bevy::light::NotShadowCaster,
+                Name::new("FH1 light glows (merged)"),
+            ));
+        }
+        info!("fh1-render glows: {n} free-roam glows ({animated} animated) in {draws} merged draws");
+        return;
+    }
     for ((beam, tex, anim, flags), batch) in build_batches(&json) {
         let Some(texture) = textures.get(&mut images, Path::new(&tex), false) else { continue };
         let anim = anim.and_then(|a| textures.get(&mut images, Path::new(&a), true));
@@ -293,7 +569,7 @@ fn setup_glows(
         commands.spawn((
             Glow,
             Mesh3d(meshes.add(batch.mesh())),
-            MeshMaterial3d(materials.add(GlowMaterial { texture, params, anim })),
+            MeshMaterial3d(materials.add(GlowMaterial { texture, params, anim, ..default() })),
             Transform::default(),
             NoFrustumCulling,
             bevy::light::NotShadowCaster,
@@ -377,7 +653,7 @@ fn draw_dynamic_glows(
             .spawn((
                 Glow,
                 Mesh3d(mesh.clone()),
-                MeshMaterial3d(materials.add(GlowMaterial { texture, params, anim })),
+                MeshMaterial3d(materials.add(GlowMaterial { texture, params, anim, ..default() })),
                 Transform::default(),
                 Visibility::Inherited,
                 NoFrustumCulling,
@@ -386,6 +662,118 @@ fn draw_dynamic_glows(
             ))
             .id();
         draws.insert(key, (e, mesh));
+    }
+}
+
+/// One merged dynamic draw: its entity, mesh, material and padded quad capacity.
+struct MergedDraw {
+    entity: Entity,
+    mesh: Handle<Mesh>,
+    material: Handle<GlowMaterial>,
+    cap: usize,
+}
+
+/// [`draw_dynamic_glows_merged`] state: texture slots and draws (parallel; a draw spawns with its first glows).
+#[derive(Default)]
+struct DynamicMerged {
+    slots: Vec<MergedSlots>,
+    draws: Vec<Option<MergedDraw>>,
+}
+
+/// Draws [`DynamicGlows`] as merged draws (normally one): rebuilt every frame, re-uploaded only when the padded mesh
+/// changed (FH1_GLOW_GUARD), at a stable power-of-two quad capacity. Empty draws are hidden, not despawned; a
+/// texture new to a draw rewrites its material once.
+#[allow(clippy::too_many_arguments)]
+fn draw_dynamic_glows_merged(
+    mut commands: Commands,
+    glows: Res<DynamicGlows>,
+    globals: Res<crate::FxGlobals>,
+    lib: Option<Res<crate::FxLibrary>>,
+    mut textures: ResMut<GlowTextures>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<GlowMaterial>>,
+    mut vis: Query<&mut Visibility, With<Glow>>,
+    mut st: Local<DynamicMerged>,
+) {
+    if textures.root.is_none() || (st.slots.is_empty() && glows.0.is_empty()) {
+        return;
+    }
+    let st = &mut *st;
+    // A map change despawns every Glow (setup_glows): drop draws whose entity is gone, they respawn below.
+    for d in st.draws.iter_mut() {
+        if d.as_ref().is_some_and(|d| vis.get(d.entity).is_err()) {
+            *d = None;
+        }
+    }
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut dirty: Vec<bool> = Vec::new();
+    for g in &glows.0 {
+        let Some(texture) = textures.get(&mut images, &g.texture, false) else { continue };
+        let strip_h = g.anim_texture.as_ref().and_then(|a| textures.get(&mut images, a, true));
+        let strip = g.anim_texture.as_deref().zip(strip_h.as_ref());
+        let (i, s, added) = place(&mut st.slots, (g.texture.as_path(), &texture), strip);
+        if batches.len() <= i {
+            batches.resize_with(i + 1, Batch::default);
+            dirty.resize(i + 1, false);
+        }
+        dirty[i] |= added;
+        let b = &mut batches[i];
+        let rgb = g.colour.map(|c| c as f32 / 255.0);
+        sprite_quad(b, g.position.to_array(), g.direction.to_array(), g.angles, g.pull, g.half_size, g.threshold, g.phase, g.rate, rgb, g.anim_texture.is_some());
+        b.tag([s[0], s[1], g.uv_scale.min(3), 0]);
+    }
+    batches.resize_with(st.slots.len(), Batch::default);
+    dirty.resize(st.slots.len(), false);
+    st.draws.resize_with(st.slots.len(), || None);
+    for (i, mut batch) in batches.into_iter().enumerate() {
+        let n = batch.idx.len() / 6;
+        if let Some(d) = &mut st.draws[i] {
+            let Ok(mut v) = vis.get_mut(d.entity) else { continue };
+            if n == 0 {
+                v.set_if_neq(Visibility::Hidden);
+                continue;
+            }
+            v.set_if_neq(Visibility::Inherited);
+            if dirty[i] {
+                if let Some(mut m) = materials.get_mut(&d.material) {
+                    st.slots[i].fill(&mut *m);
+                }
+            }
+            d.cap = merged_capacity(n, d.cap);
+            batch.pad(d.cap);
+            let new = batch.mesh();
+            if !glow_guard() || !meshes.get(d.mesh.id()).is_some_and(|old| same_mesh(old, &new)) {
+                let _ = meshes.insert(d.mesh.id(), new);
+            }
+            continue;
+        }
+        if n == 0 {
+            continue;
+        }
+        let raw = lib.as_ref().is_some_and(|l| l.raw_output);
+        // update_glows only rewrites static materials on a switch change: start from the current value.
+        let params = GlowParams {
+            p: Vec4::new(globals.get("EmissiveSwitchOnThreshold").map_or(-1.0, |v| v.x), 0.0, raw as u32 as f32, crate::output_gain()),
+            uv_scale: Vec4::new(1.0, 1.0, 0.0, globals.get("TimeGain").map_or(0.0, |v| v.x)),
+        };
+        let cap = merged_capacity(n, 0);
+        batch.pad(cap);
+        let mesh = meshes.add(batch.mesh());
+        let material = materials.add(st.slots[i].material(params));
+        let entity = commands
+            .spawn((
+                Glow,
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                Transform::default(),
+                Visibility::Inherited,
+                NoFrustumCulling,
+                bevy::light::NotShadowCaster,
+                Name::new("FH1 dynamic glows (merged)"),
+            ))
+            .id();
+        st.draws[i] = Some(MergedDraw { entity, mesh, material, cap });
     }
 }
 
@@ -453,5 +841,28 @@ mod tests {
         let a = &b[&(false, "t.dds".to_string(), Some("s.dds".to_string()), 0)];
         assert_eq!((a.colour[0][0], a.c[0][2], a.c[0][3]), (1.0, 358.0 / 1023.0, 512.0 / 1023.0));
         assert_eq!(b[&(true, "t.dds".to_string(), None, 0)].pos.len(), 8);
+    }
+
+    #[test]
+    fn merged_slots() {
+        let h = Handle::<Image>::default();
+        let mut d = Vec::new();
+        let p = |i: usize| PathBuf::from(format!("t{i}.dds"));
+        assert_eq!(place(&mut d, (p(0).as_path(), &h), None), (0, [0, 0], true));
+        assert_eq!(place(&mut d, (p(0).as_path(), &h), Some((p(100).as_path(), &h))), (0, [0, 1], true));
+        assert_eq!(place(&mut d, (p(0).as_path(), &h), Some((p(100).as_path(), &h))), (0, [0, 1], false));
+        for i in 1..MERGE_TEX {
+            assert_eq!(place(&mut d, (p(i).as_path(), &h), None), (0, [i as u32, 0], true));
+        }
+        // Full: the next texture spills into a second draw.
+        assert_eq!(place(&mut d, (p(99).as_path(), &h), None), (1, [0, 0], true));
+        let mut a = Batch::default();
+        sprite_quad(&mut a, [0.0; 3], [0.0, 1.0, 0.0], [1.0, 2.0], 0.0, 1.0, 0.0, 0.0, 0.0, [1.0; 3], false);
+        let mut m = Batch::default();
+        m.append(&a, [1, 0, 0, 0]);
+        m.append(&a, [2, 0, 3, 0]);
+        assert_eq!((m.pos.len(), m.sel.len(), m.idx[6], m.sel[4]), (8, 8, 4, [2, 0, 3, 0]));
+        m.pad(64);
+        assert_eq!((m.pos.len(), m.sel.len(), m.idx.len()), (256, 256, 384));
     }
 }

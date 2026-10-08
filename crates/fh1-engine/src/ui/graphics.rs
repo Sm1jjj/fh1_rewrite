@@ -1,11 +1,17 @@
 //! Options > Graphics (P8-A, 2026-10-08; docs/PERF.md "P8"): quality preset, anti-aliasing, render scale + CAS.
 //!
-//! - **Anti-aliasing** Off / FXAA / SMAA / MSAA 4x (default since 2026-10-08 pm, user). Before this the main camera had no `Msaa` component, so
+//! - **Anti-aliasing** Off / FXAA / SMAA / SMAA + MSAA 2x (default since 2026-10-08 night, P15-C) / MSAA 2x / MSAA 4x (default
+//!   2026-10-08 pm .. night). SMAA + MSAA 2x = the talk's "SMAA S2x"-style choice (docs/PERF_P15_C.md): 2x samples keep thin
+//!   edges stable at half the 4x target cost, SMAA (after the resolve; Bevy runs it on the resolved post-process texture)
+//!   cleans what is left. Settings files saved before (`aa_rev` < 1) with MSAA 4x are moved to the new default once.
+//!   Before 2026-10-08 pm the main camera had no `Msaa` component, so
 //!   Bevy's default 4x MSAA rendered every main pass into 4x HDR targets plus a resolve. FXAA / SMAA go on the main
 //!   camera (after tonemapping and the remaster grade). Every window camera (HUD, world map, render-scale blit) gets the
 //!   same `Msaa`: Bevy keys the shared window texture on it, and a mismatch gives the HUD its own never-cleared texture
 //!   that ghosts (memory bevy-camera-texture-sharing). `FH1_AA=old` = the old behaviour (MSAA 4x, no post AA, nothing
 //!   touched); `FH1_AA=off|fxaa|smaa|msaa` overrides the setting. Under RTX nothing changes (rtx.rs owns AA: DLSS/TAA).
+//! - **Motion blur** Off / Low / Medium (default) / High: fh1-remaster post/motion_blur.rs (P15-C), camera blur on the
+//!   HDR frame before bloom, car masked. `FH1_RM_MOTION_BLUR=0..3` forces a level; off under RTX.
 //! - **Render scale** 50-100 % (default 100 % = the old path, nothing changes). Below 100 % the main camera renders into
 //!   an offscreen image of scale x window, and a Camera2d (order 1, layer [`BLIT_LAYER`]) draws it over the window with
 //!   linear filtering and Bevy's contrast-adaptive sharpening (`FH1_CAS=0` off, `FH1_CAS_STRENGTH`, default 0.5). The
@@ -80,25 +86,75 @@ pub enum AntiAlias {
     Off,
     Fxaa,
     Smaa,
-    /// Default since 2026-10-08 pm (user).
+    /// SMAA on a 2x MSAA target. Default since 2026-10-08 night (P15-C).
     #[default]
+    Smaa2x,
+    Msaa2,
+    /// Default 2026-10-08 pm .. night.
     Msaa4,
 }
 
 impl AntiAlias {
-    const ALL: [AntiAlias; 4] = [AntiAlias::Off, AntiAlias::Fxaa, AntiAlias::Smaa, AntiAlias::Msaa4];
+    const ALL: [AntiAlias; 6] = [AntiAlias::Off, AntiAlias::Fxaa, AntiAlias::Smaa, AntiAlias::Smaa2x, AntiAlias::Msaa2, AntiAlias::Msaa4];
 
     pub fn name(self) -> &'static str {
         match self {
             AntiAlias::Off => "Off",
             AntiAlias::Fxaa => "FXAA",
             AntiAlias::Smaa => "SMAA",
+            AntiAlias::Smaa2x => "SMAA + MSAA 2x",
+            AntiAlias::Msaa2 => "MSAA 2x",
             AntiAlias::Msaa4 => "MSAA 4x",
+        }
+    }
+
+    fn msaa(self) -> Msaa {
+        match self {
+            AntiAlias::Smaa2x | AntiAlias::Msaa2 => Msaa::Sample2,
+            AntiAlias::Msaa4 => Msaa::Sample4,
+            _ => Msaa::Off,
+        }
+    }
+
+    fn smaa(self) -> bool {
+        matches!(self, AntiAlias::Smaa | AntiAlias::Smaa2x)
+    }
+
+    pub fn next(self, back: bool) -> Self {
+        cycle(&Self::ALL, self, back)
+    }
+}
+
+/// Options > Graphics > Motion blur (P15-C, fh1-remaster post.rs): camera blur beyond a few metres, the car masked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MotionBlur {
+    Off,
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl MotionBlur {
+    const ALL: [MotionBlur; 4] = [MotionBlur::Off, MotionBlur::Low, MotionBlur::Medium, MotionBlur::High];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MotionBlur::Off => "Off",
+            MotionBlur::Low => "Low",
+            MotionBlur::Medium => "Medium",
+            MotionBlur::High => "High",
         }
     }
 
     pub fn next(self, back: bool) -> Self {
         cycle(&Self::ALL, self, back)
+    }
+
+    /// 0 = off .. 3 = high.
+    pub fn level(self) -> u8 {
+        self as u8
     }
 }
 
@@ -114,13 +170,21 @@ fn cycle<T: Copy + PartialEq>(all: &[T], cur: T, back: bool) -> T {
 pub struct GraphicsSettings {
     pub quality: Quality,
     pub aa: AntiAlias,
+    pub motion_blur: MotionBlur,
     /// Main-camera resolution as a fraction of the window, 0.5..=1.
     pub render_scale: f32,
+    /// Settings-file revision of `aa`: 0 = saved before SMAA + MSAA 2x became the default (MSAA 4x is moved to it once,
+    /// [`migrate_aa`]). Absent in older files, so the field default is 0, not [`AA_REV`].
+    #[serde(default)]
+    pub aa_rev: u32,
 }
+
+/// Current [`GraphicsSettings::aa_rev`].
+const AA_REV: u32 = 1;
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
-        Self { quality: Quality::High, aa: AntiAlias::Msaa4, render_scale: 1.0 }
+        Self { quality: Quality::High, aa: AntiAlias::Smaa2x, motion_blur: MotionBlur::Medium, render_scale: 1.0, aa_rev: AA_REV }
     }
 }
 
@@ -139,6 +203,8 @@ fn aa_choice(g: &GraphicsSettings) -> Option<AntiAlias> {
         "off" | "0" => Some(AntiAlias::Off),
         "fxaa" => Some(AntiAlias::Fxaa),
         "smaa" => Some(AntiAlias::Smaa),
+        "smaa2x" | "smaa_msaa2" => Some(AntiAlias::Smaa2x),
+        "msaa2" => Some(AntiAlias::Msaa2),
         "msaa" | "msaa4" => Some(AntiAlias::Msaa4),
         _ => Some(g.aa),
     }
@@ -160,6 +226,17 @@ pub fn aa_value(g: &GraphicsSettings) -> String {
         Some(a) => format!("{} ({} by FH1_AA)", g.aa.name(), a.name()),
         None if rtx() => format!("{} (RTX: DLSS)", g.aa.name()),
         None => format!("{} (FH1_AA=old)", g.aa.name()),
+    }
+}
+
+/// Options value: the setting, plus what runs under RTX (no blur there).
+pub fn blur_value(g: &GraphicsSettings) -> String {
+    if rtx() {
+        return format!("{} (RTX: off)", g.motion_blur.name());
+    }
+    match fh1_remaster::post::motion_blur_forced_level() {
+        Some(l) => format!("{} (FH1_RM_MOTION_BLUR={l})", g.motion_blur.name()),
+        None => g.motion_blur.name().into(),
     }
 }
 
@@ -189,7 +266,7 @@ impl Plugin for GraphicsPlugin {
             .init_resource::<Scaled>()
             // Render scale before AA: the blit camera it spawns must get the same Msaa as the other window cameras in
             // its first frame (Bevy's default 4x on one camera of a shared target is a wgpu validation error).
-            .add_systems(Update, (sync_quality, sync_render_scale, sync_aa).chain());
+            .add_systems(Update, (migrate_aa, sync_quality, sync_render_scale, sync_aa, sync_motion_blur).chain());
         if std::env::var("FH1_TRANSP_CENSUS").map_or(true, |v| v != "0") {
             app.add_systems(Last, transp_census);
         }
@@ -207,13 +284,38 @@ fn sync_quality(settings: Res<Settings>, mut quality: ResMut<GraphicsQuality>) {
     }
 }
 
+/// Settings files from before `aa_rev` 1 kept MSAA 4x (the old default) saved: move them to SMAA + MSAA 2x once (other
+/// picks stay). The new value is written to settings.json the next time the pause menu closes.
+fn migrate_aa(mut settings: ResMut<Settings>) {
+    if settings.graphics.aa_rev >= AA_REV {
+        return;
+    }
+    let g = &mut settings.graphics;
+    if g.aa == AntiAlias::Msaa4 {
+        g.aa = AntiAlias::Smaa2x;
+        info!("graphics: anti-aliasing MSAA 4x -> SMAA + MSAA 2x (new default; Options > Graphics to change back)");
+    }
+    g.aa_rev = AA_REV;
+}
+
+/// Options > Graphics > Motion blur -> the remaster blur pass (fh1-remaster post/motion_blur.rs; the resource is absent
+/// under Original shaders).
+fn sync_motion_blur(settings: Res<Settings>, blur: Option<ResMut<fh1_remaster::post::MotionBlurSettings>>) {
+    let Some(mut blur) = blur else { return };
+    let level = settings.graphics.motion_blur.level();
+    if blur.level != level {
+        blur.level = level;
+        info!("graphics: motion blur {}", settings.graphics.motion_blur.name());
+    }
+}
+
 /// Same Msaa on the main camera, every window camera and every camera drawing into the main camera's target (the HUD
 /// Camera2d draws into the main camera's offscreen image below 100 % render scale: differing sample counts on one
 /// target are a wgpu validation error); FXAA / SMAA on the main camera.
 #[allow(clippy::type_complexity)]
 fn sync_aa(mut commands: Commands, settings: Res<Settings>, mut cams: Query<(Entity, &RenderTarget, &mut Msaa, Has<FxPostCamera>, Has<BlitCamera>, Has<Fxaa>, Has<Smaa>)>) {
     let Some(aa) = aa_choice(&settings.graphics) else { return };
-    let msaa = if aa == AntiAlias::Msaa4 { Msaa::Sample4 } else { Msaa::Off };
+    let msaa = aa.msaa();
     // The main camera's offscreen image (render scale < 100 %), if any.
     let main_image = cams.iter().find(|c| c.3).and_then(|c| match c.1 {
         RenderTarget::Image(i) => Some(i.handle.id()),
@@ -236,7 +338,7 @@ fn sync_aa(mut commands: Commands, settings: Res<Settings>, mut cams: Query<(Ent
             }
             _ => {}
         }
-        match (aa == AntiAlias::Smaa, smaa) {
+        match (aa.smaa(), smaa) {
             (true, false) => {
                 commands.entity(e).insert(Smaa::default());
             }

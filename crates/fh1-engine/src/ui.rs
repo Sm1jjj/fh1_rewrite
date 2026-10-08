@@ -51,6 +51,10 @@ impl Plugin for UiPlugin {
             .ok()
             .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
             .unwrap_or_default();
+        // The flags section always lists every current flag with fresh text; the player's values are kept.
+        let mut settings = settings;
+        settings.flags = crate::flags::section(Some(&settings.flags));
+        settings.flags_help = crate::flags::HELP.into();
         let mut menu = Menu::default();
         // Maps the "Map" option can switch to (Colorado + converted imports, docs/RENDERING.md).
         let maps = MapChoices(app.world().get_resource::<Garage>().map(|g| Track::available(&g.assets)).unwrap_or_default());
@@ -151,6 +155,13 @@ pub struct Settings {
     pub renderer: Option<String>,
     /// Options > Graphics (ui/graphics.rs, P8): quality preset, anti-aliasing, render scale.
     pub graphics: graphics::GraphicsSettings,
+    /// How the `flags` section works (crate::flags::HELP; rewritten on every load).
+    #[serde(rename = "_flags_help", deserialize_with = "crate::flags::de_string")]
+    pub flags_help: String,
+    /// Every FH1_* flag, documented, with the player's `value`s (crate::flags; applied at startup in main). Kept last
+    /// so the normal options stay at the top of the file. Refreshed from the build-time table on load.
+    #[serde(deserialize_with = "crate::flags::de_map")]
+    pub flags: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -176,6 +187,8 @@ impl Default for Settings {
             original_shaders: false,
             renderer: None,
             graphics: graphics::GraphicsSettings::default(),
+            flags_help: crate::flags::HELP.into(),
+            flags: crate::flags::section(None),
         }
     }
 }
@@ -836,6 +849,7 @@ enum Opt {
     AiDifficulty,
     Quality,
     AntiAlias,
+    MotionBlur,
     RenderScale,
 }
 
@@ -945,6 +959,7 @@ fn items(menu: &Menu, settings: &Settings, garage: &Garage, track: &Track, maps:
                 vec![
                     opt("Quality", g.quality.name().into(), Opt::Quality),
                     opt("Anti-aliasing", graphics::aa_value(g), Opt::AntiAlias),
+                    opt("Motion blur", graphics::blur_value(g), Opt::MotionBlur),
                     opt("Render scale", graphics::scale_value(g), Opt::RenderScale),
                 ],
                 0,
@@ -1088,6 +1103,7 @@ fn adjust(settings: &mut Settings, o: Opt, dir: i32) {
         Opt::DrivingLine => settings.driving_line = settings.driving_line.next(dir < 0),
         Opt::Quality => settings.graphics.quality = settings.graphics.quality.next(dir < 0),
         Opt::AntiAlias => settings.graphics.aa = settings.graphics.aa.next(dir < 0),
+        Opt::MotionBlur => settings.graphics.motion_blur = settings.graphics.motion_blur.next(dir < 0),
         Opt::RenderScale => graphics::step_scale(&mut settings.graphics, dir),
         Opt::AiDifficulty => settings.ai_difficulty = settings.ai_difficulty.next(dir < 0),
         Opt::Stm => settings.stm = !settings.stm,

@@ -438,6 +438,9 @@ fn wgsl() -> String {
         .replace("RM_GROUND_SPEC", &format!("{ground_spec:.3}"))
         .replace("RM_VBLEND_NOISE", if std::env::var("FH1_RM_VBLEND_NOISE").is_ok_and(|v| v == "0") { "0.0" } else { "1.0" })
         .replace("RM_VBLEND_DECAL", if std::env::var("FH1_RM_VBLEND_DECAL").is_ok_and(|v| v == "0") { "0.0" } else { "1.0" })
+        // Ground vertex shade (2026-10-08 night, docs/REMASTER.md "Transitions"): albedo x vertex alpha^2 on the FH1 road / vblnd /
+        // blnd families, as the game's Default PS; `FH1_RM_VERTEX_SHADE=0` = old (vertex alpha ignored on opaque ground).
+        .replace("RM_VERTEX_SHADE", if std::env::var("FH1_RM_VERTEX_SHADE").is_ok_and(|v| v == "0") { "0.0" } else { "1.0" })
         .replace("RM_WATER_FLAT", if flat { "1.0" } else { "0.0" })
         .replace("RM_WATER_BUMP", &format!("{:.3}", wenv("FH1_RM_WATER_BUMP", 0.35)))
         .replace("RM_WATER_OPACITY", &format!("{:.3}", wenv("FH1_RM_WATER_OPACITY", 1.0).clamp(0.0, 1.0)))
@@ -863,6 +866,16 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
             let m = sample_modulate(slot, umod, dxm, dym).rgb;
             col = col * mix(vec3<f32>(1.0), m, saturate(vc.b));
         }
+    }
+    // Vertex shade (VERIFIED from the Default PS of every h_road_* / h_vblnd_* / h_blnd* family in re/out/headlight/track,
+    // e.g. h_road_diff1_modulate_ao_lm `muls r6.x, r5.ww` -> albedo x r6.x): the DIFFUSE albedo is multiplied by vertex
+    // alpha squared (specular untouched). Colorado roads carry it on half their vertices (25% at a = 0.5..0.75): it darkens
+    // the tarmac towards the dirt / older-asphalt pieces it meets, so without it those joins read as hard seams. Not the
+    // vblnd decals (vertex alpha is their blend weight there, no square in their PS) and not FM4 (FLAG_LM_BAKED rules).
+    let ground_family = layering == LAYER_SPLAT || layering == LAYER_ROAD || layering == LAYER_VBLEND;
+    let vb_decal = cls == CLASS_DECAL && layering == LAYER_VBLEND;
+    if RM_VERTEX_SHADE > 0.5 && ground_family && !vb_decal && (flags & FLAG_LM_BAKED) == 0u {
+        col = col * (vc.a * vc.a);
     }
     col = col * p.p[0].x;
     if (flags & FLAG_OBJECT_TINT) != 0u {

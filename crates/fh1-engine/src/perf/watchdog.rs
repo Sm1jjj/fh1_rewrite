@@ -153,6 +153,21 @@ fn watch_loop(file: PathBuf) {
                 if SAMPLE_AT.get(s.samples.len()).is_some_and(|&at| into > at) {
                     // Raw return addresses only: naming them waits for the report thread.
                     s.samples.push((into, running_long(now), if stall_stacks() { super::stack::sample() } else { Vec::new() }));
+                    // Written at once too (2026-10-08): a stall that never ends (exit hang, the game killed) used to leave
+                    // no file, since the report waited for the beat to resume. FH1_STALL_EARLY=0 = old.
+                    let early = !std::env::var("FH1_STALL_EARLY").is_ok_and(|v| v == "0");
+                    if let Some(last) = s.samples.last().cloned().filter(|_| early) {
+                        let header = format!(
+                            "t {:.2} s  STALL IN PROGRESS, {:.1} s so far  main stuck after: {}  window focused: {}
+",
+                            s.start as f64 / 1000.0,
+                            into as f64 / 1000.0,
+                            MAIN_NAMES.get(s.phase as usize).unwrap_or(&"?"),
+                            focused,
+                        );
+                        let file = file.clone();
+                        let _ = std::thread::Builder::new().name("fh1-stall-report".into()).spawn(move || write_report(&file, header, vec![last]));
+                    }
                 }
             }
             None => {}

@@ -19,10 +19,12 @@
 //!
 //! Env (all optional): FH1_RM_SUN_LUX, FH1_RM_MOON_LUX, FH1_RM_EV_BIAS (EV, + = darker), FH1_RM_EV_COMPRESS (0..1),
 //! FH1_RM_TONEMAP=game|tony|agx|aces|none (default game = FH1's filmic curve in post.rs), FH1_RM_BLOOM=0|intensity, FH1_RM_ENV=0 (no env map light) / FH1_RM_ENV_SIZE=n / FH1_RM_ENV_INTENSITY=k,
-//! FH1_RM_SHADOW_RES=n (1024, like faithful), FH1_RM_SHADOW_DIST=m (300; 202 = the game's InGameShadowEnd, measured costlier), FH1_RM_CASCADES=n (3), FH1_RM_SHADOW_NEAR=m (first cascade, 9),
+//! FH1_RM_SHADOW_RES=n (quality preset, High 2048), FH1_RM_SHADOW_DIST=m (300; 202 = the game's InGameShadowEnd, measured costlier),
+//! FH1_RM_CASCADES=n|old (quality preset, High 2; old = 3 x 1024² and the old far-cascade refresh rules), FH1_RM_SHADOW_NEAR=m (first cascade, 9),
 //! FH1_RM_SHADOW_FILTER=gaussian|temporal|hard, FH1_RM_SHADOWS=0 (no sun/moon shadows),
 //! FH1_RM_ATMOSPHERE=0 (no Bevy atmosphere: no sky, haze or env light; perf A/B), FH1_RM_ENV_EVERY=1 (re-bake the env
-//! map every frame instead of on change), FH1_RM_TWILIGHT=0 (keep the game's sun elevation), FH1_RM_SUN_DIR=shadow (TrackSettings shadow azimuth instead of
+//! map every frame instead of on change), FH1_RM_TWILIGHT=0 (keep the game's sun elevation), FH1_RM_TWILIGHT_HOLD=0 (old: the
+//! sun climbs back above the horizon during the one-game-minute sun/moon swap, a daylight flash; see `twilight_sink`), FH1_RM_SUN_DIR=shadow (TrackSettings shadow azimuth instead of
 //! the TOD sun's; default TOD since 2026-10-07), FH1_RM_SUN_TINT=0..1 (0.5),
 //! FH1_RM_LIGHT_LOG=1 (log the values every 2 s), FH1_RM_FOG=0 (no distance fog) / FH1_RM_FOG=k (density scale, 1).
 //!
@@ -45,6 +47,7 @@ use bevy::prelude::*;
 
 use fh1_render::lighting::FxTimeOfDay;
 use fh1_render::post::FxPostCamera;
+use fh1_render::quality::GraphicsQuality;
 
 use crate::sky;
 
@@ -99,9 +102,9 @@ impl Plugin for RemasterLightPlugin {
         // Game shaders still drawn in game units (clouds/stars/moon, glows, particles) land where the faithful frame has
         // them under the game curve. Set before any program is built (the gain is baked into each program).
         fh1_render::set_output_gain(crate::post::game_unit_scale());
-        let res = env_f32("FH1_RM_SHADOW_RES", 1024.0) as usize;
+        // The quality preset's size (High) until apply_quality reads the real preset (same frame as the first light update).
         app.init_resource::<RemasterLighting>()
-            .insert_resource(DirectionalLightShadowMap { size: res.next_power_of_two().clamp(512, 8192) })
+            .insert_resource(DirectionalLightShadowMap { size: want_shadow_res(None) })
             .add_plugins(bevy::render::extract_component::ExtractComponentPlugin::<RemasterView>::default())
             .add_systems(Startup, (sky::setup_sky, spawn_moon))
             .add_systems(Update, main_only_light_layers)
@@ -142,31 +145,81 @@ fn main_only_light_layers(mut commands: Commands, lights: Query<Entity, (With<Di
     if crate::car_probe::main_only_layers().is_none() {
         return;
     }
+    // Static-only car probe faces render [PROBE_LAYER] (+ the env-cube sky): the sun / moon must be on it to light the
+    // static world's face draw (car_probe.rs `static_faces_on`). Nothing that casts is on that layer.
+    let layers = if crate::car_probe::static_faces_on() {
+        bevy::camera::visibility::RenderLayers::from_layers(&[0, crate::car_probe::OWN_LIGHT_LAYER, crate::car_probe::PROBE_LAYER])
+    } else {
+        bevy::camera::visibility::RenderLayers::from_layers(&[0, crate::car_probe::OWN_LIGHT_LAYER])
+    };
     for e in &lights {
-        commands.entity(e).insert(bevy::camera::visibility::RenderLayers::from_layers(&[0, crate::car_probe::OWN_LIGHT_LAYER]));
+        commands.entity(e).insert(layers.clone());
     }
 }
 
-/// Options > Graphics > Quality (fh1-render quality.rs): shadow map size and cascade count, applied when the preset
-/// changes. FH1_RM_SHADOW_RES / FH1_RM_CASCADES, when set, win over the preset. High = 1024 / 3 = the old defaults.
+/// `FH1_RM_CASCADES=old`: the layout before P14 (3 cascades x 1024², far cascade refreshed by fit / age / light only, no
+/// camera-move refresh), whatever the quality preset says. FH1_RM_SHADOW_RES / FH1_RM_CASCADE_CACHE_FRAMES still win.
+fn old_cascades() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_is("FH1_RM_CASCADES", "old"))
+}
+
+/// A numeric env override, read once.
+fn env_num(name: &'static str, cell: &'static std::sync::OnceLock<Option<f32>>) -> Option<f32> {
+    *cell.get_or_init(|| std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()))
+}
+
+/// Cascade count in effect: FH1_RM_CASCADES=n wins, =old -> 3, else the quality preset (High 2; no resource = High).
+fn want_cascades(q: Option<&GraphicsQuality>) -> usize {
+    static ENV: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let n = match env_num("FH1_RM_CASCADES", &ENV) {
+        Some(n) => n as u32,
+        None if old_cascades() => 3,
+        None => q.map_or_else(|| GraphicsQuality::default().cascades, |q| q.cascades),
+    };
+    (n as usize).clamp(1, 4)
+}
+
+/// Shadow map size in effect (every cascade; Bevy has one size for the array): FH1_RM_SHADOW_RES=n wins,
+/// FH1_RM_CASCADES=old -> 1024, else the quality preset (High 2048).
+fn want_shadow_res(q: Option<&GraphicsQuality>) -> usize {
+    static ENV: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let r = match env_num("FH1_RM_SHADOW_RES", &ENV) {
+        Some(r) => r.max(1.0) as u32,
+        None if old_cascades() => 1024,
+        None => q.map_or_else(|| GraphicsQuality::default().shadow_res, |q| q.shadow_res),
+    };
+    (r.max(1).next_power_of_two() as usize).clamp(512, 8192)
+}
+
+/// Frames between far-cascade refreshes: FH1_RM_CASCADE_CACHE_FRAMES=n wins, =old -> 4, else the quality preset (High 4).
+fn want_far_refresh(q: Option<&GraphicsQuality>) -> u32 {
+    static ENV: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    match env_num("FH1_RM_CASCADE_CACHE_FRAMES", &ENV) {
+        Some(n) => n.max(1.0) as u32,
+        None if old_cascades() => 4,
+        None => q.map_or_else(|| GraphicsQuality::default().shadow_far_refresh, |q| q.shadow_far_refresh).max(1),
+    }
+}
+
+/// Options > Graphics > Quality (fh1-render quality.rs): shadow map size and cascade count. Compared every frame (a few
+/// lights, env read once), not only on `is_changed`: `update_lights` configures the sun on its first frame and a map
+/// switch can respawn lights, and both must end up on the preset. Writes only on a difference (no change ticks).
+/// FH1_RM_SHADOW_RES / FH1_RM_CASCADES (=n or =old), when set, win over the preset.
 fn apply_quality(
-    quality: Option<Res<fh1_render::quality::GraphicsQuality>>,
+    quality: Option<Res<GraphicsQuality>>,
     mut map: ResMut<DirectionalLightShadowMap>,
     mut lights: Query<&mut CascadeShadowConfig, With<DirectionalLight>>,
 ) {
-    let Some(q) = quality.filter(|q| q.is_changed()) else { return };
-    if std::env::var("FH1_RM_SHADOW_RES").is_err() {
-        let size = q.shadow_res.next_power_of_two().clamp(512, 8192) as usize;
-        if map.size != size {
-            map.size = size;
-        }
+    let q = quality.as_deref();
+    let size = want_shadow_res(q);
+    if map.size != size {
+        map.size = size;
     }
-    if std::env::var("FH1_RM_CASCADES").is_err() {
-        let n = (q.cascades as usize).clamp(1, 4);
-        for mut c in &mut lights {
-            if c.bounds.len() != n {
-                *c = cascade_config_n(n);
-            }
+    let n = want_cascades(q);
+    for mut c in &mut lights {
+        if c.bounds.len() != n {
+            *c = cascade_config_n(n);
         }
     }
 }
@@ -177,7 +230,7 @@ fn contact_shadows_on() -> bool {
 }
 
 fn cascade_config() -> CascadeShadowConfig {
-    cascade_config_n(env_f32("FH1_RM_CASCADES", 3.0) as usize)
+    cascade_config_n(want_cascades(None))
 }
 
 fn cascade_config_n(n: usize) -> CascadeShadowConfig {
@@ -234,21 +287,26 @@ fn setup_camera(mut commands: Commands, cams: Query<Entity, (With<FxPostCamera>,
             c.insert(Bloom { intensity, max_mip_dimension: mip, ..Bloom::NATURAL });
         }
         if atmosphere_on() {
-            // Smaller LUTs than Bevy's defaults (they are rebuilt every frame): the sky is smooth, the haze low-frequency.
-            c.insert(AtmosphereSettings {
-                sky_view_lut_size: UVec2::new(256, 128),
-                sky_view_lut_samples: 12,
-                multiscattering_lut_dirs: 32,
-                aerial_view_lut_size: UVec3::new(32, 32, 16),
-                aerial_view_lut_samples: 8,
-                aerial_view_lut_max_distance: 20_000.0,
-                ..default()
-            });
+            c.insert(remaster_atmosphere_settings());
             if env_on() && env_every_frame() {
                 c.insert(env_light());
             }
         }
         info!("fh1-remaster: main camera = remaster view ({tonemap:?})");
+    }
+}
+
+/// The atmosphere settings of the remaster views (main camera, car probe face camera). Smaller LUTs than Bevy's
+/// defaults (they are rebuilt every frame): the sky is smooth, the haze low-frequency.
+pub(crate) fn remaster_atmosphere_settings() -> AtmosphereSettings {
+    AtmosphereSettings {
+        sky_view_lut_size: UVec2::new(256, 128),
+        sky_view_lut_samples: 12,
+        multiscattering_lut_dirs: 32,
+        aerial_view_lut_size: UVec3::new(32, 32, 16),
+        aerial_view_lut_samples: 8,
+        aerial_view_lut_max_distance: 20_000.0,
+        ..default()
     }
 }
 
@@ -261,6 +319,21 @@ fn mirror_z(v: [f32; 3]) -> Vec3 {
 /// it is not night yet (no moon). The remaster sinks the sun below the horizon by this amount.
 pub fn twilight(sun_mult: f32, moon: f32) -> f32 {
     ((1.0 - sun_mult / 0.6).clamp(0.0, 1.0) * (1.0 - moon)).clamp(0.0, 1.0)
+}
+
+/// How far the sun is sunk below the horizon (0 = the game's elevation, 1 = -9 degrees). Unlike [`twilight`] it does not
+/// fall back to 0 while the moon comes in: the TOD swaps sun for moon within ONE game minute (Colorado 20:02 and 06:28,
+/// SunObjectMoon keys 1202/1203 and 388/389; TimeSpeed 220 there = 0.27 real seconds), and with `twilight` x (1 - moon)
+/// the sun rose from -9 to the game's night "sun" elevation (73 degrees) during that minute at up to 66,000 lux (half moon:
+/// 28 degrees, 29,000 lux): a daylight flash of the sky, the env map, shadows and the car probe at every dusk and dawn.
+/// Fully sunk from 10 % moon on; equal to the raw sun fade without the moon.
+pub fn twilight_sink(sun_mult: f32, moon: f32) -> f32 {
+    (1.0 - sun_mult / 0.6).clamp(0.0, 1.0).max((moon * 10.0).clamp(0.0, 1.0))
+}
+
+/// FH1_RM_TWILIGHT_HOLD=0 = old (the sun climbs back up during the sun/moon swap, see [`twilight_sink`]).
+fn twilight_hold() -> bool {
+    !flag_off("FH1_RM_TWILIGHT_HOLD")
 }
 
 /// Rotate `dir` (towards the light) to elevation `el` (radians), keeping its azimuth.
@@ -303,6 +376,7 @@ fn update_lights(
     mut configured: Local<bool>,
     post_config: Option<Res<fh1_render::postfx::FxPostConfig>>,
     mut track_shadow: Local<Option<(Option<Vec3>, std::path::PathBuf)>>,
+    quality: Option<Res<GraphicsQuality>>,
 ) {
     if let Some(cfg) = post_config {
         let path = cfg.0.track_settings.clone();
@@ -335,7 +409,13 @@ fn update_lights(
     };
     // Sink to -9 degrees at full twilight: the game's 20:00 is already blue hour (lights on, dark sky), so the sun
     // sets during 19:00-20:00 and the sky goes blue/dark rather than staying orange.
-    let sun_el = game_el + (-9f32.to_radians() - game_el) * k_twi;
+    // Stays sunk through the sun/moon swap ([`twilight_sink`]; FH1_RM_TWILIGHT_HOLD=0 = old).
+    let sink = match (env_is("FH1_RM_TWILIGHT", "0"), twilight_hold()) {
+        (true, _) => 0.0,
+        (false, true) => twilight_sink(mult, night),
+        (false, false) => k_twi,
+    };
+    let sun_el = game_el + (-9f32.to_radians() - game_el) * sink;
     let sun_dir = with_elevation(azimuth_dir, sun_el);
 
     // Sun: the TOD colour on surfaces = light colour × transmittance, so divide it out (clamped: near and below
@@ -374,7 +454,8 @@ fn update_lights(
             commands.entity(e).insert(SunDisk::EARTH);
         }
         if !*configured {
-            *cfg = cascade_config();
+            // The preset's count (not the High default): apply_quality ran earlier this frame and must not be undone.
+            *cfg = cascade_config_n(want_cascades(quality.as_deref()));
         }
     }
     *configured = !sun.is_empty();
@@ -417,7 +498,14 @@ fn update_lights(
         let (c, _) = split(v3("HLTopColour").max(Vec3::splat(1e-4)));
         // Also through twilight (2026-10-07): with the sun sunk and no moon yet the env map is near black, and the car
         // at 20:00 (only env + sun, no lightmaps) went black where the faithful car is dark red.
-        let want = env_f32("FH1_RM_NIGHT_AMBIENT", 0.3) * night.max(if env_is("FH1_RM_DUSK_AMBIENT", "0") { 0.0 } else { k_twi });
+        // With the twilight hold, the dusk share is the raw sun fade (not masked by the moon): `k_twi` dips to ~0.5 at the
+        // swap's half-way point and the ambient blinked to half for that game minute.
+        let dusk = match (env_is("FH1_RM_DUSK_AMBIENT", "0"), twilight_hold()) {
+            (true, _) => 0.0,
+            (false, true) if !env_is("FH1_RM_TWILIGHT", "0") => (1.0 - mult / 0.6).clamp(0.0, 1.0),
+            _ => k_twi,
+        };
+        let want = env_f32("FH1_RM_NIGHT_AMBIENT", 0.3) * night.max(dusk);
         if (a.brightness - want).abs() > 1e-3 || a.color != c {
             a.brightness = want;
             a.color = c;
@@ -490,8 +578,19 @@ fn main_view_cascades_only(
 /// FH1_RM_CASCADE_CACHE_MARGIN (0.15 = 15 % wider and deeper, texel-snapped), and then kept: the same matrices are put
 /// back every frame and bevy_pbr skips that cascade's clear + draws (`DirectionalShadowCache::skip_mask`), so the
 /// shadow map holds the refresh frame's depth. A refresh comes when Bevy's fresh cascade no longer fits inside the kept
-/// one (camera moved / turned), the light turned > 0.05 deg (TOD clock), after FH1_RM_CASCADE_CACHE_FRAMES frames (4),
-/// or when the light, cascade count or map size changed. Nearer cascades render every frame.
+/// one (camera moved / turned), the light turned > 0.05 deg (TOD clock), after the quality preset's `shadow_far_refresh`
+/// frames (High 4; FH1_RM_CASCADE_CACHE_FRAMES=n wins; 1 = no caching), or when the light, cascade count or map size changed.
+/// Nearer cascades render every frame.
+///
+/// P14 (2 cascades): the cached cascade now starts at 9 m, so moving casters near the player (the car's own shadow tip
+/// past 9 m, traffic alongside) would lag by up to N-1 frames. Camera-move refresh: when the main camera has moved more
+/// than FH1_RM_CASCADE_CACHE_MOVE (2) kept-cascade texels since the refresh (~0.85 m at 2048² / 300 m), it refreshes
+/// this frame, so the lag of anything moving with the camera stays under ~2 texels. A camera cut / teleport / fast turn is
+/// the same case (the move test, or the fresh cascade no longer fitting): the cascade is re-drawn in full on THAT frame
+/// and the cadence restarts from it, never a stale frame. The talk's "render it at reduced resolution on the cut frame"
+/// is not done: our cost is per-draw encode + vertex work, which a smaller viewport doesn't cut, and sampling a sub-rect
+/// would need a bevy_pbr shader patch (UV scale + texel size per cascade). A refresh frame costs what every frame cost
+/// before the cache (no stall). FH1_RM_CASCADE_CACHE_MOVE=0 or FH1_RM_CASCADES=old = no move refresh (old).
 /// `FH1_RM_CASCADE_CACHE=0` = off (every cascade every frame, Bevy's matrices).
 #[derive(Default)]
 struct FarCascadeCache {
@@ -506,6 +605,17 @@ struct FarCascadeCache {
     depth: f32,
     diameter: f32,
     age: u32,
+    /// Main camera position at the refresh.
+    cam_pos: Vec3,
+}
+
+/// FH1_RM_CASCADE_CACHE_MOVE=texels (2; 0 = off, also off with FH1_RM_CASCADES=old): camera-move refresh of the cached cascade.
+fn cache_move_texels() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let d = if old_cascades() { 0.0 } else { 2.0 };
+        env_f32("FH1_RM_CASCADE_CACHE_MOVE", d).max(0.0)
+    })
 }
 
 fn cascade_cache_on() -> bool {
@@ -540,10 +650,11 @@ fn build_cascade(rot: Mat3, centre: Vec3, depth: f32, diameter: f32, texel: f32)
 
 #[allow(clippy::type_complexity)]
 fn cache_far_cascade(
-    main: Query<Entity, With<RemasterView>>,
+    main: Query<(Entity, &GlobalTransform), With<RemasterView>>,
     mut lights: Query<(Entity, &DirectionalLight, &mut Cascades)>,
     map: Res<DirectionalLightShadowMap>,
     mut cache: ResMut<bevy::pbr::DirectionalShadowCache>,
+    quality: Option<Res<GraphicsQuality>>,
     mut st: Local<FarCascadeCache>,
 ) {
     let off = |cache: &mut bevy::pbr::DirectionalShadowCache| {
@@ -559,10 +670,12 @@ fn cache_far_cascade(
     if !cache.enabled {
         cache.enabled = true;
     }
-    let Some(cam) = main.iter().next() else {
+    let Some((cam, cam_tf)) = main.iter().next() else {
         off(&mut *cache);
         return;
     };
+    let cam_pos = cam_tf.translation();
+    let max_frames = want_far_refresh(quality.as_deref());
     let Some((light, mut cascades)) = lights.iter_mut().find(|(_, l, c)| l.shadow_maps_enabled && c.cascades.get(&cam).is_some_and(|v| !v.is_empty())).map(|(e, _, c)| (e, c)) else {
         *st = FarCascadeCache::default();
         cache.skip_mask = 0;
@@ -570,7 +683,7 @@ fn cache_far_cascade(
     };
     let Some(list) = cascades.cascades.get_mut(&cam) else { return };
     let n = list.len();
-    if n < 2 {
+    if n < 2 || max_frames <= 1 {
         *st = FarCascadeCache::default();
         cache.skip_mask = 0;
         return;
@@ -579,7 +692,6 @@ fn cache_far_cascade(
     let (rot, fresh_centre, fresh_depth, fresh_d) = cascade_params(&list[k]);
     let size = map.size.max(1);
     let fresh_texel = fresh_d / size as f32;
-    let max_frames = env_f32("FH1_RM_CASCADE_CACHE_FRAMES", 4.0).max(1.0) as u32;
     let fits = st.kept.is_some() && {
         let half = 0.5 * st.diameter;
         let d = (fresh_centre.truncate() - st.centre).abs();
@@ -588,7 +700,10 @@ fn cache_far_cascade(
             && fresh_centre.z <= st.near
             && fresh_centre.z - fresh_depth >= st.near - st.depth
     };
+    let move_texels = cache_move_texels();
+    let moved = move_texels > 0.0 && st.kept.is_some() && cam_pos.distance(st.cam_pos) > move_texels * st.diameter / size as f32;
     let refresh = !fits
+        || moved
         || st.light != Some(light)
         || st.count != n
         || st.map_size != size
@@ -614,6 +729,7 @@ fn cache_far_cascade(
             depth,
             diameter,
             age: 0,
+            cam_pos,
         };
         cache.skip_mask = 0;
     } else {

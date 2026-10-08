@@ -1,4 +1,4 @@
-//! P12 static world (docs/PERF.md "P12 static world"; opt-in `FH1_STATIC_WORLD=1`). Remaster scenery (zone models, tiles,
+//! P12 static world (docs/PERF.md "P12 static world"; default-on, `FH1_STATIC_WORLD=0` = old ECS path). Remaster scenery (zone models, tiles,
 //! props) as GPU-resident geometry + draw records instead of ECS meshes, so the per-frame CPU cost no longer scales with the
 //! ~40k scenery entities.
 //!
@@ -43,7 +43,7 @@ pub enum GeoKey {
     Baked(u64),
 }
 
-/// `FH1_STATIC_WORLD=1` (remaster only).
+/// Default-on (remaster only); `FH1_STATIC_WORLD=0` = old ECS scenery path.
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Bake mode (bake.rs, FH1_BAKE_CELLS) records what the static world receives, so it needs it on. Never under RTX:
@@ -53,8 +53,13 @@ pub fn on() -> bool {
         let rtx = crate::rtx::on();
         #[cfg(not(feature = "rtx"))]
         let rtx = false;
-        crate::enabled() && !rtx && (std::env::var("FH1_STATIC_WORLD").is_ok_and(|v| v == "1") || bake::baking())
+        crate::enabled() && !rtx && (std::env::var("FH1_STATIC_WORLD").map_or(true, |v| v != "0") || bake::baking())
     })
+}
+
+/// The static world is on and draws its scenery into the car probe faces (`FH1_STATIC_WORLD_PROBE`, default on).
+pub(crate) fn probe_faces_on() -> bool {
+    on() && draw::probe_faces()
 }
 
 /// Packed vertex: position (3), normal (3), uv0 (2), uv1 (2), uv2 (2) as f32, colour as unorm8x4 = 13 words.
@@ -603,9 +608,58 @@ impl Arena {
     }
 }
 
+impl Arena {
+    /// Uploads the records of `slots` (sorted + deduplicated here) as contiguous runs, one `write_buffer` per run; gaps of
+    /// up to 16 slots are bridged (the CPU copy is current for every slot). Growth falls back to `write_record` (which
+    /// re-uploads every record). See [`batch_ops_on`].
+    pub(crate) fn write_records(&mut self, device: &RenderDevice, queue: &RenderQueue, slots: &mut Vec<u32>) {
+        const GAP: u32 = 16;
+        if slots.is_empty() {
+            return;
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        let max = slots[slots.len() - 1];
+        if max + 1 > self.record_cap || self.record_buffer.is_none() {
+            self.write_record(device, queue, max);
+            return;
+        }
+        let Some(b) = self.record_buffer.as_ref() else { return };
+        let n = self.records.len();
+        let mut i = 0;
+        while i < slots.len() {
+            let start = slots[i];
+            let mut end = start;
+            let mut j = i + 1;
+            while j < slots.len() && slots[j] <= end + 1 + GAP {
+                end = slots[j];
+                j += 1;
+            }
+            let (lo, hi) = (start as usize, (end as usize + 1).min(n));
+            if lo < hi {
+                queue.write_buffer(b, lo as u64 * RECORD_BYTES, records_bytes(&self.records[lo..hi]));
+            }
+            i = j;
+        }
+    }
+}
+
 fn records_bytes(r: &[GpuRecord]) -> &[u8] {
     // SAFETY: GpuRecord is repr(C) of 4-byte fields, no padding beyond explicit fields.
     unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, std::mem::size_of_val(r)) }
+}
+
+/// Batched record uploads (P13 micro-stutter, 2026-10-08; `FH1_SW_BATCH_OPS=0` = old). A zone fade sets the dither tag
+/// of every record of the appearing and the disappearing zone model on each level step (16 steps per fade), and a zone
+/// switch hides / shows whole bundles: thousands of ops in one frame. The old path wrote each record with its own
+/// `queue.write_buffer` (96 bytes each) AND flagged the arena dirty, so `draw.rs` rebuilt the whole candidate list
+/// (every record, hashed into bins; resets the Hi-Z bits) on every fade step. Zone switches come every few seconds at
+/// speed, so that was a burst of heavy frames each time. Now the changed slots are collected and uploaded as contiguous
+/// runs (one write per run), and only ops that change list membership (instances added / removed, geometry, rebinds,
+/// hiding without GPU culling) rebuild the lists: tags and hidden flags are read by the GPU cull from the records.
+pub(crate) fn batch_ops_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_SW_BATCH_OPS").map_or(true, |v| v != "0"))
 }
 
 /// Applies the main world's ops (render world, once per frame).
@@ -619,22 +673,29 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
         return;
     }
     let a = &mut *arena;
-    a.dirty = true;
+    let batch = batch_ops_on();
+    let cull = draw::culling();
+    // Slots whose record changed (batch mode: uploaded once, in runs, after the loop) and whether the lists must rebuild.
+    let mut touched: Vec<u32> = Vec::new();
+    let mut membership = !batch;
     for op in ops {
         match op {
             Op::AddGeometry { mesh, vertices, indices } => {
+                membership = true;
                 let vc = (vertices.len() / VERTEX_WORDS) as u32;
                 let fv = a.vertices.put(&device, &queue, &vertices) / VERTEX_WORDS as u32;
                 let fi = a.indices.put(&device, &queue, &indices);
                 a.geometry.insert(mesh, GeoRange { first_vertex: fv, vertex_count: vc, first_index: fi, index_count: indices.len() as u32 });
             }
             Op::RemoveGeometry(mesh) => {
+                membership = true;
                 if let Some(g) = a.geometry.remove(&mesh) {
                     a.vertices.alloc.release(g.first_vertex * VERTEX_WORDS as u32, (g.vertex_count * VERTEX_WORDS as u32).max(1));
                     a.indices.alloc.release(g.first_index, g.index_count.max(1));
                 }
             }
             Op::AddInstance { slot, mesh, material, mut record } => {
+                membership = true;
                 let s = slot as usize;
                 if a.records.len() <= s {
                     a.records.resize(s + 1, GpuRecord::default());
@@ -653,9 +714,14 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                 a.records[s] = record;
                 a.slot_mesh[s] = Some((mesh, material));
                 a.by_material.entry(material).or_default().push(slot);
-                a.write_record(&device, &queue, slot);
+                if batch {
+                    touched.push(slot);
+                } else {
+                    a.write_record(&device, &queue, slot);
+                }
             }
             Op::RemoveInstance(slot) => {
+                membership = true;
                 if let Some(Some((_, m))) = a.slot_mesh.get(slot as usize) {
                     if let Some(v) = a.by_material.get_mut(m) {
                         v.retain(|&x| x != slot);
@@ -665,16 +731,25 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                     *r = GpuRecord::default();
                     a.slot_mesh[slot as usize] = None;
                     a.slot_group[slot as usize] = None;
-                    a.write_record(&device, &queue, slot);
+                    if batch {
+                        touched.push(slot);
+                    } else {
+                        a.write_record(&device, &queue, slot);
+                    }
                 }
             }
             Op::SetTag(slot, level) => {
                 if let Some(r) = a.records.get_mut(slot as usize) {
                     r.tag = level;
-                    a.write_record(&device, &queue, slot);
+                    if batch {
+                        touched.push(slot);
+                    } else {
+                        a.write_record(&device, &queue, slot);
+                    }
                 }
             }
             Op::Rebind(material) => {
+                membership = true;
                 if let Some(v) = a.by_material.get(&material) {
                     a.pending.extend_from_slice(v);
                     a.recheck.extend_from_slice(v);
@@ -687,9 +762,19 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                     } else {
                         r.flags &= !FLAG_HIDDEN;
                     }
-                    a.write_record(&device, &queue, slot);
+                    if batch {
+                        touched.push(slot);
+                        // Without GPU culling the CPU args skip hidden records: the lists must follow.
+                        membership |= !cull;
+                    } else {
+                        a.write_record(&device, &queue, slot);
+                    }
                 }
             }
         }
+    }
+    a.write_records(&device, &queue, &mut touched);
+    if membership {
+        a.dirty = true;
     }
 }

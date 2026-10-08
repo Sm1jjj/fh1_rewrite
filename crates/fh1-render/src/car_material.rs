@@ -270,9 +270,20 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 }
 "#;
 
+/// P15-A (docs/PERF_P15_A.md): FxRawStandard (masked crowd / anim parts among others) stays out of Bevy's depth prepass
+/// (it exists only for contact shadows; an alpha-tested prepass draw costs about as much as the main draw).
+/// `FH1_ECS_MASK_PREPASS=1` = old (in the prepass).
+fn mask_prepass() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_ECS_MASK_PREPASS").is_ok_and(|v| v == "1"))
+}
+
 impl MaterialExtension for FxRawOutput {
     fn fragment_shader() -> ShaderRef {
         ShaderRef::Handle(RAW_STANDARD_SHADER)
+    }
+    fn enable_prepass() -> bool {
+        mask_prepass()
     }
 }
 

@@ -247,7 +247,7 @@ impl FromWorld for AtmosphereSampler {
 }
 
 #[derive(Resource)]
-pub(crate) struct AtmosphereLutPipelines {
+pub struct AtmosphereLutPipelines {
     pub transmittance_lut: CachedComputePipelineId,
     pub multiscattering_lut: CachedComputePipelineId,
     pub sky_view_lut: CachedComputePipelineId,
@@ -298,7 +298,7 @@ impl FromWorld for AtmosphereLutPipelines {
 }
 
 #[derive(Component)]
-pub(crate) struct RenderSkyPipelineId(pub CachedRenderPipelineId);
+pub struct RenderSkyPipelineId(pub CachedRenderPipelineId);
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct RenderSkyPipelineKey {
@@ -594,7 +594,7 @@ pub(super) fn prepare_atmosphere_transforms(
 }
 
 #[derive(Component)]
-pub(crate) struct AtmosphereBindGroups {
+pub struct AtmosphereBindGroups {
     pub transmittance_lut: BindGroup,
     pub multiscattering_lut: BindGroup,
     pub sky_view_lut: BindGroup,
@@ -818,7 +818,8 @@ pub(crate) fn write_atmosphere_buffer(
     atmosphere_entity: Query<&GpuAtmosphere, With<Camera3d>>,
     mut atmosphere_buffer: ResMut<AtmosphereBuffer>,
 ) {
-    let Ok(atmosphere) = atmosphere_entity.single() else {
+    // FH1 patch 4 (FH1_PATCHES.md): first camera's copy, not `single()` (fails with a second atmosphere camera).
+    let Some(atmosphere) = atmosphere_entity.iter().next() else {
         return;
     };
 
