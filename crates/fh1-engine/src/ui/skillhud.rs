@@ -34,7 +34,8 @@
 //!   an instant skill gets SHOW alone.
 //! - WARNING fires when 30 % of the chain window is left.
 //! - MAKE_SIZE_n is picked by the total's digit count.
-//! - The popularity bar shows with the chain and hides 3.5 s after the bank.
+//! - The popularity bar shows only on a rank-up (LEVEL_UP) and hides after it (user, 2026-10-08); its flash /
+//!   smoke-ring halo layers stay hidden; the chain total is centred over the skill line.
 
 use std::sync::OnceLock;
 
@@ -128,6 +129,8 @@ struct Objs {
     unlock: usize,
     unlock_title: usize,
     unlock_show: usize,
+    /// PopularityBar's flash / smoke-ring layers (an authored 40 % halo behind the ring): kept hidden (user, 2026-10-08).
+    flashes: [Option<usize>; 3],
 }
 
 impl Objs {
@@ -151,8 +154,28 @@ impl Objs {
             unlock,
             unlock_title: p.resolve_path(unlock, "MainMessage.TEXT_TITLE")?,
             unlock_show: p.resolve_path(unlock, "ShowMe.TEXT_SHOW")?,
+            flashes: [p.resolve_path(bar_root, "CircleFlash"), p.resolve_path(bar_root, "Flash_SmokeRing"), p.resolve_path(bar_root, "Flash_SmokeRing2")],
         })
     }
+}
+
+/// Centre the chain total over the skill line (the screen's centre line), as FH1 shows it: its SUPER_STACKER layout
+/// isn't implemented, so the authored left-aligned spot sits up-left of the skill name. Returns the local x that puts
+/// the text's centre on x = 0, measured from its parent's world transform. The score group is only evaluated while
+/// shown (after SHOW_SCORE), so this is measured while a chain is on screen (VERIFIED offline: parent at x −32.8,
+/// scale 0.8 once shown; None right after a HUD reset).
+fn measure_total_x(p: &Player, o: &Objs) -> Option<f32> {
+    let parent = p.scene.bgf.objects.get(o.total).map(|ob| ob.parent).filter(|&x| x >= 0)? as usize;
+    let frame = p.evaluate();
+    let (m, _) = frame.objects.get(&parent)?;
+    let origin = fh1_ui::player::apply(m, [0.0; 3]);
+    let sx = (m[0][0] * m[0][0] + m[0][1] * m[0][1]).sqrt();
+    (sx > 1e-4).then(|| (0.0 - origin[0]) / sx)
+}
+
+fn place_total(p: &mut Player, o: &Objs, x: f32) {
+    p.set(o.total, fh1_ui::names::HORZALIGN, Value::Int(1));
+    p.set(o.total, fh1_ui::names::POSITION_X, Value::Float(x));
 }
 
 #[derive(Resource, Default)]
@@ -175,6 +198,9 @@ struct SkillHudState {
     bar_fill: f32,
     bar_to: f32,
     unlock_left: Option<f32>,
+    /// The chain total's centred local x once measured (kept across HUD resets), and seconds of measuring so far.
+    total_x: Option<f32>,
+    total_measure_s: f32,
 }
 
 pub struct SkillHudPlugin;
@@ -263,9 +289,17 @@ fn drive(
         if st.objs.is_none() {
             warn!("skill HUD: 947_HUD skill / popularity objects not found");
         }
-        let keep = (st.bar_rank, st.bar_fill);
+        let keep = (st.bar_rank, st.bar_fill, st.total_x);
         *st = SkillHudState { objs: st.objs, applied: st.applied, ..default() };
-        (st.bar_rank, st.bar_fill) = keep;
+        (st.bar_rank, st.bar_fill, st.total_x) = keep;
+        if let Some(o) = st.objs {
+            for f in o.flashes.into_iter().flatten() {
+                opacity(p, f, false);
+            }
+            if let Some(x) = st.total_x {
+                place_total(p, &o, x);
+            }
+        }
     }
     let Some(o) = st.objs else {
         skill_events.clear();
@@ -293,13 +327,6 @@ fn drive(
         }
         p.set_text(o.total, "0");
         p.fire_at("SHOW_SCORE", o.skill);
-        // The popularity bar comes with the chain.
-        st.bar_hide = None;
-        if !st.bar_shown {
-            st.bar_shown = true;
-            opacity(p, o.bar_root, true);
-            p.fire_at("SHOW", o.bar_root);
-        }
     };
     // Bring the other slot to the top for a new skill.
     let next_slot = |st: &mut SkillHudState, p: &mut Player| -> usize {
@@ -366,6 +393,16 @@ fn drive(
             }
         }
     }
+    // First chain after start-up: follow the score group's intro (SHOW_SCORE, 1 s) each frame, then keep the value.
+    if st.active && st.total_x.is_none() {
+        if let Some(x) = measure_total_x(p, &o) {
+            place_total(p, &o, x);
+            st.total_measure_s += dt;
+            if st.total_measure_s > 1.2 {
+                st.total_x = Some(x);
+            }
+        }
+    }
     if st.active && st.ending.is_none() {
         // Running total, its digit-count size, and the multiplier.
         let ch = &skills.chain;
@@ -405,7 +442,6 @@ fn drive(
             }
             p.fire_at("HIDDEN_SCORE", o.skill);
             opacity(p, o.skill, false);
-            st.bar_hide = Some(BAR_HOLD_S);
         } else {
             st.ending = Some(left);
         }

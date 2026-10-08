@@ -57,7 +57,6 @@ use bevy::prelude::*;
 use bevy::sprite_render::AlphaMode2d;
 use bevy::ui::UiTargetCamera;
 use bevy::window::PrimaryWindow;
-use fh1_engine::vehicle::Ground;
 
 use self::discovery::Discovered;
 use super::minimap::{NavGraph, SatNav};

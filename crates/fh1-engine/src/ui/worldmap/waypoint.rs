@@ -17,7 +17,6 @@
 use std::sync::OnceLock;
 
 use bevy::prelude::*;
-use fh1_engine::vehicle::Ground;
 
 use crate::ui::minimap::{NavGraph, SatNav};
 use crate::ui::notify::{HudNotify, Objective};

@@ -69,6 +69,14 @@
 //!   main-view-only layer ([`main_only_layers`]), so the faces skip them; parked, a bake comes every
 //!   FH1_RM_CAR_PROBE_EVERY_PARKED s (4), easing to FH1_RM_CAR_PROBE_EVERY (1) by 10 m/s.
 //!
+//! - **Paired slots** (2026-10-08, user: "the car's paint flashes light/dark when moving", after the cluster-safe fix):
+//!   whether a probe inserted in PostUpdate is already clustered that frame depends on system order and command flush
+//!   points, so any crossfade step that adds or removes a probe could render one frame at the wrong level. Now, from the
+//!   first bake on, BOTH slots are always present with a valid env map and the same weight (inserted together, removed
+//!   together at dusk), and only intensities move: the active slot at 2x, the idle one at 0, crossing during a fade.
+//!   sum(intensity x weight) / sum(weight) is then the same on every frame whatever the timing. A new bake replaces the
+//!   idle slot's maps at intensity 0 (invisible in any frame). FH1_RM_CAR_PROBE_FADE=0 = instant swap.
+//!
 //! Anchor: the player car's `fh1_render::reflect::EnvCubeAnchor` (main.rs). Default on (FH1_RM_CAR_PROBE=0 = off, the camera's
 //! atmosphere env only); FH1_RM_CAR_PROBE_RES=n face size (256 since 2026-10-08, was 128). The face camera gets no sun cascades: light.rs empties every
 //! non-main view's entry (it must stay present, see `main_view_cascades_only`).
@@ -184,8 +192,6 @@ struct ProbeState {
     active: Option<(u8, f32)>,
     /// Crossfade in progress: (incoming slot, its intensity, start time).
     fade: Option<(u8, f32, f32)>,
-    /// Fade done: (slot, intensity) to drop to 1x next frame, once the old slot is out of the clusters.
-    settle: Option<(u8, f32)>,
     /// Slots to deactivate (remove `LightProbe` + env) in Update, before cluster assignment.
     remove: Vec<Entity>,
     /// The slots' `LightProbe` falloff (inserted with each env map).
@@ -382,23 +388,9 @@ fn drive(
     // Commands apply before the render world extracts this frame (direct mutations too), so every step keeps
     // sum(intensity x weight) / sum(weight) at the full level in the frame it happens. The 2026-10-08 dark blips were the
     // fade start: the new probe inserted at 0 beside the old one still at 1x, averaged over two weights = half for a frame.
-    if let Some((slot, i)) = state.settle.take() {
-        // The old slot left the clusters this frame (removed in Update): the new one alone at 1x.
-        if let Ok((_, _, _, Some(mut env), _)) = probe.get_mut(slot_e(slot)) {
-            env.intensity = i;
-        }
-    }
     if let Some((incoming, inc_i, t0)) = state.fade {
         if now - t0 >= fade_secs() {
-            // Fade done (the loop above put the old slot at 0 and the new one at 2x for this frame): the old slot leaves
-            // the clusters next frame (Update), then the new one drops to 1x (`settle`).
-            if let Some((old, _)) = state.active {
-                if old != incoming {
-                    let e = slot_e(old);
-                    state.remove.push(e);
-                }
-            }
-            state.settle = Some((incoming, inc_i));
+            // Fade done: the loop above put the old slot at 0 and the new one at 2x; both stay present (module doc).
             state.active = Some((incoming, inc_i));
             state.fade = None;
         }
@@ -424,7 +416,6 @@ fn drive(
                     state.last_bake = None;
                     state.active = None;
                     state.fade = None;
-                    state.settle = None;
                 }
             } else if due && state.fade.is_none() && lighting.as_ref().is_some_and(|l| l.sun_dir != Vec3::ZERO) {
                 state.centre = car_pos + Vec3::Y * 0.8;
@@ -490,24 +481,33 @@ fn drive(
                 if fl.frames >= FILTER_FRAMES {
                     let mut env = env.clone();
                     match state.active {
-                        // Crossfade onto the idle slot (starts at 0).
-                        Some((old, _)) if fade_secs() > 0.0 => {
+                        // Both slots present: the new maps replace the idle slot's at 0, then the intensities cross.
+                        Some((old, old_i)) => {
                             let incoming = 1 - old;
-                            env.intensity = 0.0;
-                            // Inserted after this frame's cluster assignment: the new slot is clustered from the next
-                            // frame, where the fade loop starts doubling the old one (module doc).
-                            commands.entity(slot_e(incoming)).insert((LightProbe { falloff: state.falloff }, env));
-                            state.fade = Some((incoming, fl.intensity, now));
-                        }
-                        // First bake, or no fade: straight onto slot 0 (old behaviour).
-                        _ => {
-                            env.intensity = fl.intensity;
-                            commands.entity(slot0).insert((LightProbe { falloff: state.falloff }, env));
-                            if let Some((old, _)) = state.active {
-                                if old != 0 {
-                                    state.remove.push(slot1);
+                            if fade_secs() > 0.0 {
+                                env.intensity = 0.0;
+                                commands.entity(slot_e(incoming)).insert(env);
+                                state.fade = Some((incoming, fl.intensity, now));
+                            } else {
+                                // Instant swap: both changes land in this frame's extraction (insert flushes before it,
+                                // the old one is set directly).
+                                env.intensity = 2.0 * fl.intensity;
+                                commands.entity(slot_e(incoming)).insert(env);
+                                if let Ok((_, _, _, Some(mut old_env), _)) = probe.get_mut(slot_e(old)) {
+                                    old_env.intensity = 0.0;
                                 }
+                                let _ = old_i;
+                                state.active = Some((incoming, fl.intensity));
                             }
+                        }
+                        // First bake (or after dusk): both slots at once, same maps, so they enter the clusters together
+                        // with equal weight: the active one at 2x, the idle one at 0.
+                        None => {
+                            let mut idle = env.clone();
+                            idle.intensity = 0.0;
+                            env.intensity = 2.0 * fl.intensity;
+                            commands.entity(slot0).insert((LightProbe { falloff: state.falloff }, env));
+                            commands.entity(slot1).insert((LightProbe { falloff: state.falloff }, idle));
                             state.active = Some((0, fl.intensity));
                         }
                     }
