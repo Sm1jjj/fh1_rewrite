@@ -932,10 +932,11 @@ enum BatchMaterial {
 /// the CPU visibility systems (frustum, VisibilityRange, directional-light cascades; ~1.5 ms/frame in log 105206) and
 /// are frustum- and range-culled in the GPU mesh preprocess instead. Their ViewVisibility then mirrors
 /// InheritedVisibility (the perf CSV's visible counts count them as visible). Not on smash pieces, cars, crowds,
-/// particles. `FH1_NO_CPU_CULL=0` = CPU culling (old).
+/// particles. OPT-IN since 2026-10-08 pm (`FH1_NO_CPU_CULL=1`): user log 125629 had render-thread prepare 2.7 -> 4.1 ms,
+/// encode 8.0 -> 10.2 and shadow draws 60 -> 206 with it on (the saved visibility work is main-thread, off the critical path).
 fn no_cpu_cull_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FH1_NO_CPU_CULL").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("FH1_NO_CPU_CULL").is_ok_and(|v| v == "1"))
 }
 
 fn no_cpu_cull(commands: &mut Commands, e: Entity) {
