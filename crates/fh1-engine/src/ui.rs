@@ -147,8 +147,7 @@ pub struct Settings {
     /// Video: the game's original translated shaders (faithful renderer) instead of the remaster. Superseded by
     /// `renderer`; still read when `renderer` is absent (older settings files).
     pub original_shaders: bool,
-    /// Video renderer: "remaster" (default), "rtx" (remaster + ray-traced lighting) or "faithful" (the game's shaders).
-    /// Applies on restart (main.rs sets FH1_RENDERER / FH1_RTX from it unless those are already set).
+    /// Retired renderer choice (always Remaster now); kept so older settings files still load.
     pub renderer: Option<String>,
     /// Options > Graphics (ui/graphics.rs, P8): quality preset, anti-aliasing, render scale.
     pub graphics: graphics::GraphicsSettings,
@@ -833,7 +832,6 @@ enum Opt {
     Telemetry,
     EngineVolume,
     RadioVolume,
-    Shaders,
     DrivingLine,
     AiDifficulty,
     Quality,
@@ -933,7 +931,6 @@ fn items(menu: &Menu, settings: &Settings, garage: &Garage, track: &Track, maps:
                     opt("Telemetry overlay", on_off(settings.telemetry), Opt::Telemetry),
                     opt("Engine volume", pct(settings.engine_volume), Opt::EngineVolume),
                     opt("Radio volume", pct(settings.radio_volume), Opt::RadioVolume),
-                    opt("Renderer", renderer_value(settings).into(), Opt::Shaders),
                     item("Graphics", Act::Open(Page::Graphics)),
                     Item { label: "Map".into(), value: Some(track.name.clone()), act: Act::Open(Page::Maps) },
                     item("Controls", Act::Open(Page::Controls)),
@@ -1107,13 +1104,6 @@ fn adjust(settings: &mut Settings, o: Opt, dir: i32) {
         }
         Opt::Hud => settings.hud = !settings.hud,
         Opt::Telemetry => settings.telemetry = !settings.telemetry,
-        Opt::Shaders => {
-            // Remaster + RTX -> Remaster -> Original (Enter / right); left goes the other way.
-            const ALL: [&str; 3] = ["rtx", "remaster", "faithful"];
-            let i = ALL.iter().position(|&r| r == renderer_choice(settings)).unwrap_or(1);
-            settings.renderer = Some(ALL[(i as i32 + if dir < 0 { 2 } else { 1 }) as usize % 3].into());
-            settings.original_shaders = settings.renderer.as_deref() == Some("faithful");
-        }
         // Enter (dir 0) steps up and wraps to 0 past 100%.
         Opt::EngineVolume | Opt::RadioVolume => {
             let v = if matches!(o, Opt::EngineVolume) { &mut settings.engine_volume } else { &mut settings.radio_volume };
@@ -1690,49 +1680,11 @@ fn spawn_rows(p: &mut ChildSpawnerCommands, menu: &Menu, rows: &[Item], sel: usi
     }
 }
 
-/// The saved renderer choice: "rtx", "remaster" or "faithful".
-fn renderer_choice(settings: &Settings) -> &'static str {
-    match settings.renderer.as_deref() {
-        Some("rtx") => "rtx",
-        Some("faithful") => "faithful",
-        Some(_) => "remaster",
-        None if settings.original_shaders => "faithful",
-        None => "remaster",
-    }
-}
-
-/// The renderer this process runs (FH1_RENDERER / FH1_RTX as set at startup).
-fn running_renderer() -> &'static str {
-    if !fh1_remaster::enabled() {
-        "faithful"
-    } else if std::env::var("FH1_RTX").is_ok_and(|v| v == "1") {
-        "rtx"
-    } else {
-        "remaster"
-    }
-}
-
-/// Options "Renderer" value. The renderer is chosen at startup, so a change shows "(restart)" until then.
-fn renderer_value(settings: &Settings) -> String {
-    let choice = renderer_choice(settings);
-    let name = match choice {
-        "rtx" => "Remaster + RTX",
-        "faithful" => "Original",
-        _ => "Remaster",
-    };
-    if choice == running_renderer() { name.into() } else { format!("{name} (restart)") }
-}
-
-/// Startup: the renderer from settings.json `original_shaders`, unless FH1_RENDERER is set. Must run before any thread
+/// Startup: the game always runs the Remaster renderer (the Original and RTX choices are retired; settings.json
+/// `renderer` / `original_shaders` are ignored). `FH1_RENDERER` stays a developer override. Must run before any thread
 /// reads the variable (fh1_remaster::enabled, fh1_render::remaster).
-pub fn apply_renderer_setting(settings_path: &std::path::Path) {
-    if std::env::var_os("FH1_RENDERER").is_some() {
-        return;
-    }
-    let settings = std::fs::read(settings_path).ok().and_then(|b| serde_json::from_slice::<Settings>(&b).ok()).unwrap_or_default();
-    let choice = renderer_choice(&settings);
-    std::env::set_var("FH1_RENDERER", if choice == "faithful" { "faithful" } else { "remaster" });
-    if choice == "rtx" && std::env::var_os("FH1_RTX").is_none() {
-        std::env::set_var("FH1_RTX", "1");
+pub fn apply_renderer_setting(_settings_path: &std::path::Path) {
+    if std::env::var_os("FH1_RENDERER").is_none() {
+        std::env::set_var("FH1_RENDERER", "remaster");
     }
 }

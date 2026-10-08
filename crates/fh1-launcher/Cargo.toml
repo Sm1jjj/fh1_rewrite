@@ -18,3 +18,4 @@ zip = { version = "6", default-features = false, features = ["deflate-flate2-zli
 # Linux file dialogs through the desktop portal (no GTK to link); the path box works without one.
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+eframe = { version = "0.35", default-features = false, features = ["x11", "wayland"] }

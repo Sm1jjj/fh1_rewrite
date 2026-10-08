@@ -187,7 +187,9 @@ impl Plugin for GraphicsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GraphicsQuality>()
             .init_resource::<Scaled>()
-            .add_systems(Update, (sync_quality, sync_aa, sync_render_scale).chain());
+            // Render scale before AA: the blit camera it spawns must get the same Msaa as the other window cameras in
+            // its first frame (Bevy's default 4x on one camera of a shared target is a wgpu validation error).
+            .add_systems(Update, (sync_quality, sync_render_scale, sync_aa).chain());
         if std::env::var("FH1_TRANSP_CENSUS").map_or(true, |v| v != "0") {
             app.add_systems(Last, transp_census);
         }
@@ -205,13 +207,20 @@ fn sync_quality(settings: Res<Settings>, mut quality: ResMut<GraphicsQuality>) {
     }
 }
 
-/// Same Msaa on the main camera and every window camera; FXAA / SMAA on the main camera.
+/// Same Msaa on the main camera, every window camera and every camera drawing into the main camera's target (the HUD
+/// Camera2d draws into the main camera's offscreen image below 100 % render scale: differing sample counts on one
+/// target are a wgpu validation error); FXAA / SMAA on the main camera.
 #[allow(clippy::type_complexity)]
 fn sync_aa(mut commands: Commands, settings: Res<Settings>, mut cams: Query<(Entity, &RenderTarget, &mut Msaa, Has<FxPostCamera>, Has<BlitCamera>, Has<Fxaa>, Has<Smaa>)>) {
     let Some(aa) = aa_choice(&settings.graphics) else { return };
     let msaa = if aa == AntiAlias::Msaa4 { Msaa::Sample4 } else { Msaa::Off };
+    // The main camera's offscreen image (render scale < 100 %), if any.
+    let main_image = cams.iter().find(|c| c.3).and_then(|c| match c.1 {
+        RenderTarget::Image(i) => Some(i.handle.id()),
+        _ => None,
+    });
     for (e, target, mut m, main, blit, fxaa, smaa) in &mut cams {
-        if !(main || blit || matches!(target, RenderTarget::Window(_))) {
+        if !(main || blit || matches!(target, RenderTarget::Window(_)) || matches!(target, RenderTarget::Image(i) if Some(i.handle.id()) == main_image)) {
             continue;
         }
         m.set_if_neq(msaa);

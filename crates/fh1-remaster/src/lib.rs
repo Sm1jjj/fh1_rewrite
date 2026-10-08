@@ -20,8 +20,8 @@ pub mod static_world;
 pub mod views;
 pub mod wheel;
 
-/// The remaster renderer is on unless `FH1_RENDERER=faithful`. fh1-engine main.rs always sets the variable at startup
-/// (Options > Shaders, saved as settings.json `original_shaders`), so an unset variable only occurs in tools/tests.
+/// The remaster renderer is on unless `FH1_RENDERER=faithful` (a developer override). fh1-engine main.rs always sets
+/// the variable at startup, so an unset variable only occurs in tools/tests.
 pub fn enabled() -> bool {
     std::env::var("FH1_RENDERER").map(|v| v.eq_ignore_ascii_case("remaster")).unwrap_or(false)
 }
