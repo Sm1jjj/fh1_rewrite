@@ -2,8 +2,9 @@
 //! highlight, over one of FH1's loading backdrops (from the user's converted data, so nothing from the game ships
 //! with the launcher; before install, a painted dusk gradient stands in).
 //!
-//! Fonts come from Windows like the engine's UiFont (ui.rs): Segoe UI Black Italic for titles and menu items,
-//! Bahnschrift for body text. Neither is redistributed; egui's default font is the fallback.
+//! Fonts come from the system like the engine's UiFont (ui.rs): Segoe UI Black Italic for titles and menu items and
+//! Bahnschrift for body text on Windows, DejaVu / Liberation / Noto on Linux. None is redistributed; egui's default
+//! font is the last fallback.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,13 +31,39 @@ pub fn body(size: f32) -> FontId {
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let windir = std::env::var_os("WINDIR").map_or_else(|| std::path::PathBuf::from(r"C:\Windows"), std::path::PathBuf::from);
-    let font = |name: &str| std::fs::read(windir.join("Fonts").join(name)).ok();
+    // The first font file that exists: Windows' Fonts folder, else common Linux locations.
+    let font = |names: &[&str]| {
+        names.iter().find_map(|n| {
+            let p = std::path::Path::new(n);
+            let p = if p.is_absolute() { p.to_path_buf() } else { windir.join("Fonts").join(n) };
+            std::fs::read(p).ok()
+        })
+    };
+    let heavy_files = [
+        "seguibli.ttf",
+        "seguibl.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-BoldItalic.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-BlackItalic.ttf",
+        "/usr/share/fonts/noto/NotoSans-BlackItalic.ttf",
+    ];
+    let body_files = [
+        "bahnschrift.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    ];
     let mut heavy_family = Vec::new();
-    if let Some(b) = font("seguibli.ttf").or_else(|| font("seguibl.ttf")) {
+    if let Some(b) = font(&heavy_files) {
         fonts.font_data.insert("heavy".into(), Arc::new(egui::FontData::from_owned(b)));
         heavy_family.push("heavy".to_owned());
     }
-    if let Some(b) = font("bahnschrift.ttf") {
+    if let Some(b) = font(&body_files) {
         fonts.font_data.insert("body".into(), Arc::new(egui::FontData::from_owned(b)));
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "body".into());
     }

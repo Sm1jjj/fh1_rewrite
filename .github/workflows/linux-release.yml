@@ -1,0 +1,104 @@
+# Linux x64 build of the release (experimental): FH1Rewrite-<ver>-linux-x64.tar.gz, attached to the GitHub release.
+#
+# Triggers: a published release (attaches the archive to it), a manual run (optionally attaching to an existing tag),
+# and pushes to the `linux-ci` branch (build + test only, archive kept as a workflow artifact).
+#
+# Secret FH1_XEX_KEY (32 hex digits) is embedded into fh1setup at compile time, like tools/release.ps1 does on Windows.
+name: Linux release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the archive to (empty = build only)"
+        required: false
+  push:
+    branches: [linux-ci]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config clang libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        env:
+          FH1_XEX_KEY_EMBED: ${{ secrets.FH1_XEX_KEY }}
+        # No RTX on Linux (DLSS is Windows-only here): --no-default-features drops fh1-engine's `rtx`.
+        run: cargo build --release --locked --no-default-features -p fh1setup --features fh2,fm4 -p fh1-launcher -p fh1-engine
+
+      - name: Tests (formats paths, launcher)
+        run: cargo test --release --locked -p fh1-formats path:: && cargo test --release --locked -p fh1-launcher
+
+      - name: Package
+        id: pack
+        run: |
+          set -euo pipefail
+          VER=$(grep -m1 '^version' crates/fh1-launcher/Cargo.toml | cut -d'"' -f2)
+          OUT=dist/FH1Rewrite-$VER
+          mkdir -p "$OUT/bin" "$OUT/licenses"
+          cp target/release/fh1-launcher "$OUT/fh1-rewrite"
+          cp target/release/fh1-engine target/release/fh1setup "$OUT/bin/"
+
+          # extract-xiso (pinned XboxDev build, same release as the Windows one).
+          curl -sSfL -o /tmp/xiso.zip https://github.com/XboxDev/extract-xiso/releases/download/build-202505152050/extract-xiso_Linux.zip
+          echo "982bbfefc9255d51f5348a477d7135d68abf81c0af9600e5728edb1246cfa200  /tmp/xiso.zip" | sha256sum -c -
+          unzip -o -q /tmp/xiso.zip -d /tmp/xiso
+          cp /tmp/xiso/extract-xiso "$OUT/bin/"
+          cp /tmp/xiso/LICENSE.TXT "$OUT/licenses/extract-xiso-LICENSE.txt"
+
+          # ffmpeg (static GPL build by BtbN) for XMA audio decoding during setup.
+          curl -sSfL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          mkdir -p /tmp/ffmpeg && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1
+          cp /tmp/ffmpeg/bin/ffmpeg "$OUT/bin/"
+          cp /tmp/ffmpeg/LICENSE.txt "$OUT/licenses/ffmpeg-LICENSE.txt"
+          echo "ffmpeg static build by BtbN (https://github.com/BtbN/FFmpeg-Builds), GPL. Source: https://ffmpeg.org" > "$OUT/licenses/ffmpeg.txt"
+
+          cp LICENSE "$OUT/licenses/FH1-Rewrite-GPL-3.0.txt"
+          cat > "$OUT/README.txt" <<EOF
+          FH1 Rewrite $VER (Linux x64, EXPERIMENTAL)
+          ==========================================
+
+          An unofficial, clean reimplementation of Forza Horizon (Xbox 360, 2012). Not affiliated with Microsoft, Turn 10 or
+          Playground Games. No game files are included: you need your own Forza Horizon disc image.
+
+          The Linux build is experimental and untested: please report problems at https://github.com/Sm1jjj/fh1_rewrite/issues
+
+          1. Extract this folder anywhere with about 30 GB free.
+          2. Run ./fh1-rewrite (needs a desktop with Vulkan drivers, ALSA/PulseAudio/PipeWire audio, curl and tar).
+          3. Choose your Forza Horizon disc: the .iso, a .zip holding it, or the folder it is in. Click Install, then PLAY.
+          EOF
+          sed -i 's/^          //' "$OUT/README.txt"
+          chmod +x "$OUT/fh1-rewrite" "$OUT"/bin/*
+          tar -czf "dist/FH1Rewrite-$VER-linux-x64.tar.gz" -C dist "FH1Rewrite-$VER"
+          echo "archive=dist/FH1Rewrite-$VER-linux-x64.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to the release
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" "${{ steps.pack.outputs.archive }}" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Keep as a workflow artifact
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag == '')
+        uses: actions/upload-artifact@v4
+        with:
+          name: fh1rewrite-linux-x64
+          path: ${{ steps.pack.outputs.archive }}

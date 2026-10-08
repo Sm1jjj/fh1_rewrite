@@ -10,6 +10,7 @@ pub mod fxobj;
 pub mod granny;
 pub mod grass;
 pub mod props;
+pub mod path;
 pub mod pvs;
 pub mod pvsz;
 pub mod rmb;

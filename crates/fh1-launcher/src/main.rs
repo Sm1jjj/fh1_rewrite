@@ -16,7 +16,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{BufRead, BufReader};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -28,8 +27,24 @@ mod style;
 mod update;
 use serde::{Deserialize, Serialize};
 
-/// No console window for the child processes.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// `.exe` on Windows, nothing on Linux.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
+/// No console window for child processes (Windows); nothing to do elsewhere.
+pub(crate) fn hide_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
+/// Open a folder or web page with the desktop's default handler.
+pub(crate) fn open_external(target: impl AsRef<std::ffi::OsStr>) {
+    let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
+    let _ = Command::new(opener).arg(target).spawn();
+}
 /// The converted-data revision: bump ONLY when a release's setup output changes (a new fh1setup group version), so
 /// existing installs are offered an update. Game-only releases keep it, so nobody re-converts their disc for nothing.
 const RELEASE: &str = "0.1.0";
@@ -59,7 +74,7 @@ struct Paths {
 impl Paths {
     fn find() -> Self {
         let root = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| ".".into());
-        let bin = if root.join("bin/fh1setup.exe").is_file() { root.join("bin") } else { root.clone() };
+        let bin = if root.join(format!("bin/fh1setup{EXE}")).is_file() { root.join("bin") } else { root.clone() };
         let data = std::env::var_os("FH1_DATA").map(PathBuf::from).unwrap_or_else(|| root.join("data"));
         Paths { root, bin, data }
     }
@@ -224,8 +239,8 @@ impl Launcher {
         self.screen = Screen::Installing;
         let (tx, rx) = channel();
         self.rx = Some(rx);
-        let setup = self.paths.bin.join("fh1setup.exe");
-        let ffmpeg = self.paths.bin.join("ffmpeg.exe");
+        let setup = self.paths.bin.join(format!("fh1setup{EXE}"));
+        let ffmpeg = self.paths.bin.join(format!("ffmpeg{EXE}"));
         let (root, data, delete_work) = (self.paths.root.clone(), self.paths.data.clone(), self.delete_work);
         let (child, cancelled, ctx) = (self.child.clone(), self.cancelled.clone(), ctx.clone());
         std::thread::spawn(move || {
@@ -237,7 +252,7 @@ impl Launcher {
             for (i, step) in steps.iter().enumerate() {
                 send(Msg::Step(i));
                 let mut cmd = Command::new(&setup);
-                cmd.args(&step.args).current_dir(&root).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
+                hide_console(cmd.args(&step.args).current_dir(&root).stdout(Stdio::piped()).stderr(Stdio::piped()));
                 if ffmpeg.is_file() && std::env::var_os("FH1_FFMPEG").is_none() {
                     cmd.env("FH1_FFMPEG", &ffmpeg);
                 }
@@ -272,8 +287,8 @@ impl Launcher {
             self.status = Some(format!("Could not write {}", log_path.display()));
             return;
         };
-        let mut cmd = Command::new(self.paths.bin.join("fh1-engine.exe"));
-        cmd.arg("--data").arg(&self.paths.data).current_dir(&self.paths.root).creation_flags(CREATE_NO_WINDOW);
+        let mut cmd = Command::new(self.paths.bin.join(format!("fh1-engine{EXE}")));
+        hide_console(cmd.arg("--data").arg(&self.paths.data).current_dir(&self.paths.root));
         if std::env::var_os("FH1_WINDOW").is_none() {
             cmd.env("FH1_WINDOW", "borderless");
         }
@@ -352,7 +367,7 @@ impl Launcher {
                         self.start_update(ui.ctx());
                     }
                     if !rel.page.is_empty() && ui.link("What's new").clicked() {
-                        let _ = Command::new("explorer").arg(&rel.page).spawn();
+                        open_external(&rel.page);
                     }
                 });
                 if busy {
@@ -487,8 +502,8 @@ impl Launcher {
         if s.own_fm4 && !s.fm4_content.is_empty() && bad(&s.fm4_content) {
             return Some("The FM4 Content Install Disc path doesn't exist.");
         }
-        if !self.paths.bin.join("fh1setup.exe").is_file() {
-            return Some("fh1setup.exe is missing next to this program (bin\\). Re-extract the release.");
+        if !self.paths.bin.join(format!("fh1setup{EXE}")).is_file() {
+            return Some("fh1setup is missing from the bin folder next to this program. Re-extract the release.");
         }
         None
     }
@@ -556,7 +571,7 @@ impl Launcher {
             self.screen = Screen::Setup;
         }
         if style::menu_item(ui, "Data folder", 30.0, true, false).clicked() {
-            let _ = Command::new("explorer").arg(&self.paths.data).spawn();
+            open_external(&self.paths.data);
         }
         if style::menu_item(ui, "Quit", 30.0, true, false).clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

@@ -283,10 +283,18 @@ pub struct UiFont(pub Handle<Font>);
 
 impl FromWorld for UiFont {
     fn from_world(world: &mut World) -> Self {
-        // Bahnschrift (DIN-style, ships with Windows 10+) reads like a racing HUD. It is loaded from
-        // the user's system and never redistributed.
+        // Bahnschrift (DIN-style, ships with Windows 10+) reads like a racing HUD; on Linux a condensed system sans
+        // stands in. Loaded from the user's system and never redistributed.
         let windir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-        match std::fs::read(windir.join("Fonts").join("bahnschrift.ttf")) {
+        let candidates = [
+            windir.join("Fonts").join("bahnschrift.ttf"),
+            PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"),
+            PathBuf::from("/usr/share/fonts/TTF/DejaVuSansCondensed.ttf"),
+            PathBuf::from("/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Regular.ttf"),
+            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+            PathBuf::from("/usr/share/fonts/noto/NotoSans-Regular.ttf"),
+        ];
+        match candidates.iter().find_map(|p| std::fs::read(p).ok()).ok_or(()) {
             Ok(bytes) => UiFont(world.resource_mut::<Assets<Font>>().add(Font::from_bytes(bytes))),
             Err(_) => UiFont(Handle::default()),
         }

@@ -142,7 +142,7 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
     }
     let mut jobs: Vec<(Arc<Vec<u8>>, String, usize)> = Vec::new();
     for p in &banks {
-        let buf = Arc::new(std::fs::read(p).with_context(|| p.display().to_string())?);
+        let buf = Arc::new(std::fs::read(fh1_formats::path::resolve(p)).with_context(|| p.display().to_string())?);
         let samples = fsb::parse(&buf).with_context(|| p.display().to_string())?;
         let stem = bank_stem(&p.file_name().unwrap().to_string_lossy()).to_owned();
         std::fs::create_dir_all(out.join("banks").join(&stem))?;

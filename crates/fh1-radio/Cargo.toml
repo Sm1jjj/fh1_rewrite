@@ -8,6 +8,8 @@ description = "Forza Horizon (Xbox 360) in-game radio: station config, setup con
 
 [dependencies]
 anyhow = "1"
+# Case-insensitive disc paths (Linux).
+fh1-formats = { path = "../fh1-formats" }
 quick-xml = "0.42"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

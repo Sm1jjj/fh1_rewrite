@@ -204,7 +204,7 @@ pub fn unpad_mp3(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Copies one bank's samples to `out/<sub>/<name>.mp3` and returns its clip table.
 fn convert_bank(fsb: &Path, out: &Path, sub: &str) -> Result<Bank> {
-    let buf = std::fs::read(fsb).with_context(|| format!("read {}", fsb.display()))?;
+    let buf = std::fs::read(fh1_formats::path::resolve(fsb)).with_context(|| format!("read {}", fsb.display()))?;
     let lst = fsb.with_extension("lst");
     let names = parse_lst(&std::fs::read_to_string(&lst).with_context(|| format!("read {}", lst.display()))?);
     let samples = parse_bank(&buf)?;

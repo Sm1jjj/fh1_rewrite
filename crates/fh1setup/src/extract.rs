@@ -9,8 +9,18 @@ use std::process::Command;
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
 const XISO_URL: &str = "https://github.com/XboxDev/extract-xiso/releases/download/build-202505152050/extract-xiso-Win64_Release.zip";
+#[cfg(windows)]
 const XISO_SHA256: &str = "fec88d03c7efd6205ab09be4abba70c0afd0eb27a5709f0a6235b828ba5ac11e";
+#[cfg(not(windows))]
+const XISO_URL: &str = "https://github.com/XboxDev/extract-xiso/releases/download/build-202505152050/extract-xiso_Linux.zip";
+#[cfg(not(windows))]
+const XISO_SHA256: &str = "982bbfefc9255d51f5348a477d7135d68abf81c0af9600e5728edb1246cfa200";
+/// `extract-xiso.exe` on Windows, `extract-xiso` elsewhere.
+fn xiso_name() -> String {
+    format!("extract-xiso{}", std::env::consts::EXE_SUFFIX)
+}
 
 /// Files every supported disc must have.
 const REQUIRED: &[&str] = &["default.xex", "media/db/gamedb.slt", "media/cars"];
@@ -190,17 +200,17 @@ fn extract_xiso(dir: &Path) -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("FH1_EXTRACT_XISO") {
         return Ok(p.into());
     }
-    if let Some(p) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("extract-xiso.exe"))).filter(|p| p.is_file()) {
+    if let Some(p) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join(xiso_name()))).filter(|p| p.is_file()) {
         return Ok(p);
     }
-    let exe = dir.join("extract-xiso.exe");
+    let exe = dir.join(xiso_name());
     if exe.is_file() {
         return Ok(exe);
     }
     std::fs::create_dir_all(dir)?;
     let zip_path = dir.join("extract-xiso.zip");
     println!("downloading extract-xiso...");
-    let status = Command::new("curl")
+    let status = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" })
         .args(["-sSfL", "-o"])
         .arg(&zip_path)
         .arg(XISO_URL)
@@ -215,10 +225,15 @@ fn extract_xiso(dir: &Path) -> Result<PathBuf> {
     let entry = ar
         .entries
         .iter()
-        .find(|e| e.name.replace('\\', "/").ends_with("extract-xiso.exe"))
+        .find(|e| e.name.replace('\\', "/").ends_with(&xiso_name()))
         .cloned()
         .context("extract-xiso.exe not in release zip")?;
     std::fs::write(&exe, ar.read(&entry)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
+    }
     std::fs::remove_file(&zip_path)?;
     Ok(exe)
 }

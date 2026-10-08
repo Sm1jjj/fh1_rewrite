@@ -9,7 +9,6 @@
 //! `FH1_UPDATE=off` disables the check; `FH1_UPDATE_REPO=owner/name` points at another repository (testing).
 
 use std::io::Read;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -17,7 +16,9 @@ use std::sync::mpsc::Sender;
 use sha2::{Digest, Sha256};
 
 const REPO: &str = "Sm1jjj/fh1_rewrite";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// The release asset for this platform (tools/release.ps1 / the Linux workflow).
+const ASSET_SUFFIX: &str = if cfg!(windows) { "-win64.zip" } else { "-linux-x64.tar.gz" };
+const EXE: &str = std::env::consts::EXE_SUFFIX;
 
 #[derive(Clone, Debug)]
 pub struct Release {
@@ -47,8 +48,8 @@ pub fn enabled() -> bool {
 }
 
 fn curl() -> Command {
-    let mut c = Command::new("curl.exe");
-    c.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null());
+    let mut c = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
+    crate::hide_console(&mut c).stdin(Stdio::null());
     c
 }
 
@@ -78,7 +79,7 @@ pub fn check(current: &str) -> Option<Release> {
     if !force && !newer(tag, current) {
         return None;
     }
-    let asset = v["assets"].as_array()?.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with("-win64.zip")))?;
+    let asset = v["assets"].as_array()?.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(ASSET_SUFFIX)))?;
     Some(Release {
         version: tag.trim_start_matches('v').to_owned(),
         url: asset["browser_download_url"].as_str()?.to_owned(),
@@ -103,7 +104,7 @@ pub fn install(rel: &Release, root: &Path, data: &Path, tx: &Sender<UpdateMsg>, 
 fn install_inner(rel: &Release, root: &Path, data: &Path, progress: &dyn Fn(f32)) -> Result<(), String> {
     let dir = data.join("updates");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let zip_path = dir.join(format!("FH1Rewrite-{}-win64.zip", rel.version));
+    let zip_path = dir.join(format!("FH1Rewrite-{}{ASSET_SUFFIX}", rel.version));
     let _ = std::fs::remove_file(&zip_path);
 
     // Download (progress = bytes on disk / asset size, polled while curl runs).
@@ -147,27 +148,15 @@ fn install_inner(rel: &Release, root: &Path, data: &Path, progress: &dyn Fn(f32)
     }
     progress(0.92);
 
-    // Unpack to a staging folder first, so a broken zip never leaves half an install.
+    // Unpack to a staging folder first, so a broken archive never leaves half an install.
     let stage = dir.join(format!("stage-{}", rel.version));
     let _ = std::fs::remove_dir_all(&stage);
-    let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
-    let mut ar = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| format!("bad update zip: {e}"))?;
+    std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    unpack(&zip_path, &stage)?;
     let mut files = Vec::new();
-    for i in 0..ar.len() {
-        let mut e = ar.by_index(i).map_err(|e| e.to_string())?;
-        let name = e.name().replace('\\', "/");
-        // Strip the top folder (FH1Rewrite-<ver>/); skip anything that would escape the install.
-        let Some((_, rel_path)) = name.split_once('/') else { continue };
-        if rel_path.is_empty() || e.is_dir() || rel_path.split('/').any(|c| c == ".." || c.contains(':')) || rel_path.starts_with("data/") {
-            continue;
-        }
-        let dst = stage.join(rel_path);
-        std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
-        let mut out = std::fs::File::create(&dst).map_err(|e| e.to_string())?;
-        std::io::copy(&mut e, &mut out).map_err(|e| format!("unpacking {rel_path}: {e}"))?;
-        files.push(rel_path.to_owned());
-    }
-    if !files.iter().any(|f| f == LAUNCHER) || !files.iter().any(|f| f == "bin/fh1-engine.exe") {
+    walk(&stage, &stage, &mut files);
+    files.retain(|f| !f.starts_with("data/"));
+    if !files.iter().any(|f| f == LAUNCHER) || !files.iter().any(|f| *f == format!("bin/fh1-engine{EXE}")) {
         return Err("the update zip doesn't look like an FH1 Rewrite release".into());
     }
     progress(0.96);
@@ -197,8 +186,57 @@ fn install_inner(rel: &Release, root: &Path, data: &Path, progress: &dyn Fn(f32)
     Ok(())
 }
 
-/// The launcher's name in the release zip (and next to `bin\`).
-pub const LAUNCHER: &str = "FH1 Rewrite.exe";
+/// The launcher's name in the release archive (and next to `bin`).
+pub const LAUNCHER: &str = if cfg!(windows) { "FH1 Rewrite.exe" } else { "fh1-rewrite" };
+
+/// Unpack the release archive into `stage`, dropping its top folder (`FH1Rewrite-<ver>/`).
+#[cfg(windows)]
+fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut ar = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| format!("bad update zip: {e}"))?;
+    for i in 0..ar.len() {
+        let mut e = ar.by_index(i).map_err(|e| e.to_string())?;
+        let name = e.name().replace('\\', "/");
+        let Some((_, rel_path)) = name.split_once('/') else { continue };
+        // Skip directories and anything that would escape the install.
+        if rel_path.is_empty() || e.is_dir() || rel_path.split('/').any(|c| c == ".." || c.contains(':')) {
+            continue;
+        }
+        let dst = stage.join(rel_path);
+        std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
+        let mut out = std::fs::File::create(&dst).map_err(|e| e.to_string())?;
+        std::io::copy(&mut e, &mut out).map_err(|e| format!("unpacking {rel_path}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Unpack the release archive into `stage` with the system `tar` (keeps the executable bits).
+#[cfg(not(windows))]
+fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
+    let ok = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(stage)
+        .arg("--strip-components=1")
+        .arg("--no-same-owner")
+        .status()
+        .map_err(|e| format!("could not run tar: {e}"))?
+        .success();
+    if ok { Ok(()) } else { Err("bad update archive".into()) }
+}
+
+/// Every file under `dir`, as `/`-separated paths relative to `base`.
+fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk(base, &p, out);
+        } else if let Ok(rel) = p.strip_prefix(base) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
 
 fn old_name(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();

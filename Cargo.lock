@@ -3031,6 +3031,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "fh1-audio",
+ "fh1-formats",
  "quick-xml 0.42.0",
  "serde",
  "serde_json",

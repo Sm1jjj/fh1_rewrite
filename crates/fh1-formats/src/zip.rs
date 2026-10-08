@@ -41,7 +41,7 @@ pub struct Archive<R> {
 
 impl Archive<File> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::new(File::open(path)?)
+        Self::new(File::open(crate::path::resolve(path.as_ref()))?)
     }
 }
 
