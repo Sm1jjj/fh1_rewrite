@@ -33,7 +33,8 @@ use crate::race::Events;
 use crate::Car;
 
 const MPH: f32 = 0.44704;
-/// GlobalRegistry UI/RaceFeats/Animation/FadeOut_Duration (VERIFIED value; its use as the bank delay is INFERRED).
+/// GlobalRegistry UI/RaceFeats/Animation/FadeOut_Duration: VERIFIED as how long a chained skill stays on the HUD
+/// (xex 827E87B8); that the chain banks at the same moment is INFERRED (docs/PROGRESSION.md).
 const CHAIN_WINDOW_S: f32 = 3.0;
 /// UI/RaceFeats/Animation/Count_Up_Duration: the shown total runs up to the chain total over this long.
 const COUNT_UP_S: f32 = 1.6;

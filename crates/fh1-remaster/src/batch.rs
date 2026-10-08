@@ -341,7 +341,8 @@ pub fn plugin(app: &mut App) {
 }
 
 /// Transparent-pass census (2026-10-08 perf: main transparent pass 1.19 ms in the user's log, contents unknown): every
-/// ~5 s with `FH1_PERF_REC=1` or `FH1_RM_PHASE_STATS=1`, logs per view the `Transparent3d` items grouped by their
+/// ~5 s with `FH1_RM_PHASE_STATS=1` (no longer with `FH1_PERF_REC=1`: in user log 20261008_125629 one run froze the
+/// render thread for 34.6 s inside PhaseSort), logs per view the `Transparent3d` items grouped by their
 /// pipeline's fragment shader (embedded path for custom materials, handle id otherwise; the remaster scenery shader is
 /// named). Transparent items are drawn one by one after a per-frame sort, so this is where draws hide.
 fn phase_stats(
@@ -350,7 +351,7 @@ fn phase_stats(
     mut frame: Local<u32>,
 ) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| ["FH1_PERF_REC", "FH1_RM_PHASE_STATS"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "1"))) {
+    if !*ON.get_or_init(|| std::env::var("FH1_RM_PHASE_STATS").is_ok_and(|v| v == "1")) {
         return;
     }
     *frame = frame.wrapping_add(1);
