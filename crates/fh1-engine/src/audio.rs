@@ -180,7 +180,7 @@ fn feed_audio(
         shifts: v.shift_count,
         speed: v.speed(),
         boost,
-        has_turbo: v.data.boost.is_some(),
+        has_turbo: v.data.boost.is_some_and(|b| !b.supercharger),
         wheels,
         rpm_limit: rpm_limit(&v.data),
         view: match rig.mode {
@@ -345,7 +345,7 @@ fn feed_other_cars(
             shifts: v.shift_count,
             speed: v.speed(),
             boost,
-            has_turbo: v.data.boost.is_some(),
+            has_turbo: v.data.boost.is_some_and(|b| !b.supercharger),
             view: View::Follow,
             rpm_limit: rpm_limit(&v.data),
             volume: master,

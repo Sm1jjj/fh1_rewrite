@@ -417,13 +417,21 @@ pub struct Boost {
     pub dropoff_scale: [f32; 2],
     /// Spool-up time constant (s). STOPGAP: MomentInertia / 30 (parity barely changes from /100 to /15).
     pub spool_time: f32,
+    /// Supercharger (CSC / DSC): `min_scale` / `max_scale` are the ZeroRPMScale / RedlineRPMScale factors, lerped by
+    /// rpm / `redline_rpm` (INFERRED input; the game's 82D230B8 SC factor input isn't re-derived) instead of by power.
+    pub supercharger: bool,
+    pub redline_rpm: f32,
 }
 
 impl Boost {
     /// Target torque multiplier for `torque` N·m at `rpm` (unboosted).
     pub fn target(&self, torque: f32, rpm: f32) -> f32 {
-        let hp = torque * rpm * std::f32::consts::TAU / 60.0 / 745.7;
-        let x = ((hp - self.power_min_hp) / (self.power_max_hp - self.power_min_hp)).clamp(0.0, 1.0);
+        let x = if self.supercharger {
+            (rpm / self.redline_rpm.max(1.0)).clamp(0.0, 1.0)
+        } else {
+            let hp = torque * rpm * std::f32::consts::TAU / 60.0 / 745.7;
+            ((hp - self.power_min_hp) / (self.power_max_hp - self.power_min_hp)).clamp(0.0, 1.0)
+        };
         self.min_scale + (self.max_scale - self.min_scale) * x
     }
 
@@ -567,6 +575,125 @@ fn f(v: &Value, key: &str) -> Result<f32> {
     v[key].as_f64().map(|x| x as f32).with_context(|| format!("missing number {key}"))
 }
 
+/// The game's part rules (docs/CUSTOMIZE.md "Upgrade rules (VERIFIED from default.xex)", 82BF4FB0 / 82D26650): every
+/// fitted row of `stock_parts` used with its absolute values: MassDiff / WeightDistDiff summed, DragScale multiplied,
+/// TorqueScale additive (S = 1 + sum(x - 1)), one aspiration (turbo > CSC > DSC > manifold), intercooler added to the
+/// boost maximum, tyre width / rim size keeping the stock outer diameter. `FH1_UPG_RULES=0` = the old reading (the
+/// Weight row's mass only, no S; customize_upgrades.rs then applies its INFERRED ratios instead).
+pub fn upgrade_rules_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_UPG_RULES").map_or(true, |v| v != "0"))
+}
+
+/// The fitted boost system's RobScale lowers S (stock turbo / SC cars: S = 0.89-0.94 in the game). `FH1_ROBSCALE=0` =
+/// ignore it (before 2026-10-08).
+fn robscale_on() -> bool {
+    std::env::var("FH1_ROBSCALE").map_or(true, |v| v != "0")
+}
+
+/// Superchargers (CSC / DSC rows) boost the engine (they were ignored before 2026-10-08). `FH1_SC_BOOST=0` = off.
+fn sc_boost_on() -> bool {
+    std::env::var("FH1_SC_BOOST").map_or(true, |v| v != "0")
+}
+
+/// The front bumper / rear wing aero elements (82BEE128 -> 82BEAC90, physics.json `aero.front_bumper` / `aero.rear_wing`,
+/// the fitted bumper / wing row's List_AeroPhysics): drag = lerp(Drag0, Drag1, slider), downforce = lerp(Downforce0,
+/// Downforce1, slider) at the tuning slider (DefaultTuneSlider until tuning exists). Units INFERRED as the body aero's
+/// (kgf at 150 mph, 82D33188); LateralDrag, AngleZeroDownforce and the DFTorqueScale tables (82D27EF0) are not modelled.
+/// Not scaled by the parts' DragScale. Returns (drag, front downforce, rear downforce) in kgf at 150 mph.
+/// `FH1_AERO_ELEMENTS=0` = ignored (before 2026-10-08: stock winged cars had no wing downforce either).
+fn aero_elements(p: &Value) -> (f32, f32, f32) {
+    if std::env::var("FH1_AERO_ELEMENTS").is_ok_and(|v| v == "0") {
+        return (0.0, 0.0, 0.0);
+    }
+    let el = |v: &Value| -> (f32, f32) {
+        let g = |k: &str| v[k].as_f64().unwrap_or(0.0) as f32;
+        let s = v["DefaultTuneSlider"].as_f64().unwrap_or(0.5) as f32;
+        (g("Drag0") + (g("Drag1") - g("Drag0")) * s, (g("Downforce0") + (g("Downforce1") - g("Downforce0")) * s).max(0.0))
+    };
+    let (df, ff) = el(&p["aero"]["front_bumper"]);
+    let (dr, fr) = el(&p["aero"]["rear_wing"]);
+    (df + dr, ff, fr)
+}
+
+/// Aspiration tables in the game's priority order (82BF4FB0): only the first fitted one is kept.
+pub const ASPIRATION: [&str; 6] = [
+    "List_UpgradeEngineTurboSingle",
+    "List_UpgradeEngineTurboTwin",
+    "List_UpgradeEngineTurboQuad",
+    "List_UpgradeEngineCSC",
+    "List_UpgradeEngineDSC",
+    "List_UpgradeEngineManifold",
+];
+
+/// Engine parts whose TorqueScale adds into S (82BEBE40 / 82BEC0C0 / 82BEC1A0, Valves in the camshaft block).
+const TORQUE_PARTS: [&str; 10] = [
+    "List_UpgradeEngineIntake",
+    "List_UpgradeEngineFuelSystem",
+    "List_UpgradeEngineIgnition",
+    "List_UpgradeEngineExhaust",
+    "List_UpgradeEngineValves",
+    "List_UpgradeEngineDisplacement",
+    "List_UpgradeEnginePistonsCompression",
+    "List_UpgradeEngineManifold",
+    "List_UpgradeEngineRestrictorPlate",
+    "List_UpgradeEngineOilCooling",
+];
+
+/// Drops every aspiration row but the first fitted one (the game's record does the same).
+pub fn keep_one_aspiration(parts: &mut Value) {
+    let Some(o) = parts.as_object_mut() else { return };
+    let Some(keep) = ASPIRATION.iter().find(|t| o.contains_key(**t)) else { return };
+    o.retain(|k, _| k == keep || !ASPIRATION.contains(&k.as_str()));
+}
+
+/// Tyre width / rim size rows into the car's tyre columns, the aspect recomputed so the outer diameter stays the
+/// stock one (82BF0B60 / 82D12768): width only changes grip (TireFricScale(width)) and the sidewall, never the radius.
+fn fit_tyre_sizes(p: &mut Value) {
+    for (end, width_t, width_k, rim_t, rim_k) in [
+        ("Front", "List_UpgradeCarBodyTireWidthFront", "FrontTireWidth", "List_UpgradeRimSizeFront", "FrontWheelDiameter"),
+        ("Rear", "List_UpgradeCarBodyTireWidthRear", "RearTireWidth", "List_UpgradeRimSizeRear", "RearWheelDiameter"),
+    ] {
+        let car = &p["car"];
+        let (Some(w0), Some(a0), Some(d0)) = (
+            car[format!("{end}TireWidthMM")].as_f64(),
+            car[format!("{end}TireAspect")].as_f64(),
+            car[format!("{end}WheelDiameterIN")].as_f64(),
+        ) else {
+            continue;
+        };
+        let w = p["stock_parts"][width_t][width_k].as_f64().filter(|&x| x > 50.0).unwrap_or(w0);
+        let d = p["stock_parts"][rim_t][rim_k].as_f64().filter(|&x| x > 8.0).unwrap_or(d0);
+        if (w - w0).abs() < 1e-6 && (d - d0).abs() < 1e-6 {
+            continue;
+        }
+        let radius = 0.001 * w0 * 0.01 * a0 + 0.0127 * d0;
+        let aspect = (100.0 * (radius - 0.0127 * d) / (0.001 * w)).max(5.0);
+        p["car"][format!("{end}TireWidthMM")] = serde_json::json!(w);
+        p["car"][format!("{end}TireAspect")] = serde_json::json!(aspect);
+        p["car"][format!("{end}WheelDiameterIN")] = serde_json::json!(d);
+    }
+}
+
+/// Sums over the fitted parts: (MassDiff sum, WeightDistDiff sum, DragScale product, S, intercooler MaxScaleScale).
+fn part_sums(parts: &Value) -> (f32, f32, f32, f32, f32) {
+    let Some(o) = parts.as_object() else { return (0.0, 0.0, 1.0, 1.0, 1.0) };
+    let kept = ASPIRATION.iter().find(|t| o.contains_key(**t)).copied();
+    let fitted = || o.iter().filter(|(k, _)| !ASPIRATION.contains(&k.as_str()) || Some(k.as_str()) == kept).map(|(k, v)| (k.as_str(), v));
+    let num = |v: &Value, k: &str| v[k].as_f64().map(|x| x as f32);
+    let mass: f32 = fitted().filter_map(|(_, r)| num(r, "MassDiff")).sum();
+    let dist: f32 = fitted().filter_map(|(_, r)| num(r, "WeightDistDiff")).sum();
+    let drag: f32 = fitted().filter_map(|(_, r)| num(r, "DragScale")).product();
+    let mut s = 1.0 + fitted().filter(|(k, _)| TORQUE_PARTS.contains(k)).filter_map(|(_, r)| num(r, "TorqueScale")).map(|x| x - 1.0).sum::<f32>();
+    if robscale_on() {
+        if let Some(r) = kept.filter(|k| *k != "List_UpgradeEngineManifold").and_then(|k| num(&o[k], "RobScale")) {
+            s += r - 1.0;
+        }
+    }
+    let ics = num(&parts["List_UpgradeEngineIntercooler"], "MaxScaleScale").filter(|x| (x - 1.0).abs() >= 0.001).unwrap_or(1.0);
+    (mass, dist, drag, s.max(0.1), ics)
+}
+
 impl CarData {
     pub fn load(car_dir: &Path) -> Result<Self> {
         Self::load_with(car_dir, |_| {})
@@ -577,6 +704,13 @@ impl CarData {
     pub fn load_with(car_dir: &Path, patch: impl FnOnce(&mut Value)) -> Result<Self> {
         let mut p: Value = serde_json::from_slice(&std::fs::read(car_dir.join("physics.json"))?)?;
         patch(&mut p);
+        let rules = upgrade_rules_on();
+        if rules {
+            keep_one_aspiration(&mut p["stock_parts"]);
+            fit_tyre_sizes(&mut p);
+        }
+        let (mass_diff, dist_diff, drag_scale, engine_s, ics) = if rules { part_sums(&p["stock_parts"]) } else { (0.0, 0.0, 1.0, 1.0, 1.0) };
+        let (aero_drag, aero_front, aero_rear) = aero_elements(&p);
         let m: Value = serde_json::from_slice(&std::fs::read(car_dir.join("model.json"))?)?;
         let car = &p["car"];
         let parts = &p["stock_parts"];
@@ -622,8 +756,8 @@ impl CarData {
         // (+-1.6% on that car): the writer of wheel+0x3B0 and the game's own rule are not located (UNVERIFIED rule).
         let mut suspension = [susp("front", "anti_sway_front")?, susp("rear", "anti_sway_rear")?];
         {
-            let share = f(weight, "CMBackFront")?;
-            let mass = f(weight, "Mass")?;
+            let share = (f(weight, "CMBackFront")? + dist_diff).clamp(0.01, 0.99);
+            let mass = f(weight, "Mass")? + mass_diff;
             for (axle, end) in ["Front", "Rear"].iter().enumerate() {
                 let sidewall = f(car, &format!("{end}TireWidthMM"))? * 0.001 * f(car, &format!("{end}TireAspect"))? * 0.01;
                 let corner = mass * if axle == 0 { share } else { 1.0 - share } * 0.5 + UNSPRUNG_KG;
@@ -632,21 +766,38 @@ impl CarData {
             }
         }
 
+        // Boost (82BEC330 turbo, 82BEC6F0 CSC / DSC, 82BEC9D0 intercooler; docs/CUSTOMIZE.md "Upgrade rules"): factors on
+        // top of S, so full boost gives curve x (S + MaxScale - 1 + MaxScaleScale - 1): max' = (MaxScale - 1 + ICS - 1 + S) / S,
+        // min' = (MinScale - 1 + S) / S; superchargers the same with RedlineRPMScale / ZeroRPMScale. A row within 0.001 of 1
+        // is no boost. Old reading (`FH1_UPG_RULES=0`): turbo rows only, factors as stored.
+        let redline_for_sc = f(cam, "RedlineRPM").unwrap_or(6000.0);
         let boost = ["List_UpgradeEngineTurboSingle", "List_UpgradeEngineTurboTwin", "List_UpgradeEngineTurboQuad", "List_UpgradeEngineCSC", "List_UpgradeEngineDSC"]
             .iter()
-            .find_map(|t| parts.get(*t).filter(|v| v.get("MaxScale").is_some()))
-            .map(|t| -> Result<Boost> {
+            .find_map(|t| {
+                let v = parts.get(*t)?;
+                let turbo = v.get("MaxScale").is_some();
+                let sc = rules && sc_boost_on() && v.get("RedlineRPMScale").is_some();
+                (turbo || sc).then_some((v, sc && !turbo))
+            })
+            .map(|(t, sc)| -> Result<Boost> {
+                let (lo, hi) = if sc { (f(t, "ZeroRPMScale")?, f(t, "RedlineRPMScale")?) } else { (f(t, "MinScale")?, f(t, "MaxScale")?) };
+                let (lo, hi) = if rules { ((lo - 1.0 + engine_s) / engine_s, (hi - 1.0 + ics - 1.0 + engine_s) / engine_s) } else { (lo, hi) };
                 Ok(Boost {
-                    min_scale: f(t, "MinScale")?,
-                    max_scale: f(t, "MaxScale")?,
-                    power_min_hp: f(t, "PowerMinScale")?,
-                    power_max_hp: f(t, "PowerMaxScale")?,
+                    min_scale: lo,
+                    max_scale: hi,
+                    power_min_hp: f(t, "PowerMinScale").unwrap_or(0.0),
+                    power_max_hp: f(t, "PowerMaxScale").unwrap_or(1.0),
                     dropoff_rpm: [f(t, "TorqueDropOffRPM0").unwrap_or(1e6), f(t, "TorqueDropOffRPM1").unwrap_or(2e6)],
                     dropoff_scale: [f(t, "TorqueDropOffScale0").unwrap_or(1.0), f(t, "TorqueDropOffScale1").unwrap_or(1.0)],
-                    spool_time: f(t, "MomentInertia").unwrap_or(30.0) / 30.0,
+                    // A supercharger is belt-driven: no spool (INFERRED).
+                    spool_time: if sc { 0.05 } else { f(t, "MomentInertia").unwrap_or(30.0) / 30.0 },
+                    supercharger: sc,
+                    redline_rpm: redline_for_sc,
                 })
             })
-            .transpose()?;
+            .transpose()?
+            // A row within 0.001 of 1 adds no boost (82BEC330 / 82BEC6F0).
+            .filter(|b| !rules || (b.max_scale - 1.0).abs() >= 0.001 || (b.min_scale - 1.0).abs() >= 0.001);
         let tc = &p["torque_curve"];
         let n_gears = trans["NumGears"].as_i64().unwrap_or(6) as usize;
         let gears: Vec<f32> = (1..n_gears)
@@ -670,9 +821,9 @@ impl CarData {
             media_name: car["MediaName"].as_str().unwrap_or("?").to_owned(),
             sound: p["sound_donor"].as_str().or(car["MediaName"].as_str()).unwrap_or("?").to_owned(),
             display_year: car["Year"].as_i64().unwrap_or(0),
-            mass: f(weight, "Mass")?,
+            mass: f(weight, "Mass")? + mass_diff,
             cg_height: f(weight, "CMHeight")?,
-            front_weight: f(weight, "CMBackFront")?,
+            front_weight: if rules { (f(weight, "CMBackFront")? + dist_diff).clamp(0.01, 0.99) } else { f(weight, "CMBackFront")? },
             block_dims: [f(weight, "BlockDimX")?, f(weight, "BlockDimY")?, f(weight, "BlockDimZ")?],
             hubs,
             wheel_radius_visual: m["wheel_radius"].as_f64().unwrap_or(0.33) as f32,
@@ -692,7 +843,9 @@ impl CarData {
             suspension,
             torque_curve: tc["samples"].as_array().context("torque samples")?.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect(),
             // default.xex 82BF4FB0 scales by Data_Car.GameTorqueScale clamped to [0.5, 1.5] (docs/PHYSICS_PARITY.md).
-            torque_scale: f(tc, "torque_scale_nm")? * f(car, "GameTorqueScale").unwrap_or(1.0).clamp(0.5, 1.5),
+            // x S, the engine parts' additive TorqueScale (positive full-throttle torque only; the zero-throttle drag below
+            // is not scaled, 82D22D58).
+            torque_scale: f(tc, "torque_scale_nm")? * f(car, "GameTorqueScale").unwrap_or(1.0).clamp(0.5, 1.5) * engine_s,
             zero_throttle_nm: f(tc, "zero_throttle_nm").unwrap_or_else(|_| 0.46 * f(tc, "torque_scale_nm").unwrap_or(300.0))
                 * f(car, "GameTorqueScale").unwrap_or(1.0).clamp(0.5, 1.5),
             peak_power_rpm: f(car, "SimPeakAngVel").map(|w| w * 60.0 / std::f32::consts::TAU).unwrap_or(0.0),
@@ -720,10 +873,12 @@ impl CarData {
             tyre: TyreColumns::from_json(&p, &lateral),
             lateral,
             longitudinal: FrictionCurve::from_json(&p["tires"]["friction_longitudinal"])?,
-            drag_k: f(car, "BodyAeroLongitudinalDrag")? * KGF_AT_150MPH * f(car, "GameDragScale").unwrap_or(1.0).clamp(0.5, 1.5),
+            // x the fitted parts' DragScale product (82D33188 aero +0x80).
+            drag_k: f(car, "BodyAeroLongitudinalDrag")? * KGF_AT_150MPH * f(car, "GameDragScale").unwrap_or(1.0).clamp(0.5, 1.5) * drag_scale
+                + aero_drag * KGF_AT_150MPH,
             downforce_k: [
-                f(car, "BodyAeroForwardDownforceFront")?.max(0.0) * KGF_AT_150MPH,
-                f(car, "BodyAeroForwardDownforceRear")?.max(0.0) * KGF_AT_150MPH,
+                (f(car, "BodyAeroForwardDownforceFront")?.max(0.0) + aero_front) * KGF_AT_150MPH,
+                (f(car, "BodyAeroForwardDownforceRear")?.max(0.0) + aero_rear) * KGF_AT_150MPH,
             ],
             reference_0_60_s: f(car, "SimTimeTo60MPH").unwrap_or(0.0),
             reference_top_speed: top_speed,
