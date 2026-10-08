@@ -212,6 +212,9 @@ struct ProbeState {
     next_face: u8,
     faces_since_bake: u32,
     face_ev: Option<f32>,
+    /// Parked rest: seconds stood still, faces left in a rest refresh cycle.
+    rest_t: f32,
+    rest_cycle: u8,
 }
 
 /// Crossfade time (s); 0 = instant swap (before 2026-10-08).
@@ -251,14 +254,22 @@ pub fn probe_min_radius() -> f32 {
 
 /// Face size cap of the even cadence (FH1_RM_PROBE_EVEN_RES, 128): the quality preset's probe_res, at most this.
 fn even_res_cap() -> u32 {
-    std::env::var("FH1_RM_PROBE_EVEN_RES").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(128).next_power_of_two().clamp(32, 512)
+    std::env::var("FH1_RM_PROBE_EVEN_RES").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(64).next_power_of_two().clamp(32, 512)
 }
 
 /// FH1_RM_PROBE_EVEN=1 = one face every frame (module doc "Even cadence"). OPT-IN since 2026-10-08 pm: log 140912 fps 67 -> 56
 /// (a second 3D view every frame); default = the capture bursts.
 fn even_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // P11 (2026-10-08 late): lean content, 64 px faces and the parked rest make the per-frame face small and steady (the
+    // bursts' alternating heavy frames + camera-wake re-specialisation were the micro-stutter at speed). Still OPT-IN
+    // (FH1_RM_PROBE_EVEN=1) until a user log measures its steady cost (the user reverted the 128 px version for fps).
     *V.get_or_init(|| std::env::var("FH1_RM_PROBE_EVEN").is_ok_and(|v| v == "1"))
+}
+
+/// FH1_RM_PROBE_REST=0: the even cadence keeps rendering faces while parked.
+fn rest_on() -> bool {
+    std::env::var("FH1_RM_PROBE_REST").map_or(true, |v| v != "0")
 }
 
 fn face_spread() -> u32 {
@@ -627,6 +638,25 @@ fn drive(
             layers.set_if_neq(idle.clone());
             return;
         }
+        // Parked rest: once the cube is complete and the car has stood for 2 s, no faces (the camera stays awake on the empty
+        // layer, so resuming doesn't re-specialise); one 6-face refresh every FH1_RM_PROBE_REST_REFRESH s (10) for the
+        // time of day. FH1_RM_PROBE_REST=0 = faces every frame while parked too.
+        if speed.1 < 0.5 {
+            state.rest_t += dt;
+        } else {
+            state.rest_t = 0.0;
+            state.rest_cycle = 0;
+        }
+        if rest_on() && state.rest_t > 2.0 && state.faces_since_bake >= 6 && state.rest_cycle == 0 {
+            if state.rest_t < env_f32("FH1_RM_PROBE_REST_REFRESH", 10.0).max(2.5) {
+                f.set_if_neq(CarProbeFace(NO_FACE));
+                layers.set_if_neq(idle.clone());
+                return;
+            }
+            state.rest_t = 2.0;
+            state.rest_cycle = 6;
+        }
+        state.rest_cycle = state.rest_cycle.saturating_sub(1);
         if state.face_ev.is_none_or(|e| (e - ev100).abs() > 0.05) {
             state.face_ev = Some(ev100);
             commands.entity(face_e).insert(bevy::camera::Exposure { ev100 });
@@ -636,7 +666,7 @@ fn drive(
         state.faces_since_bake += 1;
         let (fwd, up) = face_basis(k);
         if let Projection::Perspective(p) = &mut *proj {
-            let far = if k == 3 { env_f32("FH1_RM_CAR_PROBE_DOWN_FAR", 8.0) } else { env_f32("FH1_RM_CAR_PROBE_FAR", 100.0) };
+            let far = if k == 3 { env_f32("FH1_RM_CAR_PROBE_DOWN_FAR", 8.0) } else { env_f32("FH1_RM_CAR_PROBE_FAR", 80.0) };
             if p.far != far {
                 p.far = far;
             }

@@ -188,6 +188,9 @@ impl Plugin for GraphicsPlugin {
         app.init_resource::<GraphicsQuality>()
             .init_resource::<Scaled>()
             .add_systems(Update, (sync_quality, sync_aa, sync_render_scale).chain());
+        if std::env::var("FH1_TRANSP_CENSUS").map_or(true, |v| v != "0") {
+            app.add_systems(Last, transp_census);
+        }
         if std::env::var("FH1_OCCLUSION").is_ok_and(|v| v == "1") && !rtx() {
             app.add_systems(Update, occlusion_culling);
         }
@@ -352,4 +355,69 @@ fn occlusion_culling(mut commands: Commands, cams: Query<Entity, (With<FxPostCam
         commands.entity(e).insert((bevy::core_pipeline::prepass::DepthPrepass, bevy::render::occlusion_culling::OcclusionCulling));
         info!("graphics: GPU occlusion culling on the main camera");
     }
+}
+
+/// Transparent-pass census (P8, 2026-10-08): the main transparent pass costs 1-2 ms of render-thread encode with
+/// ~215-355 sorted, one-by-one draws per frame (user log 20261008_140912), contents unknown. Every 300 frames this logs
+/// the blended entities visible in any view, by kind, so the next gameplay log attributes them (`grep "transp census"`).
+/// Main world only (the render-world phase census, fh1-remaster batch.rs FH1_RM_PHASE_STATS, froze one run).
+/// Counts include entities without CPU culling (always "visible") and shadow-view visibility, so they are upper bounds.
+/// `FH1_TRANSP_CENSUS=0` = off.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn transp_census(
+    mut frame: Local<u32>,
+    standard: Query<(&ViewVisibility, &MeshMaterial3d<StandardMaterial>, Has<bevy::gltf::GltfMaterialName>)>,
+    scenery: Query<(&ViewVisibility, &MeshMaterial3d<fh1_remaster::material::RemasterMaterial>)>,
+    glows: Query<&ViewVisibility, With<MeshMaterial3d<fh1_render::glow::GlowMaterial>>>,
+    particles: Query<&ViewVisibility, With<MeshMaterial3d<fh1_render::particles::ParticleMaterial>>>,
+    drops: Query<&ViewVisibility, With<MeshMaterial3d<fh1_render::car_shadow::drop_shadow::DropShadowMaterial>>>,
+    (smoke, markers, flames, fx): (
+        Query<&ViewVisibility, With<MeshMaterial3d<crate::smoke::SmokeMaterial>>>,
+        Query<&ViewVisibility, With<MeshMaterial3d<crate::race::visuals::MarkerMaterial>>>,
+        Query<&ViewVisibility, With<MeshMaterial3d<crate::backfire::FlameMaterial>>>,
+        Query<&ViewVisibility, With<MeshMaterial3d<fh1_render::material::FxMaterial>>>,
+    ),
+    std_assets: Res<Assets<StandardMaterial>>,
+    rm_assets: Res<Assets<fh1_remaster::material::RemasterMaterial>>,
+) {
+    *frame = frame.wrapping_add(1);
+    if *frame % 300 != 0 {
+        return;
+    }
+    let blended = |a: AlphaMode| matches!(a, AlphaMode::Blend | AlphaMode::Premultiplied | AlphaMode::Add | AlphaMode::Multiply);
+    let (mut car, mut other_std) = (0u32, 0u32);
+    for (v, m, gltf) in &standard {
+        if v.get() && std_assets.get(&m.0).is_some_and(|m| blended(m.alpha_mode)) {
+            if gltf {
+                car += 1;
+            } else {
+                other_std += 1;
+            }
+        }
+    }
+    let (mut sc_blend, mut sc_add) = (0u32, 0u32);
+    for (v, m) in &scenery {
+        if !v.get() {
+            continue;
+        }
+        match rm_assets.get(&m.0).map(|m| m.base.alpha_mode) {
+            Some(AlphaMode::Add) => sc_add += 1,
+            Some(a) if blended(a) => sc_blend += 1,
+            _ => {}
+        }
+    }
+    info!(
+        "transp census: scenery blend {sc_blend} add {sc_add} | car glTF parts {car} | other standard {other_std} | glows {} particles {} smoke {} drop shadows {} markers {} flames {} | FxMaterial (all, faithful / sky / anim) {}",
+        visible(&glows),
+        visible(&particles),
+        visible(&smoke),
+        visible(&drops),
+        visible(&markers),
+        visible(&flames),
+        visible(&fx)
+    );
+}
+
+fn visible<F: bevy::ecs::query::QueryFilter>(q: &Query<&ViewVisibility, F>) -> u32 {
+    q.iter().filter(|v| v.get()).count() as u32
 }
