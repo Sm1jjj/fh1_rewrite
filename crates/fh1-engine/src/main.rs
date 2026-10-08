@@ -190,8 +190,10 @@ fn main() -> AppExit {
     fh1_remaster::pre_default_plugins(&mut app);
     // GPU upload budget per frame (2026-10-08, user: small skips with steady fps; log 133825 hitches = PrepareAssets
     // 50-93 ms while scenery streams in): Bevy uploads every new mesh/texture in the frame it appears; the limiter spreads a
-    // burst over frames (a soft cap: whole assets only). FH1_UPLOAD_MB=n MB per frame (default 24), 0 = unlimited (old).
-    let upload_mb = std::env::var("FH1_UPLOAD_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(24);
+    // burst over frames (a soft cap: whole assets only). FH1_UPLOAD_MB=n MB per frame. OFF by default since log 135653: the
+    // hitches are mesh allocation (allocate_and_free_meshes), not images, and with the cap on the festival showed missing
+    // barrier/road textures (a deferred image never reached its material).
+    let upload_mb = std::env::var("FH1_UPLOAD_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     if upload_mb > 0 {
         app.insert_resource(bevy::render::render_asset::RenderAssetBytesPerFrame::new(upload_mb << 20));
     }
