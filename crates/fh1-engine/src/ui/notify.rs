@@ -14,6 +14,11 @@
 //! Free roam's objective is race central ("Head to the Horizon Heats" in the Xenia refs; xex string
 //! `IDS_HudInstruction_Travel_To_RaceCentral`), the minimap's default satnav target. It clears on
 //! arrival inside race central's TriggerZone radius (24 m, `race_central.xml`).
+//! Credits (P10, 2026-10-08): every credit gain (progression::wallet `CreditsChanged`: race payouts, sponsors,
+//! popularity milestones, car sales) goes on this tape as `+N CR`, its reason and the new balance, the changes of one frame summed into
+//! one notification. 947_HUD has no credits counter of its own (its only reward text, TEXT_REWARD, is the street-race
+//! encounter's), so the tape is FH1's place for it. Spending is not toasted (the garage / shop menus show it).
+//! `FH1_CREDIT_TOAST=0` = off (then ui/skillhud.rs shows CareerNotice::Payout as before).
 //! GUESSES:
 //! - The game raises the `*_COMPLETE` / `SHOWN` events when the 1 s show/hide slides end.
 //! - A notification stays up for [`NOTIFY_HOLD`].
@@ -58,7 +63,46 @@ impl Plugin for NotifyPlugin {
             .init_resource::<NotifyState>()
             .add_message::<HudNotify>()
             .add_systems(Update, (default_objective, debug_notify, objective, notifications).chain().after(crate::sync_visuals).after(super::hud::drive_hud));
+        if credit_toast() {
+            app.add_systems(
+                Update,
+                credits_toast.before(notifications).run_if(resource_exists::<bevy::ecs::message::Messages<crate::progression::wallet::CreditsChanged>>),
+            );
+        }
     }
+}
+
+/// `FH1_CREDIT_TOAST=0`: no `+N CR` notifications (module doc).
+pub fn credit_toast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_CREDIT_TOAST").map_or(true, |v| v != "0"))
+}
+
+/// One `+N CR` notification per frame of credit gains.
+fn credits_toast(mut changes: MessageReader<crate::progression::wallet::CreditsChanged>, mut out: MessageWriter<HudNotify>) {
+    let mut total = 0i64;
+    let mut balance = None;
+    let mut reasons: Vec<String> = Vec::new();
+    for c in changes.read().filter(|c| c.delta > 0) {
+        total += c.delta;
+        balance = Some(c.balance);
+        if !reasons.contains(&c.reason) {
+            reasons.push(c.reason.clone());
+        }
+    }
+    if total <= 0 {
+        return;
+    }
+    let reason = match reasons.len() {
+        1 => reasons.remove(0),
+        n => format!("{} +{} more", reasons[0], n - 1),
+    };
+    // TEXT3: the new balance.
+    let mut lines = vec![format!("+{} CR", crate::progression::fmt_num(total)), reason.to_uppercase()];
+    if let Some(b) = balance {
+        lines.push(format!("{} CR", crate::progression::fmt_num(b)));
+    }
+    out.write(HudNotify { lines });
 }
 
 #[derive(Resource, Default)]

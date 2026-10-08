@@ -486,8 +486,11 @@ fn drive(
                 p.fire_at("SHOW", o.unlock);
                 st.unlock_left = Some(UNLOCK_S);
             }
+            // Credits go on the tape from wallet CreditsChanged (ui/notify.rs credits_toast) unless FH1_CREDIT_TOAST=0.
             CareerNotice::Payout { credits, reason } => {
-                notify.write(HudNotify { lines: vec![format!("{} CR", fmt_num(*credits)), reason.to_uppercase()] });
+                if !super::notify::credit_toast() {
+                    notify.write(HudNotify { lines: vec![format!("{} CR", fmt_num(*credits)), reason.to_uppercase()] });
+                }
             }
             CareerNotice::PrizeCar { car } => {
                 notify.write(HudNotify { lines: vec!["PRIZE CAR".into(), car.to_uppercase()] });
