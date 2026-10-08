@@ -156,6 +156,16 @@ impl Scenery {
         mesh_add_bytes() == 0 || self.mesh_budget > 0
     }
 
+    /// Room for new merged prop chunks: props only spend the top `FH1_MESH_PROP_SHARE` (default 0.5) of the frame's
+    /// budget, so zone models (roads, terrain, barriers) and tiles, which finish after the props in `stream`, always find
+    /// room (47's review: at the festival the chunks spent it all and the zones starved). 1 = shared budget (old).
+    fn prop_mesh_room(&self) -> bool {
+        static SHARE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let share = *SHARE.get_or_init(|| std::env::var("FH1_MESH_PROP_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5f64).clamp(0.0, 1.0));
+        let limit = mesh_add_bytes();
+        limit == 0 || self.mesh_budget as f64 > limit as f64 * (1.0 - share)
+    }
+
     fn spend_mesh(&mut self, m: &Mesh) {
         if mesh_add_bytes() > 0 {
             self.mesh_budget -= mesh_bytes(m);
@@ -1505,7 +1515,7 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
             job.chunks = block_on(future::poll_once(task)).unwrap_or_default().into();
         }
         while !job.chunks.is_empty() {
-            if !sc.mesh_room() {
+            if !sc.prop_mesh_room() {
                 break;
             }
             let Some(((.., material), m)) = job.chunks.pop_front() else { break };
