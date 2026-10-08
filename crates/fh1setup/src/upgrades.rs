@@ -12,7 +12,10 @@
 //!   Physics rows a level references are inlined (upgrades-2), in physics.json's shapes: Camshaft rows `_torque_curve`
 //!   ({id, torque_scale_nm, max_rpm, samples}), SpringDamper rows `_front` / `_rear` (List_SpringDamperPhysics), AntiSway
 //!   rows `_physics` (List_AntiSwayPhysics), TireCompound rows `_tires` ({compound, friction_lateral,
-//!   friction_longitudinal, affect_curves}).
+//!   friction_longitudinal, affect_curves}). upgrades-3: front bumper / rear wing rows `_aero` (their List_AeroPhysics row,
+//!   physics.json `aero.front_bumper` / `aero.rear_wing` shape); engine swap rows `_engine_parts` ({table: [rows]}: every
+//!   engine-keyed part table's rows for the swapped EngineID, inlined the same way), since a swap replaces the whole
+//!   engine part set (docs/CUSTOMIZE.md "Upgrade rules").
 //! - `rims.json`: `[{id, media_name, name, maker, mass, price, type, exception}]`, aftermarket rims whose folder the
 //!   cars group installs (`cars/wheels/<MediaName>`).
 //! - `special_colors.json`: `[{id, name, finish, primary, secondary, two_tone: [scale, bias, power]}]`.
@@ -68,6 +71,23 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
                     let e = r["EngineID"].as_i64();
                     let swap = e.map(|e| rows(&db, "SELECT * FROM Data_Engine WHERE EngineID=?1", [e])).transpose()?.and_then(|v| v.into_iter().next());
                     r.insert("swap_engine".into(), swap.map(Value::Object).unwrap_or(Value::Null));
+                    // The swapped engine's whole part set (its stock rows + upgrade levels), keyed by the new EngineID.
+                    if let Some(e) = e {
+                        let mut set = Map::new();
+                        for (t, c, k) in &tables {
+                            if !matches!(k, Key::Engine) {
+                                continue;
+                            }
+                            let mut l = rows(&db, &format!("SELECT * FROM \"{t}\" WHERE \"{c}\"=?1 ORDER BY IsStock DESC, Level, Id"), [e])?;
+                            for x in l.iter_mut() {
+                                inline_physics(&db, t, x)?;
+                            }
+                            if !l.is_empty() {
+                                set.insert(t.clone(), Value::Array(l.into_iter().map(Value::Object).collect()));
+                            }
+                        }
+                        r.insert("_engine_parts".into(), Value::Object(set));
+                    }
                 }
             }
             for r in list.iter_mut() {
@@ -154,6 +174,10 @@ fn inline_physics(db: &Connection, table: &str, r: &mut Row) -> Result<()> {
             let (front, rear) = (one(sql, id("FrontSpringDamperPhysicsID"))?, one(sql, id("RearSpringDamperPhysicsID"))?);
             r.insert("_front".into(), front);
             r.insert("_rear".into(), rear);
+        }
+        "List_UpgradeCarBodyFrontBumper" | "List_UpgradeRearWing" => {
+            let v = one("SELECT * FROM List_AeroPhysics WHERE AeroPhysicsID=?1", id("AeroPhysicsID"))?;
+            r.insert("_aero".into(), v);
         }
         "List_UpgradeAntiSwayFront" | "List_UpgradeAntiSwayRear" => {
             let v = one("SELECT * FROM List_AntiSwayPhysics WHERE AntiSwayPhysicsID=?1", id("AntiSwayPhysicsID"))?;

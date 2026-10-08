@@ -529,7 +529,42 @@ fn seamless_loop(clip: Clip) -> Clip {
             data[i * ch + c] = head * a + tail * (1.0 - a);
         }
     }
+    if !std::env::var("FH1_AUDIO_LFE_FLAT").is_ok_and(|v| v == "0") {
+        flatten_envelope(&mut data, ch, clip.rate as f32);
+    }
     Clip { data: data.into(), ..clip }
+}
+
+/// Evens out a looped clip's level (P9): gain = median / smoothed RMS (20 ms Hann, wrapping round the loop), clamped
+/// x0.25..x4. The NORM loops still swell 0.3-0.6 over their length (sub envelope depth 0.13-0.31 -> 0.08-0.18 measured
+/// offline). `FH1_AUDIO_LFE_FLAT=0` = as recorded.
+fn flatten_envelope(data: &mut [f32], ch: usize, rate: f32) {
+    let n = data.len() / ch;
+    let w = ((rate * 0.02) as usize).max(2);
+    if n < 4 * w {
+        return;
+    }
+    let power: Vec<f32> = (0..n).map(|i| (0..ch).map(|c| data[i * ch + c] * data[i * ch + c]).sum::<f32>() / ch as f32).collect();
+    let kernel: Vec<f32> = (0..=2 * w).map(|k| 0.5 - 0.5 * (std::f32::consts::TAU * k as f32 / (2 * w) as f32).cos()).collect();
+    let ksum: f32 = kernel.iter().sum();
+    let env: Vec<f32> = (0..n)
+        .map(|i| {
+            let s: f32 = kernel.iter().enumerate().map(|(k, kv)| kv * power[(i + n + k - w) % n]).sum();
+            (s / ksum).sqrt()
+        })
+        .collect();
+    let mut sorted = env.clone();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[n / 2];
+    if median <= 1e-6 {
+        return;
+    }
+    for i in 0..n {
+        let g = (median / env[i].max(1e-6)).clamp(0.25, 4.0);
+        for c in 0..ch {
+            data[i * ch + c] *= g;
+        }
+    }
 }
 
 /// Overrun burbles only off the throttle (user 2026-10-08: "on some vehicles the burble / gargle continues even when
@@ -574,6 +609,8 @@ pub struct CarSound {
     pending: Vec<(Backfire, f32, bool)>,
     /// Sub rumble (`EngineLFE`) and exhaust air (`ExhNoise`), each through its own lowpass.
     lfe: Option<Layer>,
+    /// Pitch factor on the LFE loop (the 8-cylinder loop played for fewer cylinders).
+    lfe_pitch: f32,
     lfe_lp: [Biquad; 2],
     exh_noise: Option<Layer>,
     noise_lp: Biquad,
@@ -663,11 +700,18 @@ impl CarSound {
             .unwrap_or_default()
             .into_iter()
             .partition(|c| c.name.to_ascii_lowercase().contains("bang"));
-        let lfe_name = match audio.cylinders {
-            12.. => "LFE_12cyl_D_NORM",
-            10..=11 => "LFE_10_NORM_Down1",
-            7..=9 => "LFE_8cyl_A_NORM_Down1",
-            _ => "LFE_Short_2V2",
+        // P9 (2026-10-08, user: "beating / juddering" on the R35 GT-R, twice the rate after the loop trim): LFE_Short_2V2 is
+        // 0.24 s of noise-like ~45 Hz rumble, not a steady loop; any loop of it flutters at its loop rate (raw 3.3 Hz at
+        // 5,400 rpm, 6.0 Hz trimmed; measured offline, audio_render held throttle). Cars up to 6 cylinders now use the
+        // 2 s steady 8-cylinder loop pitched down by cylinders / 8 (repeats ~0.6 Hz). `FH1_AUDIO_LFE_SHORT=1` = the
+        // short clip (before).
+        let short = std::env::var("FH1_AUDIO_LFE_SHORT").is_ok_and(|v| v == "1");
+        let (lfe_name, lfe_pitch) = match audio.cylinders {
+            12.. => ("LFE_12cyl_D_NORM", 1.0),
+            10..=11 => ("LFE_10_NORM_Down1", 1.0),
+            7..=9 => ("LFE_8cyl_A_NORM_Down1", 1.0),
+            _ if short => ("LFE_Short_2V2", 1.0),
+            c => ("LFE_8cyl_A_NORM_Down1", (c as f32 / 8.0).clamp(0.5, 0.75)),
         };
         let choice = audio.extras.blowoff_choice.clamp(1, 3);
         let blowoff = lib.clip("Turbos", &format!("BlowOff_L1_{choice}_HI_1")).or_else(|| lib.clip("Turbos", "BlowOff_L1_1_HI_1"));
@@ -688,6 +732,7 @@ impl CarSound {
             pops,
             bangs,
             lfe: Layer::get(lib, "EngineLFE", lfe_name).map(|l| Layer { voice: Voice::new(seamless_loop(l.voice.clip)) }),
+            lfe_pitch,
             lfe_lp: [Biquad::pass(); 2],
             exh_noise: Layer::get(lib, "ExhNoise", "pinknoise_00.wav"),
             noise_lp: Biquad::pass(),
@@ -894,7 +939,7 @@ impl CarSound {
                 tmp.clear();
                 tmp.resize(out.len(), 0.0);
                 let g = engine_gain * (0.25 + 0.75 * throttle) * (0.35 + 0.65 * rpm_n) * 0.45;
-                l.voice.mix(&mut tmp, rate, (0.55 + 0.9 * rpm_n) * doppler, g, (1.0, 1.0));
+                l.voice.mix(&mut tmp, rate, (0.55 + 0.9 * rpm_n) * self.lfe_pitch * doppler, g, (1.0, 1.0));
                 let lp = 140.0 + 120.0 * rpm_n;
                 self.lfe_lp.iter_mut().for_each(|b| b.set_lowpass(rate, lp, std::f32::consts::FRAC_1_SQRT_2));
                 for f in 0..frames {

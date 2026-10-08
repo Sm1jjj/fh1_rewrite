@@ -681,10 +681,18 @@ fn request_variants(mut commands: Commands, added: Query<(Entity, &FxCarBody, Op
     }
 }
 
+/// The letter standing for a `<stem>race` section (fh1setup variants.rs RACE; Customize's race rows).
+pub const RACE: char = '#';
+
+/// Section name of `stem` + `letter` (`wingrace` for [`RACE`]).
+fn kit_key(stem: &str, letter: char) -> String {
+    if letter == RACE { format!("{stem}race") } else { format!("{stem}{letter}") }
+}
+
 /// Is `name` the kit section `stem` + `letter` (optionally `_tail` or another `_` suffix)?
 fn kit_node(name: &str, stem: &str, letter: char) -> bool {
     let n = name.to_ascii_lowercase();
-    n.strip_prefix(stem).and_then(|r| r.strip_prefix(letter)).is_some_and(|r| r.is_empty() || r.starts_with('_'))
+    n.strip_prefix(&kit_key(stem, letter)).is_some_and(|r| r.is_empty() || r.starts_with('_'))
 }
 
 /// When a body's scene has spawned: swap its rims and kit parts; when a variant kit scene has spawned: keep only the
@@ -744,13 +752,18 @@ fn apply_variants(
     if !req.kit.is_empty() {
         let rel = format!("variants/cars/{car_name}/model.gltf");
         if body.assets.join(&rel).exists() {
+            // Only the sections this car has (variants-2 kit.json; an older export without it: all requested). A missing
+            // one keeps the stock part rather than leaving a hole.
+            let have: Option<Vec<String>> = json(body.assets.join("variants/cars").join(&car_name).join("kit.json"))
+                .and_then(|k| k["sections"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()));
+            let kit: Vec<&(String, char, char)> = req.kit.iter().filter(|(stem, _, l)| have.as_ref().is_none_or(|h| h.iter().any(|n| kit_node(n, stem, *l)))).collect();
             for d in children.iter_descendants(root) {
                 let Ok(n) = names.get(d) else { continue };
-                if req.kit.iter().any(|(stem, stock, _)| kit_node(n.as_str(), stem, *stock)) {
+                if kit.iter().any(|(stem, stock, _)| kit_node(n.as_str(), stem, *stock)) {
                     commands.entity(d).insert(Visibility::Hidden);
                 }
             }
-            let keep = req.kit.iter().map(|(stem, _, l)| format!("{stem}{l}")).collect();
+            let keep = kit.iter().map(|(stem, _, l)| kit_key(stem, *l)).collect();
             commands.spawn((WorldAssetRoot(assets.load(GltfAssetLabel::Scene(0).from_asset(rel))), KitSelect(keep), Transform::default(), Visibility::default(), ChildOf(root)));
         } else {
             warn!("{}: no {rel} (run fh1setup variants); stock kit kept", body.car);
@@ -934,6 +947,9 @@ mod tests {
         assert!(kit_node("bumperFb_tail", "bumperf", 'b'));
         assert!(!kit_node("bumperFbx", "bumperf", 'b'));
         assert!(!kit_node("bumperRb", "bumperf", 'b'));
+        assert!(kit_node("wingRace", "wing", RACE));
+        assert!(kit_node("bumperFrace_tail", "bumperf", RACE));
+        assert!(!kit_node("wingRace", "wing", 'r'));
         assert_eq!(look("chrome_2").kind, Kind::Chrome);
         assert_eq!(look("misc_NoOcclude_NoShadow").kind, Kind::Surface);
         assert_eq!(look("headlight_paint").kind, Kind::Paint);

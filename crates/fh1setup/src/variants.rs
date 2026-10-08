@@ -12,6 +12,11 @@
 //!   the same `mesh_offset` translation as the cars group's model.gltf root. Materials are the cars group's (same
 //!   names), textures point at the cars group's atlases (`../../../cars/<CAR>/exterior.png`). Cars without
 //!   non-stock kit sections get no folder.
+//! - Race parts (variants-2, 2026-10-08): the `<stem>race` sections (bumperfrace on 153 cars, wingrace 144, bumperrrace
+//!   36; carbin_names survey) and the roll cage `cagerace` (140) are exported too, named as in the carbin. The gamedb
+//!   race rows (Level 3: one per car and slot; FrontBumper on 162 bodies, RearWing on 155 cars) are those sections
+//!   (INFERRED from the counts; the Level 1-2 rows are the letters a + Sequence). `kit.json` lists the exported section
+//!   names (lower case) so the engine swaps in only what the car has.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,8 +30,11 @@ use fh1_formats::zip::Archive;
 
 use crate::model::{self, Gltf, Kit, WheelGeo};
 
-/// Kit stems (fh1setup model.rs is_stock).
-const KIT_STEMS: [&str; 6] = ["bumperf", "bumperr", "hood", "skirtl", "skirtr", "wing"];
+/// Kit stems (fh1setup model.rs is_stock), plus the roll cage (race weight reduction; only its `race` section).
+const KIT_STEMS: [&str; 7] = ["bumperf", "bumperr", "hood", "skirtl", "skirtr", "wing", "cage"];
+
+/// The letter standing for a `<stem>race` section (fh1-render StockKit / fh1-remaster kit_node use the same).
+pub const RACE: char = '#';
 
 pub fn build(disc: &Path, out: &Path) -> Result<()> {
     let rims = rims(disc, &out.join("wheels"))?;
@@ -102,11 +110,20 @@ fn kits(disc: &Path, out: &Path) -> Result<usize> {
     Ok(n)
 }
 
-/// `bumperFb` -> Some(("bumperf", 'b')) when the name is a kit stem + one letter (+ `_tail`).
+/// `bumperFb` -> Some(("bumperf", 'b')) when the name is a kit stem + one letter (+ `_tail`); `wingrace` ->
+/// Some(("wing", RACE)).
 fn kit_part(name: &str) -> Option<(&'static str, char)> {
     let n = name.to_lowercase();
     for stem in KIT_STEMS {
         if let Some(rest) = n.strip_prefix(stem) {
+            if let Some(tail) = rest.strip_prefix("race") {
+                if tail.is_empty() || tail.starts_with('_') {
+                    return Some((stem, RACE));
+                }
+            }
+            if stem == "cage" {
+                continue;
+            }
             let mut ch = rest.chars();
             let letter = ch.next().filter(|c| c.is_ascii_lowercase())?;
             let tail = ch.as_str();
@@ -169,5 +186,7 @@ fn kit(zip: &Path, media: &str, stock: &Kit, body: Option<&serde_json::Map<Strin
     let centre = ["BottomCenterWheelbasePosx", "BottomCenterWheelbasePosy", "BottomCenterWheelbasePosZ"].map(|k| body.and_then(|b| b.get(k)).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32);
     let root = g.node(json!({"name": format!("{media}_kit"), "children": children, "translation": centre.map(|v| -v)}));
     g.write(out, root)?;
+    let sections: Vec<String> = parts.iter().map(|(s, _)| s.name.to_lowercase()).collect();
+    std::fs::write(out.join("kit.json"), serde_json::to_vec_pretty(&json!({ "sections": sections }))?)?;
     Ok(true)
 }

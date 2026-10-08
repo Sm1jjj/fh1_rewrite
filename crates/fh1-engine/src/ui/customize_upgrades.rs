@@ -266,6 +266,11 @@ fn fit(p: &mut Value, doc: &Value, chosen: &BTreeMap<String, i64>) {
             }
             if !row["swap_engine"].is_null() {
                 p["engine"] = row["swap_engine"].clone();
+                // The swapped engine's sound (audio/cars/<Data_Engine.MediaName>; every stock engine row's MediaName is its
+                // car's, so sounds are keyed by engine). INFERRED that the game plays it (no xex trace); data.rs `sound`.
+                if let Some(m) = row["swap_engine"]["MediaName"].as_str().filter(|m| !m.is_empty()) {
+                    p["sound_donor"] = serde_json::json!(m);
+                }
             }
         }
     }

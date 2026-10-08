@@ -19,6 +19,16 @@
 //! Paint is free: FH1 has no paint price anywhere (gamedb List_SpecialColors / Combo_Colors). Short of credits, the
 //! preview is dropped and the title says so. `FH1_OWNERSHIP=0` (wallet::ownership_on) = everything free (old).
 //!
+//! Body / aero parts (P11, 2026-10-08): the kit slots are FH1's body upgrade tables (front / rear bumper, side skirts,
+//! hood, rear wing). A row's Level 1-2 = the carbin letter a + Sequence; Level 3 = the race part, the `<stem>race`
+//! section (INFERRED: one race row per car and slot, matching the bumperfrace / wingrace counts; setup variants-2).
+//! A race front bumper also fits the car's race rear bumper when it has one and no rear row of its own, and a race
+//! weight reduction (List_UpgradeCarBodyWeight Level 3, ui/customize_upgrades.rs) the roll cage `cagerace` (both
+//! INFERRED). The chosen kit rows also go into `upgrades` (table -> row Id), so the physics patch (47's
+//! customize_upgrades.rs `patch`) fits their mass, drag and front-bumper / wing aero.
+//! Engine swaps (List_UpgradeEngine rows) are an Upgrades row; after a swap the engine-part rows are the new engine's
+//! (`upgrades::effective_doc`) and the old engine's part choices are dropped (still owned if bought).
+//!
 //! `FH1_GARAGE=0`: garage.json is neither read nor applied (stock looks; the page still opens).
 //! `FH1_CUSTOMIZE=0`: the pause menu's Change car opens the car list directly (no Garage page).
 
@@ -119,6 +129,11 @@ const KIT_SLOTS: [(&str, &str, &str, &[&str]); 5] = [
     ("rear_wing", "List_UpgradeRearWing", "Rear wing", &["wing"]),
 ];
 
+/// The race-section letter (fh1-remaster car.rs kit_node; fh1setup variants.rs).
+const RACE: char = fh1_remaster::car::RACE;
+/// Weight reduction (Level 3 = race: the roll cage).
+const WEIGHT_TABLE: &str = "List_UpgradeCarBodyWeight";
+
 /// One kit option: gamedb row Id, Sequence, Level, stock flag and Price (CR).
 #[derive(Clone, Copy, Debug)]
 struct KitOption {
@@ -133,6 +148,9 @@ impl KitOption {
     fn name(&self) -> String {
         if self.stock {
             return "Stock".into();
+        }
+        if self.level >= 3 {
+            return "Race".into();
         }
         let letter = (b'A' + self.sequence.min(25) as u8) as char;
         if self.level >= 3 { format!("Option {letter} (race)") } else { format!("Option {letter}") }
@@ -200,15 +218,33 @@ impl CarLooks {
         if let Some(rim) = &look.rim {
             body.insert(fh1_render::car::FxCarRim(rim.clone()));
         }
-        if !look.kit.is_empty() {
-            // Every kit stem gets a letter: the chosen row's, else the stock row's (as fh1setup cars.rs stock_kit).
+        // The roll cage comes with the race weight reduction (module doc).
+        let cage = look.upgrades.get(WEIGHT_TABLE).is_some_and(|&id| {
+            upgrades::read_doc(&self.assets, car)["parts"][WEIGHT_TABLE]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|r| r["Id"].as_i64() == Some(id) && r["Level"].as_i64().unwrap_or(0) >= 3))
+        });
+        if !look.kit.is_empty() || cage {
+            // Every kit stem gets a letter: the chosen row's, else the stock row's (as fh1setup cars.rs stock_kit); race
+            // rows the race section ([`RACE`]).
             let options = kit_options(&self.assets, car);
             let mut letters = Vec::new();
+            let mut race_front = false;
             for (i, (key, _, _, stems)) in KIT_SLOTS.iter().enumerate() {
                 let stock = options[i].iter().find(|o| o.stock).map_or(0, |o| o.sequence);
                 let seq = look.kit.get(*key).copied().unwrap_or(stock);
-                let letter = (b'a' + seq.min(25) as u8) as char;
+                let race = options[i].iter().any(|o| o.sequence == seq && !o.stock && o.level >= 3);
+                race_front |= race && *key == "front_bumper";
+                let letter = if race { RACE } else { (b'a' + seq.min(25) as u8) as char };
                 letters.extend(stems.iter().map(|s| (s.to_string(), letter)));
+            }
+            // The race front bumper's rear half (bumperrrace) when the rear has no row of its own chosen.
+            if race_front && !look.kit.contains_key("rear_bumper") {
+                letters.retain(|(s, _)| s != "bumperr");
+                letters.push(("bumperr".into(), RACE));
+            }
+            if cage {
+                letters.push(("cage".into(), RACE));
             }
             body.insert(fh1_render::car::FxCarKit(fh1_render::car::StockKit(letters)));
         }
@@ -348,8 +384,10 @@ pub struct CustomizeMenu {
     kit_rows: Vec<usize>,
     /// Special colours (loaded once).
     specials: Vec<Special>,
-    /// The car's upgradable parts (ui/customize_upgrades.rs).
+    /// The car's upgradable parts (ui/customize_upgrades.rs), from `doc` with the chosen engine swap applied.
     parts: Vec<upgrades::Part>,
+    /// The car's upgrades document (`upgrades/cars/<car>.json`).
+    doc: serde_json::Value,
     /// Custom colour editor: hue (deg), saturation, value (0..1), metallic.
     hsv: [f32; 3],
     metallic: bool,
@@ -592,7 +630,7 @@ impl CustomizeMenu {
                         selectable: !self.parts.is_empty(),
                         ..row(
                             "Upgrades",
-                            Some(match look.map_or(0, |l| l.upgrades.len()) {
+                            Some(match look.map_or(0, |l| l.upgrades.keys().filter(|t| !KIT_SLOTS.iter().any(|k| k.1 == t.as_str())).count()) {
                                 _ if self.parts.is_empty() => "No parts".into(),
                                 0 => "Stock".into(),
                                 n => format!("{n} part{}", if n == 1 { "" } else { "s" }),
@@ -802,8 +840,14 @@ impl CustomizeMenu {
         self.base_seq = if name == crate::DEFAULT_CAR.0 { crate::DEFAULT_CAR.1 } else { stock.or(self.colours.first().map(|c| c.0)).unwrap_or(1) };
         self.no_rims = read_json(&garage.assets.join("upgrades/cars").join(format!("{name}.json")))["no_rim_styles"].as_bool().unwrap_or(false);
         self.kit = kit_options(&garage.assets, &name);
-        self.parts = upgrades::catalog(&upgrades::read_doc(&garage.assets, &name));
+        self.doc = upgrades::read_doc(&garage.assets, &name);
+        self.parts = upgrades::catalog(&self.doc);
         self.car = name;
+    }
+
+    /// The parts list for `chosen` (an engine swap brings the new engine's part rows).
+    fn refresh_parts(&mut self, chosen: &BTreeMap<String, i64>) {
+        self.parts = upgrades::catalog(&upgrades::effective_doc(&self.doc, chosen));
     }
 }
 
@@ -866,6 +910,7 @@ fn apply_requests(
         match req {
             Req::Open => {
                 m.load(&garage);
+                m.refresh_parts(&current.upgrades);
                 if m.view == View::Custom {
                     // The editor starts on the colour the car shows.
                     if let Some((rgb, metallic)) = m.shown_rgb(Some(&current)) {
@@ -887,6 +932,12 @@ fn apply_requests(
                     if part.table.contains("Turbo") || part.table.ends_with("CSC") || part.table.ends_with("DSC") {
                         look.upgrades.retain(|t, _| t == part.table || !(t.contains("Turbo") || t.ends_with("CSC") || t.ends_with("DSC")));
                     }
+                }
+                // Engine swap: the old engine's part choices no longer apply; the list becomes the new engine's.
+                if part.table == "List_UpgradeEngine" {
+                    look.upgrades.retain(|t, _| t == "List_UpgradeEngine" || !t.starts_with("List_UpgradeEngine"));
+                    let chosen = look.upgrades.clone();
+                    m.refresh_parts(&chosen);
                 }
                 respawn |= set_preview(&mut looks, &m.car, look);
             }
@@ -917,12 +968,18 @@ fn apply_requests(
                 let n = m.kit[slot].len() as i32;
                 let i = (m.kit_index(Some(&current), slot) as i32 + dir).rem_euclid(n.max(1)) as usize;
                 let mut look = current;
+                // The row also goes to the physics patch (upgrades: table -> row Id; stock = none).
+                let table = KIT_SLOTS[slot].1;
                 match m.kit[slot].get(i) {
                     Some(o) if !o.stock => {
                         look.kit.insert(KIT_SLOTS[slot].0.to_owned(), o.sequence);
+                        if o.id >= 0 {
+                            look.upgrades.insert(table.to_owned(), o.id);
+                        }
                     }
                     _ => {
                         look.kit.remove(KIT_SLOTS[slot].0);
+                        look.upgrades.remove(table);
                     }
                 }
                 respawn |= set_preview(&mut looks, &m.car, look);
