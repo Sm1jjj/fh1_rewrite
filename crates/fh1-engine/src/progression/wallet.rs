@@ -55,7 +55,8 @@ pub(super) fn migrate(p: &mut ProfileData) {
     p.version = 2;
 }
 
-fn add(p: &mut ProfileData, car: &str, source: CarSource, paid: i64) -> bool {
+/// Into the garage unless already owned (true = added). No save (callers commit).
+pub(super) fn add(p: &mut ProfileData, car: &str, source: CarSource, paid: i64) -> bool {
     if p.owned.iter().any(|o| o.car == car) {
         return false;
     }
@@ -102,14 +103,6 @@ pub fn spend(p: &mut Profile, n: i64, reason: &str) -> bool {
     true
 }
 
-/// Receive `n` credits. Saves.
-pub fn earn(p: &mut Profile, n: i64, reason: &str) {
-    if n <= 0 {
-        return;
-    }
-    apply(p, n, reason);
-    p.commit();
-}
 
 // ---- Cars ----
 
@@ -121,14 +114,6 @@ pub fn owns(p: &Profile, car: &str) -> bool {
     p.data.owned.iter().any(|o| o.car == car)
 }
 
-/// Adds a car without paying (prizes, wristband rewards, barn finds). False if already owned. Saves.
-pub fn add_car(p: &mut Profile, car: &str, source: CarSource) -> bool {
-    let added = add(&mut p.data, car, source, 0);
-    if added {
-        p.commit();
-    }
-    added
-}
 
 /// Autoshow price (None = not for sale: traffic, unicorns, BaseCost 0, or no data).
 pub fn price(c: &CareerData, car: &str) -> Option<i64> {
@@ -136,14 +121,6 @@ pub fn price(c: &CareerData, car: &str) -> Option<i64> {
     (info.selectable && !info.unicorn && info.price > 0).then_some(info.price)
 }
 
-/// Why `car` can't be bought now (None = it can).
-pub fn buy_lock(c: &CareerData, p: &Profile, car: &str) -> Option<String> {
-    if owns(p, car) {
-        return Some("Already owned".into());
-    }
-    let Some(cost) = price(c, car) else { return Some("Not for sale".into()) };
-    (!can_afford(p, cost)).then(|| format!("INSUFFICIENT CR! ({} needed)", super::fmt_num(cost)))
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuyError {

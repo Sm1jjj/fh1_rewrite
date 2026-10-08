@@ -425,9 +425,7 @@ fn apply_results(
             if !p.cars_won.contains(car) {
                 p.cars_won.push(car.clone());
                 // Into the garage (P10 economy).
-                if !p.owned.iter().any(|o| &o.car == car) {
-                    p.owned.push(profile::OwnedCar { car: car.clone(), source: profile::CarSource::Prize, paid: 0 });
-                }
+                wallet::add(p, car, profile::CarSource::Prize, 0);
                 extra.push(format!("Prize car: {car}"));
                 banners.push(format!("PRIZE CAR  {car}"));
                 banners.1.push(CareerNotice::PrizeCar { car: car.clone() });
@@ -458,9 +456,7 @@ fn apply_results(
             for (_, car) in c.wristband_cars.iter().filter(|(t, _)| *t as usize == tier) {
                 if !p.cars_won.contains(car) {
                     p.cars_won.push(car.clone());
-                    if !p.owned.iter().any(|o| &o.car == car) {
-                        p.owned.push(profile::OwnedCar { car: car.clone(), source: profile::CarSource::Wristband, paid: 0 });
-                    }
+                    wallet::add(p, car, profile::CarSource::Wristband, 0);
                     banners.push(format!("WRISTBAND REWARD  {car}"));
                 }
             }
