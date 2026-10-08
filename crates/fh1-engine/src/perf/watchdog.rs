@@ -238,6 +238,8 @@ mod spans {
         pub(super) name: String,
         pub(super) ns: AtomicU64,
         pub(super) runs: AtomicU32,
+        /// Time since the recorder's last per-frame read ([`super::take_frame_spans`]).
+        pub(super) frame_ns: AtomicU64,
         /// Watchdog ms (`super::now_ms`) when entered; 0 = not inside.
         pub(super) entered_ms: AtomicU64,
     }
@@ -252,7 +254,7 @@ mod spans {
         let mut g = ACCS.lock().unwrap_or_else(|e| e.into_inner());
         g.get_or_insert_with(HashMap::new)
             .entry(name.clone())
-            .or_insert_with(|| Arc::new(Acc { name, ns: AtomicU64::new(0), runs: AtomicU32::new(0), entered_ms: AtomicU64::new(0) }))
+            .or_insert_with(|| Arc::new(Acc { name, ns: AtomicU64::new(0), runs: AtomicU32::new(0), frame_ns: AtomicU64::new(0), entered_ms: AtomicU64::new(0) }))
             .clone()
     }
 
@@ -315,7 +317,9 @@ mod spans {
             t.0.entered_ms.store(0, Ordering::Relaxed);
             if ACCUM.load(Ordering::Relaxed) {
                 if let Some(s) = ext.get::<Start>() {
-                    t.0.ns.fetch_add(s.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let ns = s.0.elapsed().as_nanos() as u64;
+                    t.0.ns.fetch_add(ns, Ordering::Relaxed);
+                    t.0.frame_ns.fetch_add(ns, Ordering::Relaxed);
                     t.0.runs.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -340,6 +344,23 @@ pub(crate) fn take_span_totals() -> Vec<(String, f64, u32)> {
         .collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1));
     v
+}
+
+/// The `top` slowest spans (name, ms) since the last call: called by the recorder every frame (which resets them), so
+/// a hitch frame names its own systems, not the second's averages. Spans of both worlds; the render world runs one
+/// frame behind (pipelined), so a render-thread spike shows on the frame the main thread waited for it.
+pub(crate) fn take_frame_spans(top: usize) -> Vec<(String, f64)> {
+    let mut best: Vec<(u64, std::sync::Arc<spans::Acc>)> = Vec::with_capacity(top + 1);
+    for a in spans::all() {
+        let ns = a.frame_ns.swap(0, Ordering::Relaxed);
+        if ns == 0 || (best.len() == top && best.last().is_some_and(|b| b.0 >= ns)) {
+            continue;
+        }
+        let at = best.iter().position(|b| b.0 < ns).unwrap_or(best.len());
+        best.insert(at, (ns, a));
+        best.truncate(top);
+    }
+    best.into_iter().map(|(ns, a)| (a.name.clone(), ns as f64 / 1e6)).collect()
 }
 
 /// LogPlugin `custom_layer`: the system-span tracker above.

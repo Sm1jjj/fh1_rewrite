@@ -24,7 +24,8 @@ use crate::track::Track;
 use crate::Car;
 
 /// A frame this long (ms) gets its own `hitch` row.
-const HITCH_MS: f32 = 50.0;
+/// 40 ms since P9 (2026-10-08; was 50): the user's small skips were 50-110 ms.
+const HITCH_MS: f32 = 40.0;
 const FLUSH_EVERY: f64 = 5.0;
 const SUMMARY_EVERY: f64 = 30.0;
 
@@ -91,7 +92,7 @@ const HEADER: &str = "kind,t_s,utc,map,car,renderer,state,x,y,z,speed_kmh,fps,fr
 rt_extract,rt_prepare_assets,rt_specialize,rt_queue,rt_prepare,rt_render,rt_total,main_wait,main_to_preupdate,main_to_update,\
 main_to_postupdate,main_to_last,main_busy,cpu_process,cpu_system,ram_process_mb,ram_system_mb,gpu_util,vram_mb,vram_total_mb,gpu_temp,\
 entities,meshes,meshes_visible,zones_loaded,zones_pending,prop_tiles,prop_pending,prop_placing,zone_loads,prop_tile_loads,\
-scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms";
+scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms,hitch_spans";
 
 /// One (map, car, renderer) stretch of play.
 #[derive(Default)]
@@ -286,6 +287,8 @@ fn record(
     let key = (map.clone(), car_name.clone(), r.renderer);
     let streamed: [u32; 3] = std::array::from_fn(|k| STREAMED[k].load(Ordering::Relaxed));
     let gauges = scenery.as_ref().map(|s| s.stream_gauges()).unwrap_or_default();
+    // This frame's slowest spans (read every frame: it resets them).
+    let frame_spans = super::watchdog::take_frame_spans(5);
     if counting {
         let seg = r.segment(key.clone());
         seg.frames.push(ms);
@@ -297,8 +300,9 @@ fn record(
             parts.sort_by(|a, b| b.0.total_cmp(&a.0));
             let ds: Vec<u32> = (0..3).map(|k| streamed[k] - r.streamed_prev[k]).collect();
             let (pos, kmh) = car.map_or((Vec3::ZERO, 0.0), |c| (c.0.position, c.0.velocity.length() * 3.6));
+            let spans = frame_spans.iter().map(|(n, ms)| format!("{} {ms:.1}", short_span(n))).collect::<Vec<_>>().join(", ");
             let attr = format!(
-                "top: {}; streaming this second: {} zone loads, {} prop tiles, {} spawned",
+                "top: {}; systems: {spans}; streaming this second: {} zone loads, {} prop tiles, {} spawned",
                 parts.iter().take(3).map(|(v, n)| format!("{n} {v:.0}")).collect::<Vec<_>>().join(", "),
                 ds[0],
                 ds[1],
@@ -315,6 +319,7 @@ fn record(
             row.main(&main);
             row.gauges(&gauges, &ds);
             row.set("hitch_ms", ms, 1);
+            row.text("hitch_spans", csv_field(&frame_spans.iter().map(|(n, ms)| format!("{} {ms:.1}", short_span(n))).collect::<Vec<_>>().join("; ")));
             r.buf += &row.line();
         }
     }
@@ -440,6 +445,24 @@ type MeshCat = (
     Has<MeshMaterial3d<crate::grass::GrassMaterial>>,
     Has<fh1_render::shadow::CasterProxy>,
 );
+
+/// A span name without module paths, generics kept short: `bevy_render::render_asset::prepare_assets<bevy_render::
+/// texture::gpu_image::GpuImage>` -> `prepare_assets<GpuImage>`.
+fn short_span(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut word = String::new();
+    for c in name.chars() {
+        if c.is_alphanumeric() || c == '_' || c == ':' {
+            word.push(c);
+        } else {
+            out += word.rsplit("::").next().unwrap_or(&word);
+            word.clear();
+            out.push(c);
+        }
+    }
+    out += word.rsplit("::").next().unwrap_or(&word);
+    out
+}
 
 /// One CSV row, filled by column name (unknown names panic in debug: the header is the single source of the columns).
 struct Row(Vec<String>);
