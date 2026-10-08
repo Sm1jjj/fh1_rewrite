@@ -1869,18 +1869,16 @@ pub fn prepare_lights(
                 continue;
             }
 
-            let cascades = light
-                .cascades
-                .get(&entity)
-                .unwrap()
-                .iter()
-                .take(MAX_CASCADES_PER_LIGHT);
-            let frusta = light
-                .frusta
-                .get(&entity)
-                .unwrap()
-                .iter()
-                .take(MAX_CASCADES_PER_LIGHT);
+            // FH1 patch: the app may prune a view's cascade entry (fh1-remaster light.rs FH1_RM_CASCADE_PRUNE); skip the
+            // view instead of panicking (upstream unwrapped).
+            let (Some(cascades), Some(frusta)) = (light.cascades.get(&entity), light.frusta.get(&entity)) else {
+                if let Some(entities) = light_view_entities.remove(&entity) {
+                    despawn_entities(&mut commands, entities);
+                }
+                continue;
+            };
+            let cascades = cascades.iter().take(MAX_CASCADES_PER_LIGHT);
+            let frusta = frusta.iter().take(MAX_CASCADES_PER_LIGHT);
 
             let iter = cascades
                 .zip(frusta)
