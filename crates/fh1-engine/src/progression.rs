@@ -26,6 +26,7 @@ pub mod data;
 pub mod profile;
 pub mod screen;
 pub mod skill;
+pub mod wallet;
 
 pub use profile::Profile;
 
@@ -240,7 +241,8 @@ impl Plugin for ProgressionPlugin {
             .add_message::<RaceFinished>()
             .add_message::<CareerNotice>()
             .add_message::<skill::SkillEvent>()
-            .add_systems(PostUpdate, (flush_notices, skill::flush_skill_events))
+            .add_message::<wallet::CreditsChanged>()
+            .add_systems(PostUpdate, (flush_notices, skill::flush_skill_events, wallet::flush_credit_events))
             .add_systems(Startup, (screen::spawn_career_ui, skill::spawn_skill_hud))
             .add_systems(Update, (apply_results, update_catalog).chain())
             .add_systems(Update, (screen::career_input, screen::draw_career).chain().after(update_catalog))
@@ -422,17 +424,24 @@ fn apply_results(
         if let (true, Some(car)) = (first_win, def.prize_car.as_ref()) {
             if !p.cars_won.contains(car) {
                 p.cars_won.push(car.clone());
+                // Into the garage (P10 economy).
+                if !p.owned.iter().any(|o| &o.car == car) {
+                    p.owned.push(profile::OwnedCar { car: car.clone(), source: profile::CarSource::Prize, paid: 0 });
+                }
                 extra.push(format!("Prize car: {car}"));
                 banners.push(format!("PRIZE CAR  {car}"));
                 banners.1.push(CareerNotice::PrizeCar { car: car.clone() });
             }
         }
         p.xp += xp;
-        p.credits += credits;
         last.place = place;
         last.credits = credits;
         last.xp = xp;
         last.replay = !improved;
+        // Through the ledger (P10): CreditsChanged for the HUD, a ledger line in profile.json.
+        let reason = format!("{} P{place}", def.name);
+        wallet::apply(&mut profile, credits, &reason);
+        let p = &mut profile.data;
         last.balance = p.credits;
         last.xp_after = p.xp;
         last.tier_before = tier_before;
@@ -449,6 +458,9 @@ fn apply_results(
             for (_, car) in c.wristband_cars.iter().filter(|(t, _)| *t as usize == tier) {
                 if !p.cars_won.contains(car) {
                     p.cars_won.push(car.clone());
+                    if !p.owned.iter().any(|o| &o.car == car) {
+                        p.owned.push(profile::OwnedCar { car: car.clone(), source: profile::CarSource::Wristband, paid: 0 });
+                    }
                     banners.push(format!("WRISTBAND REWARD  {car}"));
                 }
             }
@@ -563,7 +575,7 @@ pub fn pay_rank_milestones(profile: &mut Profile, rank: u32, banners: &mut Banne
         }
     }
     if paid > 0 {
-        profile.data.credits += paid;
+        wallet::apply(profile, paid, "Popularity sponsor");
     }
     profile.data.rank_paid = profile.data.rank_paid.min(rank);
 }

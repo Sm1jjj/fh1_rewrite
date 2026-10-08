@@ -55,7 +55,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 /// Asset groups and their pipeline versions. Bump a version when its output changes.
-pub const GROUPS: &[(&str, &str)] = &[("cars", "cars-18"), ("world", "world-3"), ("scenery", "scenery-32"), ("shaders", "shaders-2"), ("tracks", "tracks-3"), ("dynamicpost", "dynamicpost-2"), ("audio", "audio-2"), ("radio", "radio-3"), ("ui", "ui-4"), ("grass", "grass-1"), ("crowd", "crowd-2"), ("anim", "anim-1"), ("sky", "sky-1"), ("camera", "camera-1"), ("effects", "effects-1"), ("events", "events-4"), ("ailines", "ailines-1"), ("traffic", "traffic-1"), ("upgrades", "upgrades-2"), ("variants", "variants-1"), ("remaster", "remaster-4")];
+pub const GROUPS: &[(&str, &str)] = &[("cars", "cars-18"), ("world", "world-3"), ("scenery", "scenery-32"), ("shaders", "shaders-2"), ("tracks", "tracks-3"), ("dynamicpost", "dynamicpost-2"), ("audio", "audio-2"), ("radio", "radio-3"), ("ui", "ui-4"), ("grass", "grass-1"), ("crowd", "crowd-2"), ("anim", "anim-1"), ("sky", "sky-1"), ("camera", "camera-1"), ("effects", "effects-1"), ("events", "events-5"), ("ailines", "ailines-1"), ("traffic", "traffic-1"), ("upgrades", "upgrades-2"), ("variants", "variants-1"), ("remaster", "remaster-4")];
 
 struct Args {
     source: PathBuf,

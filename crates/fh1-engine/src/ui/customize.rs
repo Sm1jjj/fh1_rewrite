@@ -13,6 +13,12 @@
 //! `Car` root (physics, pose) stays. Lists preview as the cursor moves (kit slots with Left / Right); Enter keeps,
 //! Back reverts.
 //!
+//! Shop (P10, 2026-10-08): rims (List_Wheels.Price), body kit rows (List_UpgradeCarBody*.Price) and upgrades
+//! (ui/customize_upgrades.rs `purchase_price`) are paid with credits (progression::wallet) when a look is kept (Enter);
+//! previews are free, and parts bought once (or worn before the economy) stay owned per car, so switching back is free.
+//! Paint is free: FH1 has no paint price anywhere (gamedb List_SpecialColors / Combo_Colors). Short of credits, the
+//! preview is dropped and the title says so. `FH1_OWNERSHIP=0` (wallet::ownership_on) = everything free (old).
+//!
 //! `FH1_GARAGE=0`: garage.json is neither read nor applied (stock looks; the page still opens).
 //! `FH1_CUSTOMIZE=0`: the pause menu's Change car opens the car list directly (no Garage page).
 
@@ -77,6 +83,15 @@ pub struct CarLook {
     pub kit: BTreeMap<String, u32>,
     /// Performance parts: gamedb table -> chosen row Id; missing = stock.
     pub upgrades: BTreeMap<String, i64>,
+    /// Bought parts (performance upgrades and kit rows): gamedb table -> row Ids (Ids repeat across tables), kept when
+    /// switching back (ui/customize_upgrades.rs `purchase_price` / `record_owned`; swapping to stock or an owned part is
+    /// free). garage.json key `owned_upgrades` (a pre-release flat `owned_parts` list is ignored).
+    #[serde(rename = "owned_upgrades")]
+    pub owned_parts: upgrades::OwnedParts,
+    /// Bought aftermarket rims (media names) for this car.
+    pub owned_rims: Vec<String>,
+    /// Credits spent on this car's parts (added to its sell value, progression::wallet::sell_price).
+    pub spent: i64,
 }
 
 impl CarLook {
@@ -104,12 +119,14 @@ const KIT_SLOTS: [(&str, &str, &str, &[&str]); 5] = [
     ("rear_wing", "List_UpgradeRearWing", "Rear wing", &["wing"]),
 ];
 
-/// One kit option: gamedb Sequence and Level, stock flag.
+/// One kit option: gamedb row Id, Sequence, Level, stock flag and Price (CR).
 #[derive(Clone, Copy, Debug)]
 struct KitOption {
+    id: i64,
     sequence: u32,
     level: i64,
     stock: bool,
+    price: u32,
 }
 
 impl KitOption {
@@ -130,7 +147,15 @@ fn kit_options(assets: &Path, car: &str) -> [Vec<KitOption>; 5] {
             .as_array()
             .map(|rows| {
                 rows.iter()
-                    .filter_map(|r| Some(KitOption { sequence: r["Sequence"].as_u64()? as u32, level: r["Level"].as_i64().unwrap_or(0), stock: r["IsStock"].as_i64() == Some(1) }))
+                    .filter_map(|r| {
+                        Some(KitOption {
+                            id: r["Id"].as_i64().unwrap_or(-1),
+                            sequence: r["Sequence"].as_u64()? as u32,
+                            level: r["Level"].as_i64().unwrap_or(0),
+                            stock: r["IsStock"].as_i64() == Some(1),
+                            price: r["Price"].as_u64().unwrap_or(0) as u32,
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -187,6 +212,11 @@ impl CarLooks {
             }
             body.insert(fh1_render::car::FxCarKit(fh1_render::car::StockKit(letters)));
         }
+    }
+
+    /// Credits spent on `car`'s parts (its sell value, ui/garage.rs).
+    pub fn spent(&self, car: &str) -> i64 {
+        self.cars.get(car).map_or(0, |l| l.spent)
     }
 
     /// Edit `car`'s physics.json with its upgrades (main.rs spawn_car's `CarData::load_with`).
@@ -293,6 +323,8 @@ struct Special {
 struct Rim {
     media: String,
     label: String,
+    /// List_Wheels.Price (CR).
+    price: u32,
 }
 
 /// The page's state, held by ui.rs `Menu`.
@@ -324,6 +356,8 @@ pub struct CustomizeMenu {
     pending: Vec<Req>,
     /// Built by [`apply_requests`]; ui.rs `items()` shows them.
     pub rows: Vec<Row>,
+    /// Shop message for the title (bought / not enough credits); cleared when a view opens.
+    notice: Option<String>,
 }
 
 /// Menu navigation (ui.rs `Nav`).
@@ -353,6 +387,14 @@ impl CustomizeMenu {
     }
 
     pub fn title(&self) -> String {
+        let t = self.view_title();
+        match &self.notice {
+            Some(n) => format!("{t}    ·    {n}"),
+            None => t,
+        }
+    }
+
+    fn view_title(&self) -> String {
         match self.view {
             View::Root => self.car.clone(),
             View::Paint => format!("{}  ·  paint {} / {}", self.car, self.cursor + 1, self.rows.len()),
@@ -437,6 +479,7 @@ impl CustomizeMenu {
                     _ => None,
                 };
                 if let Some(v) = view {
+                    self.notice = None;
                     self.root_cursor = k;
                     self.view = v;
                     // The cursor starts on what the car wears; set by build_rows.
@@ -527,6 +570,9 @@ impl CustomizeMenu {
 
     fn build_rows(&mut self, looks: &CarLooks) {
         let look = looks.get(&self.car);
+        // Prices are shown when the economy is on; what the saved look owns (or wears) shows as owned.
+        let shop = crate::progression::wallet::ownership_on();
+        let owned = self.owned_of(&looks.cars.get(&self.car).cloned().unwrap_or_default());
         self.kit_rows = (0..KIT_SLOTS.len()).filter(|&i| self.kit[i].len() > 1).collect();
         self.rows = match self.view {
             View::Root => {
@@ -577,9 +623,19 @@ impl CustomizeMenu {
                 .parts
                 .iter()
                 .map(|part| {
-                    let (_, name, effect) = &part.options[part.index(look.and_then(|l| l.upgrades.get(part.table).copied()))];
+                    let i = part.index(look.and_then(|l| l.upgrades.get(part.table).copied()));
+                    let (id, name, effect) = &part.options[i];
                     let effect = if effect.is_empty() { String::new() } else { format!("   {effect}") };
-                    row(part.label.clone(), Some(format!("‹  {name}  ›{effect}")))
+                    let tag = if !shop {
+                        String::new()
+                    } else if let Some(c) = upgrades::purchase_price(part, i, &owned.0) {
+                        format!("   ·  {} CR", crate::progression::fmt_num(c as i64))
+                    } else if i > 0 && owned.0.get(part.table).is_some_and(|v| v.contains(id)) {
+                        "   ·  owned".into()
+                    } else {
+                        String::new()
+                    };
+                    row(part.label.clone(), Some(format!("‹  {name}  ›{effect}{tag}")))
                 })
                 .collect(),
             View::Custom => {
@@ -591,13 +647,23 @@ impl CustomizeMenu {
                     row("Finish", Some(format!("‹  {}  ›", if self.metallic { "Metallic" } else { "Gloss" }))),
                 ]
             }
-            View::Rims => std::iter::once(row("Stock", None)).chain(self.rims.iter().map(|r| row(r.label.clone(), None))).collect(),
+            View::Rims => std::iter::once(row("Stock", None))
+                .chain(self.rims.iter().map(|r| {
+                    let tag = (shop && r.price > 0).then(|| if owned.1.contains(&r.media) { "Owned".to_string() } else { format!("{} CR", crate::progression::fmt_num(r.price as i64)) });
+                    row(r.label.clone(), tag)
+                }))
+                .collect(),
             View::Kit => self
                 .kit_rows
                 .iter()
                 .map(|&i| {
                     let o = &self.kit[i][self.kit_index(look, i)];
-                    row(KIT_SLOTS[i].2, Some(format!("‹  {}  ›", o.name())))
+                    let tag = if shop && !o.stock && o.price > 0 {
+                        if owned.0.get(KIT_SLOTS[i].1).is_some_and(|v| v.contains(&o.id)) { "   ·  owned".to_string() } else { format!("   ·  {} CR", crate::progression::fmt_num(o.price as i64)) }
+                    } else {
+                        String::new()
+                    };
+                    row(KIT_SLOTS[i].2, Some(format!("‹  {}  ›{tag}", o.name())))
                 })
                 .collect(),
         };
@@ -621,6 +687,69 @@ impl CustomizeMenu {
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
     }
 
+    /// Part row Ids and rims `saved` owns: its owned lists plus what it wears (looks saved before the economy).
+    fn owned_of(&self, saved: &CarLook) -> (upgrades::OwnedParts, Vec<String>) {
+        let mut ids = saved.owned_parts.clone();
+        let mut rims = saved.owned_rims.clone();
+        let add = |ids: &mut upgrades::OwnedParts, table: &str, id: i64| {
+            let v = ids.entry(table.to_owned()).or_default();
+            if id >= 0 && !v.contains(&id) {
+                v.push(id);
+            }
+        };
+        if let Some(r) = &saved.rim {
+            if !rims.contains(r) {
+                rims.push(r.clone());
+            }
+        }
+        for (i, slot) in KIT_SLOTS.iter().enumerate() {
+            if let Some(o) = saved.kit.get(slot.0).and_then(|&seq| self.kit[i].iter().find(|o| o.sequence == seq)) {
+                add(&mut ids, slot.1, o.id);
+            }
+        }
+        for (table, &id) in &saved.upgrades {
+            add(&mut ids, table, id);
+        }
+        (ids, rims)
+    }
+
+    /// Credits `look` costs over `saved` (paint is free), with the bought items' names; records them as owned in `look`.
+    fn charge(&self, saved: &CarLook, look: &mut CarLook) -> (i64, Vec<String>) {
+        let (ids, rims) = self.owned_of(saved);
+        look.owned_parts = ids;
+        look.owned_rims = rims;
+        let mut cost = 0i64;
+        let mut items = Vec::new();
+        if let Some(r) = look.rim.clone() {
+            if !look.owned_rims.contains(&r) {
+                if let Some(rim) = self.rims.iter().find(|x| x.media == r) {
+                    cost += rim.price as i64;
+                    items.push(rim.label.clone());
+                }
+                look.owned_rims.push(r);
+            }
+        }
+        for (i, slot) in KIT_SLOTS.iter().enumerate() {
+            let Some(o) = look.kit.get(slot.0).and_then(|&seq| self.kit[i].iter().find(|o| o.sequence == seq)).copied() else { continue };
+            if !o.stock && o.id >= 0 && !look.owned_parts.get(slot.1).is_some_and(|v| v.contains(&o.id)) {
+                cost += o.price as i64;
+                items.push(format!("{} {}", slot.2, o.name()));
+                look.owned_parts.entry(slot.1.to_owned()).or_default().push(o.id);
+            }
+        }
+        let chosen: Vec<(String, i64)> = look.upgrades.iter().map(|(t, &id)| (t.clone(), id)).collect();
+        for (table, id) in chosen {
+            let Some(part) = self.parts.iter().find(|p| p.table == table) else { continue };
+            let i = part.index(Some(id));
+            if let Some(c) = upgrades::purchase_price(part, i, &look.owned_parts) {
+                cost += c as i64;
+                items.push(part.label.clone());
+            }
+            upgrades::record_owned(part, i, &mut look.owned_parts);
+        }
+        (cost, items)
+    }
+
     /// Read the car's colours, kit rows and the rim list.
     fn load(&mut self, garage: &Garage) {
         let name = garage.cars[garage.current].clone();
@@ -637,7 +766,11 @@ impl CustomizeMenu {
                         .filter(|r| !r["exception"].as_bool().unwrap_or(false))
                         .filter_map(|r| {
                             let media = r["media_name"].as_str()?.to_owned();
-                            garage.assets.join("cars/wheels").join(&media).is_dir().then(|| Rim { label: format!("{}  {}", maker(r["maker"].as_str().unwrap_or("")), r["name"].as_str().unwrap_or(&media)), media })
+                            garage.assets.join("cars/wheels").join(&media).is_dir().then(|| Rim {
+                                label: format!("{}  {}", maker(r["maker"].as_str().unwrap_or("")), r["name"].as_str().unwrap_or(&media)),
+                                price: r["price"].as_u64().unwrap_or(0) as u32,
+                                media,
+                            })
                         })
                         .collect()
                 })
@@ -717,6 +850,7 @@ fn apply_requests(
     asset_server: Res<AssetServer>,
     mut cars: Query<(Entity, &mut Car), With<fh1_engine::ai::PlayerCar>>,
     bodies: Query<(Entity, &ChildOf), With<CarModel>>,
+    mut profile: Option<ResMut<crate::progression::Profile>>,
 ) {
     let m = &mut menu.custom;
     if m.pending.is_empty() {
@@ -794,7 +928,22 @@ fn apply_requests(
                 respawn |= set_preview(&mut looks, &m.car, look);
             }
             Req::Commit => {
-                if let Some((car, look)) = looks.preview.take() {
+                if let Some((car, mut look)) = looks.preview.take() {
+                    // Pay for the parts not owned yet (module doc); short of credits the preview is dropped.
+                    let (cost, items) = m.charge(&saved, &mut look);
+                    if cost > 0 && crate::progression::wallet::ownership_on() {
+                        if let Some(p) = profile.as_deref_mut() {
+                            let label = crate::progression::fmt_num(cost);
+                            if crate::progression::wallet::spend(p, cost, &format!("{car}: {}", items.join(", "))) {
+                                look.spent += cost;
+                                m.notice = Some(format!("Bought for {label} CR"));
+                            } else {
+                                m.notice = Some(format!("INSUFFICIENT CREDITS: {label} CR needed"));
+                                respawn = true;
+                                continue;
+                            }
+                        }
+                    }
                     if look == CarLook::default() {
                         looks.cars.remove(&car);
                     } else {
@@ -810,7 +959,12 @@ fn apply_requests(
             }
             Req::Reset => {
                 looks.preview = None;
-                if looks.cars.remove(&m.car).is_some() {
+                if let Some(old) = looks.cars.remove(&m.car) {
+                    // Bought parts stay owned (switching back to them is free).
+                    let keep = CarLook { owned_parts: old.owned_parts, owned_rims: old.owned_rims, spent: old.spent, ..default() };
+                    if keep != CarLook::default() {
+                        looks.cars.insert(m.car.clone(), keep);
+                    }
                     looks.save();
                     respawn = true;
                 }

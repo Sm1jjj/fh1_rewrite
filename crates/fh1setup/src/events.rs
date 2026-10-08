@@ -620,8 +620,8 @@ fn progression_tables(db: &Connection, text: &dyn Fn(&str) -> String, cars: &Has
         .map(|(id, badge, _, max_d, min_pi)| json!({"id": id, "name": badge.trim_start_matches("CLASS_"), "max_pi": max_d, "career_min_pi": min_pi}))
         .collect();
     let mut car_info = serde_json::Map::new();
-    for (media, class, pi, drive, year, make, selectable, display) in db
-        .prepare("SELECT MediaName, ClassID, PerformanceIndex, DriveTypeID, Year, MakeName, IsSelectable, DisplayName FROM Data_Car")?
+    for (media, class, pi, drive, year, make, selectable, display, cost, unicorn) in db
+        .prepare("SELECT MediaName, ClassID, PerformanceIndex, DriveTypeID, Year, MakeName, IsSelectable, DisplayName, BaseCost, IsUnicorn FROM Data_Car")?
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -632,14 +632,17 @@ fn progression_tables(db: &Connection, text: &dyn Fn(&str) -> String, cars: &Has
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<i64>>(6)?.unwrap_or(0),
                 r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                r.get::<_, Option<i64>>(9)?.unwrap_or(0),
             ))
         })?
         .filter_map(|r| r.ok())
     {
+        // `price`: Data_Car.BaseCost (autoshow price, credits; 0 = not for sale); `unicorn`: IsUnicorn (events-5).
         car_info.insert(
             media,
             json!({"class": class, "pi": display_pi(pi), "drive": drive, "year": year, "make": make.as_deref().map(text), "selectable": selectable != 0,
-                "name": display.as_deref().map(text).filter(|n| !n.starts_with("_&"))}),
+                "name": display.as_deref().map(text).filter(|n| !n.starts_with("_&")), "price": cost.max(0.0) as i64, "unicorn": unicorn != 0}),
         );
     }
     let drivers: Vec<Value> = db
@@ -695,8 +698,54 @@ fn tunables(disc: &Path) -> Result<Value> {
     collect_levels(&fame_doc, &mut fame);
     fame.sort_by_key(|x| -x.0);
     let feats = read("HorizonFeats.xml").unwrap_or(Value::Null);
-    println!("[events] tunables: {} fame levels, feats {}", fame.len(), if feats.is_null() { "missing" } else { "ok" });
-    Ok(json!({"fame": fame, "feats": feats}))
+    let sponsors = read("SponsorshipChallenges.xml").map(|v| sponsor_challenges(&v)).unwrap_or_default();
+    // GameTunableSettings.ini: `Section\Key value` lines (CarValueScales, RaceWinnings...), events-5.
+    let mut economy = serde_json::Map::new();
+    if let Some(e) = ar.entries.iter().find(|e| e.name.replace('\\', "/").rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case("GameTunableSettings.ini"))).cloned() {
+        let text = String::from_utf8_lossy(&ar.read(&e)?).into_owned();
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                if k.starts_with("CarValueScales\\") || k.starts_with("RaceWinnings\\") {
+                    if let Ok(x) = v.parse::<f64>() {
+                        economy.insert(k.replace('\\', "/"), json!(x));
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "[events] tunables: {} fame levels, feats {}, {} sponsor challenges, {} economy values",
+        fame.len(),
+        if feats.is_null() { "missing" } else { "ok" },
+        sponsors.len(),
+        economy.len()
+    );
+    Ok(json!({"fame": fame, "feats": feats, "sponsors": sponsors, "economy": economy}))
+}
+
+/// SponsorshipChallenges.xml -> [{id, type, ranks: [{level?, skill?, grade?, number?, credits}]}] (events-5).
+fn sponsor_challenges(doc: &Value) -> Vec<Value> {
+    let list = |v: &Value| -> Vec<Value> {
+        match v {
+            Value::Array(a) => a.clone(),
+            Value::Null => Vec::new(),
+            other => vec![other.clone()],
+        }
+    };
+    let challenges = list(&doc["SkillChallenges"]["Challenge"]);
+    challenges
+        .iter()
+        .map(|c| {
+            let ranks: Vec<Value> = list(&c["Rank"])
+                .iter()
+                .map(|r| {
+                    json!({"level": r["levelRequired"], "skill": r["skill"], "grade": r["grade"], "number": r["number"], "credits": r["credits"]})
+                })
+                .collect();
+            json!({"id": c["id"], "type": c["type"], "ranks": ranks})
+        })
+        .collect()
 }
 
 /// Every object with `rank` and `target` attributes, anywhere in the tree.

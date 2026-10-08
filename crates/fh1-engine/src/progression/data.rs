@@ -50,6 +50,42 @@ pub struct CarInfo {
     pub selectable: bool,
     /// `cars/<media>` is installed (AI can drive it).
     pub installed: bool,
+    /// Autoshow price: Data_Car.BaseCost (credits; 0 = not for sale), events-5; 0 before.
+    pub price: i64,
+    /// Data_Car.IsUnicorn (rare: prize / barn find only, not in the autoshow), events-5.
+    pub unicorn: bool,
+}
+
+/// One sponsor challenge rank (SponsorshipChallenges.xml): a popularity rank (`level`) or a skill count (`skill`,
+/// minimum `grade`: 0 = Ultimate .. 3 = base grade, 4 = any; combos have grade 0) paying `credits` once.
+#[derive(Clone, Debug)]
+pub struct SponsorRank {
+    pub level: Option<u32>,
+    pub skill: Option<String>,
+    pub grade: u32,
+    pub number: u32,
+    pub credits: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sponsor {
+    pub id: String,
+    pub ranks: Vec<SponsorRank>,
+}
+
+/// Car value rules (GameTunableSettings.ini CarValueScales, VERIFIED on the EU disc: Sell 0.5, Trade 0.95, Restocking
+/// 0.5, RewardCarsValue 100).
+#[derive(Clone, Debug)]
+pub struct Economy {
+    pub sell_value_scale: f64,
+    pub trade_value_scale: f64,
+    pub reward_cars_value: f64,
+}
+
+impl Default for Economy {
+    fn default() -> Self {
+        Self { sell_value_scale: 0.5, trade_value_scale: 0.95, reward_cars_value: 100.0 }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +109,9 @@ pub struct CareerData {
     pub fame: Vec<(u32, u64)>,
     /// Wristband reward cars (Rewards_Wristband: tier, car).
     pub wristband_cars: Vec<(u32, String)>,
+    /// Sponsor challenges (SponsorshipChallenges.xml), events-5; empty before (popularity sponsor = built-in copy).
+    pub sponsors: Vec<Sponsor>,
+    pub economy: Economy,
 }
 
 /// gamedb CareerWristbandLevels (XP, name) x WristbandScoring (points per place).
@@ -171,6 +210,8 @@ impl CareerData {
                         make: s(&c["make"]),
                         name: s(&c["name"]),
                         selectable: c["selectable"].as_bool().unwrap_or(false),
+                        price: c["price"].as_i64().or_else(|| c["price"].as_f64().map(|f| f as i64)).unwrap_or(0),
+                        unicorn: c["unicorn"].as_bool().unwrap_or(false),
                         installed: cars_dir.join(k).is_dir(),
                     },
                 )
@@ -191,6 +232,35 @@ impl CareerData {
             d.fame = fame;
         }
         d.wristband_cars = p["wristband_rewards"].as_array().into_iter().flatten().filter_map(|r| Some((u(&r["tier"]) as u32, r["car"].as_str()?.to_owned()))).collect();
+        d.sponsors = p["tunables"]["sponsors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                let id = c["id"].as_str()?.to_owned();
+                let ranks = c["ranks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|r| SponsorRank {
+                        level: (!r["level"].is_null()).then(|| u(&r["level"]) as u32),
+                        skill: r["skill"].as_str().map(str::to_owned),
+                        grade: if r["grade"].is_null() { 4 } else { u(&r["grade"]) as u32 },
+                        number: u(&r["number"]) as u32,
+                        credits: u(&r["credits"]) as i64,
+                    })
+                    .collect();
+                Some(Sponsor { id, ranks })
+            })
+            .collect();
+        let eco = &p["tunables"]["economy"];
+        let f = |k: &str, d: f64| eco[k].as_f64().unwrap_or(d);
+        let e = Economy::default();
+        d.economy = Economy {
+            sell_value_scale: f("CarValueScales/SellValueScale", e.sell_value_scale),
+            trade_value_scale: f("CarValueScales/TradeValueScale", e.trade_value_scale),
+            reward_cars_value: f("CarValueScales/RewardCarsValue", e.reward_cars_value),
+        };
         d
     }
 
@@ -213,7 +283,18 @@ impl CareerData {
             };
             fame.push((rank, target));
         }
-        Self { installed: false, wristbands, hubs: Vec::new(), classes, cars: HashMap::new(), drivers: HashMap::new(), fame, wristband_cars: Vec::new() }
+        Self {
+            installed: false,
+            wristbands,
+            hubs: Vec::new(),
+            classes,
+            cars: HashMap::new(),
+            drivers: HashMap::new(),
+            fame,
+            wristband_cars: Vec::new(),
+            sponsors: Vec::new(),
+            economy: Economy::default(),
+        }
     }
 
     /// Wristband index worn at `xp`.

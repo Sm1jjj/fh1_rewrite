@@ -20,6 +20,7 @@ pub mod assists;
 pub mod browser;
 pub mod customize;
 pub mod customize_upgrades;
+pub mod garage;
 pub mod graphics;
 pub mod hud;
 // L1: launch screen + loading covers.
@@ -79,6 +80,8 @@ impl Plugin for UiPlugin {
             .add_plugins(assists::AssistsPlugin)
             // Options > Graphics: AA, render scale, quality preset (P8).
             .add_plugins(graphics::GraphicsPlugin)
+            // Garage: My cars / Autoshow on the credits ledger (P10).
+            .add_plugins(garage::GaragePlugin)
             // Garage > Customize (ui/customize.rs; garage.json beside settings.json).
             .add_plugins(customize::CustomizePlugin { path: self.settings_path.with_file_name("garage.json") })
             // L1: launch screen and loading covers (FH1_LAUNCH_SCREEN=0 / FH1_LOADING=0).
@@ -242,6 +245,8 @@ pub struct Menu {
     custom: customize::CustomizeMenu,
     /// The world map was opened straight from driving (pad Back tap / Tab): leaving it resumes.
     map_direct: bool,
+    /// Garage modes of the car page (My cars / Autoshow), buy / sell dialogs (ui/garage.rs).
+    shop: garage::ShopState,
 }
 
 impl Menu {
@@ -828,6 +833,8 @@ enum Act {
     Resume,
     Restart,
     Open(Page),
+    /// The car page in a garage mode (My cars / Autoshow).
+    Cars(garage::Mode),
     Photo,
     Quit,
     Opt(Opt),
@@ -933,6 +940,10 @@ fn items(menu: &Menu, settings: &Settings, garage: &Garage, track: &Track, maps:
                 0,
             )
         }
+        Page::Garage if garage::shop_on() => (
+            vec![item("My cars", Act::Cars(garage::Mode::Owned)), item("Autoshow", Act::Cars(garage::Mode::Shop)), item("Customize", Act::Open(Page::Customize))],
+            0,
+        ),
         Page::Garage => (vec![item("Change car", Act::Open(Page::Cars)), item("Customize", Act::Open(Page::Customize))], 0),
         Page::Customize => {
             let all = &menu.custom.rows;
@@ -1233,6 +1244,30 @@ fn menu_input(
         close_menu(&mut menu, &settings, &path);
         return;
     }
+    if menu.page == Page::Cars {
+        // Garage (ui/garage.rs): a car just bought is driven.
+        if let Some(i) = menu.shop.drive.take() {
+            browser_pick(browser::Pick::Car(i), &mut menu, &mut settings, &path, &garage, &track, &mut actions, &mut exit, &mut switch);
+            return;
+        }
+        // The buy / sell dialog takes the input while it is up.
+        if menu.shop.confirm.is_some() {
+            if nav.confirm || nav.back || nav.toggle {
+                menu.shop.answer(nav.confirm);
+                menu.dirty = true;
+            }
+            return;
+        }
+        // My cars: Delete / R3 sells the selected car (after the dialog).
+        let sell = keys.just_pressed(KeyCode::Delete) || pads.iter().any(|p| p.just_pressed(GamepadButton::RightThumb));
+        if sell && menu.shop.mode == garage::Mode::Owned {
+            if let Some(i) = menu.cars.as_ref().and_then(|b| b.selected()).map(|e| e.index) {
+                menu.shop.ask_sell(i);
+                menu.dirty = true;
+            }
+            return;
+        }
+    }
     if matches!(menu.page, Page::Cars | Page::Maps) && !nav.toggle {
         // B1: controller mapping of browser.rs (LB/RB games, LT/RT jumps, X/View filters, Y sort, held repeat).
         let input = browser::read_input(&keys, &pads, &mut menu.browse_repeat, time.delta_secs());
@@ -1248,7 +1283,7 @@ fn menu_input(
         match step {
             customize::Step::Leave => {
                 menu.page = Page::Garage;
-                menu.cursor = 1;
+                menu.cursor = garage::customize_row();
                 menu.dirty = true;
             }
             customize::Step::Stay { changed } => menu.dirty |= changed,
@@ -1314,7 +1349,7 @@ fn browser_pick(
         browser::Pick::Browsing { changed } => menu.dirty |= changed,
         browser::Pick::Leave => {
             if menu.page == Page::Cars && customize::enabled() {
-                menu.cursor = 0;
+                menu.cursor = if menu.shop.mode == garage::Mode::Shop { 1 } else { 0 };
                 menu.page = Page::Garage;
             } else {
                 menu.cursor = if menu.page == Page::Cars { 3 } else { 5 };
@@ -1323,6 +1358,11 @@ fn browser_pick(
             menu.dirty = true;
         }
         browser::Pick::Car(i) => {
+            // Autoshow: a car not owned asks to buy it first (ui/garage.rs).
+            if menu.page == Page::Cars && !menu.shop.pick(i) {
+                menu.dirty = true;
+                return;
+            }
             if i != garage.current {
                 actions.write(GameAction::SelectCar(i));
             }
@@ -1379,12 +1419,23 @@ fn activate(
         Act::Open(p) => {
             menu.page = p;
             menu.cursor = 0;
+            if p == Page::Cars {
+                menu.shop.open(garage::Mode::All);
+            }
             if matches!(p, Page::Cars | Page::Maps) {
                 menu.open_browsers(garage, &track.id);
             }
             if p == Page::Customize {
                 menu.custom.open();
             }
+            menu.dirty = true;
+        }
+        Act::Cars(mode) => {
+            menu.page = Page::Cars;
+            menu.cursor = 0;
+            menu.shop.open(mode);
+            // ui/garage.rs replaces this list with the mode's (same frame, before drawing).
+            menu.open_browsers(garage, &track.id);
             menu.dirty = true;
         }
         Act::Custom(k) => {
@@ -1491,6 +1542,7 @@ fn draw_menu(
     mut root: Query<&mut Visibility, With<MenuRoot>>,
     panel: Query<Entity, With<MenuPanel>>,
     fh1: Option<Res<Fh1Pause>>,
+    (profile, asset_server): (Option<Res<crate::progression::Profile>>, Res<AssetServer>),
 ) {
     if !menu.dirty && !(menu.open && settings.is_changed()) {
         return;
@@ -1517,47 +1569,96 @@ fn draw_menu(
             Page::Customize => menu.custom.title(),
             _ => car.clone(),
         };
+        // Garage pages: the credits balance (progression::wallet).
+        let shop_page = matches!(menu.page, Page::Garage | Page::Customize) || (menu.page == Page::Cars && menu.shop.mode != garage::Mode::All);
+        let sub = match profile.as_deref().filter(|_| shop_page && garage::shop_on()) {
+            Some(pr) => format!("{sub}    ·    {} CR", crate::progression::fmt_num(crate::progression::wallet::credits(pr))),
+            None => sub,
+        };
         p.spawn((Text::new(sub), font.text(16.0), TextColor(DIM), Node { margin: UiRect::bottom(Val::Px(14.0)), ..default() }));
-        for (i, it) in rows.iter().enumerate() {
-            let on = i == sel;
-            let fg = if on { Color::WHITE } else { Color::srgba(1.0, 1.0, 1.0, 0.8) };
-            let selectable = !matches!(it.act, Act::None);
-            let mut row = p.spawn((
-                MenuRow(i),
-                Node {
-                    height: Val::Px(if menu.page == Page::Controls { 32.0 } else { 42.0 }),
-                    padding: UiRect::horizontal(Val::Px(14.0)),
-                    column_gap: Val::Px(40.0),
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                BackgroundColor(if on && selectable { ACCENT } else { Color::NONE }),
-            ));
-            if selectable {
-                row.insert(Button);
+        if menu.page == Page::Cars {
+            if let Some(n) = &menu.shop.notice {
+                p.spawn((Text::new(n.clone()), font.text(18.0), TextColor(ACCENT), Node { margin: UiRect::bottom(Val::Px(10.0)), ..default() }));
             }
-            row.with_children(|r| {
-                r.spawn((Text::new(it.label.clone()), font.text(22.0), TextColor(fg)));
-                if let Some(v) = &it.value {
-                    let v = if on && matches!(it.act, Act::Opt(_)) { format!("‹  {v}  ›") } else { v.clone() };
-                    let size = if menu.page == Page::Controls { 16.0 } else { 20.0 };
-                    // Customize paint rows: the value in the paint's own colour.
-                    let swatch = if menu.page == Page::Customize { menu.custom.rows.get(first + i).and_then(|r| r.swatch) } else { None };
-                    r.spawn((Text::new(v), font.text(size), TextColor(swatch.unwrap_or(if on { Color::WHITE } else { DIM }))));
-                }
+            // The buy / sell dialog replaces the list.
+            if let Some(c) = &menu.shop.confirm {
+                p.spawn((Text::new(c.title.clone()), font.text(30.0), TextColor(Color::WHITE), Node { margin: UiRect::top(Val::Px(20.0)), ..default() }));
+                p.spawn((Text::new(c.message.clone()), font.text(20.0), TextColor(Color::WHITE), Node { margin: UiRect::vertical(Val::Px(12.0)), max_width: Val::Px(760.0), ..default() }));
+                p.spawn((Text::new("Enter / A  confirm      Esc / B  cancel"), font.text(15.0), TextColor(DIM), Node { margin: UiRect::top(Val::Px(16.0)), ..default() }));
+                return;
+            }
+        }
+        if menu.page == Page::Cars {
+            // The car page: rows on the left, the selected car's photo and details on the right.
+            p.spawn(Node { flex_direction: FlexDirection::Row, column_gap: Val::Px(28.0), align_items: AlignItems::FlexStart, ..default() }).with_children(|c| {
+                c.spawn(Node { flex_direction: FlexDirection::Column, ..default() }).with_children(|l| spawn_rows(l, &menu, &rows, sel, first, &font));
+                let Some(b) = menu.cars.as_ref() else { return };
+                let selected = b.selected();
+                let view = b.view();
+                c.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), width: Val::Px(384.0), ..default() }).with_children(|d| {
+                    // The game's own photo (ui group thumbnails/thumbnail_<Data_Car.Id>.png, FH1 cars).
+                    if let Some(id) = selected.and_then(|e| e.id) {
+                        d.spawn((
+                            ImageNode { image: asset_server.load(format!("ui/textures/thumbnails/thumbnail_{id}.png")), image_mode: NodeImageMode::Stretch, ..default() },
+                            Node { width: Val::Px(384.0), height: Val::Px(144.0), margin: UiRect::bottom(Val::Px(8.0)), ..default() },
+                        ));
+                    }
+                    if let Some((title, lines)) = view.details {
+                        d.spawn((Text::new(title), font.text(20.0), TextColor(Color::WHITE)));
+                        for (k, v) in lines {
+                            let line = if k.is_empty() { v } else { format!("{k}:  {v}") };
+                            d.spawn((Text::new(line), font.text(16.0), TextColor(DIM)));
+                        }
+                    }
+                });
             });
+        } else {
+            spawn_rows(p, &menu, &rows, sel, first, &font);
         }
         let hint: String = match menu.page {
             Page::Main => "Enter / A  select      Esc / B  resume".into(),
             Page::Options | Page::Graphics => "Left / Right  change      Esc / B  back".into(),
-            Page::Cars => menu.cars.as_ref().map_or("Esc / B  back".into(), |b| b.hint()),
+            Page::Cars => menu.cars.as_ref().map_or("Esc / B  back".into(), |b| format!("{}{}", b.hint(), menu.shop.hint_extra())),
             Page::Maps => menu.maps.hint(),
             Page::Customize => menu.custom.hint(),
             _ => "Enter / A  select      Esc / B  back".into(),
         };
         p.spawn((Text::new(hint), font.text(15.0), TextColor(DIM), Node { margin: UiRect::top(Val::Px(16.0)), ..default() }));
     });
+}
+
+/// The page's rows under `p` (the panel, or the car page's list column).
+fn spawn_rows(p: &mut ChildSpawnerCommands, menu: &Menu, rows: &[Item], sel: usize, first: usize, font: &UiFont) {
+    for (i, it) in rows.iter().enumerate() {
+        let on = i == sel;
+        let fg = if on { Color::WHITE } else { Color::srgba(1.0, 1.0, 1.0, 0.8) };
+        let selectable = !matches!(it.act, Act::None);
+        let mut row = p.spawn((
+            MenuRow(i),
+            Node {
+                height: Val::Px(if menu.page == Page::Controls { 32.0 } else { 42.0 }),
+                padding: UiRect::horizontal(Val::Px(14.0)),
+                column_gap: Val::Px(40.0),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(if on && selectable { ACCENT } else { Color::NONE }),
+        ));
+        if selectable {
+            row.insert(Button);
+        }
+        row.with_children(|r| {
+            r.spawn((Text::new(it.label.clone()), font.text(22.0), TextColor(fg)));
+            if let Some(v) = &it.value {
+                let v = if on && matches!(it.act, Act::Opt(_)) { format!("‹  {v}  ›") } else { v.clone() };
+                let size = if menu.page == Page::Controls { 16.0 } else { 20.0 };
+                // Customize paint rows: the value in the paint's own colour.
+                let swatch = if menu.page == Page::Customize { menu.custom.rows.get(first + i).and_then(|r| r.swatch) } else { None };
+                r.spawn((Text::new(v), font.text(size), TextColor(swatch.unwrap_or(if on { Color::WHITE } else { DIM }))));
+            }
+        });
+    }
 }
 
 /// The saved renderer choice: "rtx", "remaster" or "faithful".

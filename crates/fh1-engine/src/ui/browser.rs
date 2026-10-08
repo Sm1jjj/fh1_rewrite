@@ -32,6 +32,8 @@ pub struct CarEntry {
     pub drive: String,
     /// The car's `physics.json` (stats for the details panel, read on demand).
     pub physics: Option<std::path::PathBuf>,
+    /// gamedb Data_Car.Id (FH1 cars; `ui/textures/thumbnails/thumbnail_<id>.png`, the game's own car photo).
+    pub id: Option<i64>,
 }
 
 impl CarEntry {
@@ -299,6 +301,18 @@ impl CarCatalog {
     pub fn entry_of(&self, garage_index: usize) -> Option<&CarEntry> {
         self.entries.iter().find(|e| e.index == garage_index)
     }
+
+    /// The entries `keep` accepts (garage indices unchanged), for the garage / autoshow lists (ui/garage.rs).
+    pub fn subset(&self, keep: impl Fn(&CarEntry) -> bool) -> CarCatalog {
+        let mut out = CarCatalog::default();
+        for e in self.entries.iter().filter(|e| keep(e)) {
+            if !out.games.contains(&e.game) {
+                out.games.push(e.game.clone());
+            }
+            out.entries.push(e.clone());
+        }
+        out
+    }
 }
 
 fn fh1_entry(index: usize, assets: &Path, media: &str, text: &impl Fn(&str) -> String) -> CarEntry {
@@ -315,6 +329,7 @@ fn fh1_entry(index: usize, assets: &Path, media: &str, text: &impl Fn(&str) -> S
         pi: car["PerformanceIndex"].as_f64().map(fh1_display_pi),
         drive: drive_name(car["DriveTypeID"].as_i64()).into(),
         physics: None,
+        id: phys["id"].as_i64(),
     }
 }
 
@@ -322,7 +337,7 @@ fn imported_entry(index: usize, game: &str, media: &str, row: Option<&Value>) ->
     let game_label = game.to_ascii_uppercase();
     // The import contract (FH2, FM4).
     let Some((r, name)) = row.and_then(|r| Some((r, r["name"].as_str()?))) else {
-        return CarEntry { index, game: game_label, maker: "Other".into(), name: media.into(), year: None, class: None, pi: None, drive: String::new(), physics: None };
+        return CarEntry { index, game: game_label, maker: "Other".into(), name: media.into(), year: None, class: None, pi: None, drive: String::new(), physics: None, id: None };
     };
     CarEntry {
         index,
@@ -334,6 +349,7 @@ fn imported_entry(index: usize, game: &str, media: &str, row: Option<&Value>) ->
         pi: r["pi"].as_i64(),
         drive: r["drive"].as_str().unwrap_or("").to_owned(),
         physics: None,
+        id: None,
     }
 }
 
@@ -643,6 +659,9 @@ pub struct CarBrowser {
     /// Last manufacturer per game, and last car (garage index) per (game, manufacturer or "*").
     mem_maker: HashMap<String, Option<String>>,
     mem_car: HashMap<(String, String), usize>,
+    /// Per garage index: a (label, value) shown after the row's value and in the details panel (garage / autoshow:
+    /// price, owned, sell value; ui/garage.rs).
+    pub tags: std::sync::Arc<HashMap<usize, (String, String)>>,
 }
 
 impl CarBrowser {
@@ -660,6 +679,7 @@ impl CarBrowser {
             current,
             mem_maker: HashMap::new(),
             mem_car: HashMap::new(),
+            tags: Default::default(),
         };
         let cat = b.catalog.clone();
         if let Some(e) = cat.entry_of(current) {
@@ -667,8 +687,21 @@ impl CarBrowser {
             b.maker = Some(e.maker.clone());
             b.mem_maker.insert(e.game.clone(), b.maker.clone());
             b.enter_cars();
+        } else if cat.games.len() == 1 {
+            // A one-game list without the current car (the autoshow): open on its manufacturers.
+            b.enter_makers();
         }
         b
+    }
+
+    /// The car tags (see [`CarBrowser::tags`]).
+    pub fn with_tags(mut self, tags: HashMap<usize, (String, String)>) -> Self {
+        self.tags = std::sync::Arc::new(tags);
+        self
+    }
+
+    fn tag(&self, index: usize) -> String {
+        self.tags.get(&index).map(|t| format!("  ·  {}", t.1)).unwrap_or_default()
     }
 
     fn game_name(&self) -> String {
@@ -822,7 +855,7 @@ impl CarBrowser {
                         let e = &cat.entries[i];
                         BrowserRow {
                             label: if all { format!("{} {}", e.maker, e.name) } else { e.name.clone() },
-                            value: Some(format!("{}{}", e.detail(), here(e.index == self.current))),
+                            value: Some(format!("{}{}{}", e.detail(), self.tag(e.index), here(e.index == self.current))),
                         }
                     })
                     .collect()
@@ -1007,6 +1040,9 @@ impl CarBrowser {
                         if let Some(v) = s.top_mph {
                             lines.push(("Top speed".into(), format!("{v:.0} mph")));
                         }
+                    }
+                    if let Some((k, v)) = self.tags.get(&e.index) {
+                        lines.push((k.clone(), v.clone()));
                     }
                     if e.index == self.current {
                         lines.push((String::new(), "Current car".into()));
@@ -1433,7 +1469,7 @@ mod tests {
     }
 
     fn car(index: usize, game: &str, maker: &str, name: &str, class: &str, pi: i64) -> CarEntry {
-        CarEntry { index, game: game.into(), maker: maker.into(), name: name.into(), year: Some(2000), class: Some(class.into()), pi: Some(pi), drive: "RWD".into(), physics: None }
+        CarEntry { index, game: game.into(), maker: maker.into(), name: name.into(), year: Some(2000), class: Some(class.into()), pi: Some(pi), drive: "RWD".into(), physics: None, id: None }
     }
 
     fn catalog() -> std::sync::Arc<CarCatalog> {

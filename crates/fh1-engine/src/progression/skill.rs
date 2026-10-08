@@ -645,6 +645,10 @@ fn bank(chain: &Chain, events: &Events, profile: &mut Profile, banners: &mut Ban
     for a in &chain.awards {
         let key = if a.kind == SkillKind::Combo { a.label.clone() } else { a.kind.label().to_owned() };
         *p.skills.counts.entry(key).or_default() += 1;
+        // Sponsor skill counts by grade (P10 economy).
+        if let Some((name, grade)) = sponsor_skill(a) {
+            p.skill_grades.entry(name.to_owned()).or_default()[grade] += 1;
+        }
     }
     let rank = c.rank(p.fame);
     if rank < rank_before {
@@ -664,7 +668,82 @@ fn bank(chain: &Chain, events: &Events, profile: &mut Profile, banners: &mut Ban
         }
         super::pay_rank_milestones(profile, rank, banners);
     }
+    pay_skill_sponsors(profile, c, banners);
     profile.commit();
+}
+
+/// SponsorshipChallenges.xml skill name and grade (0 = Ultimate .. 3 = base grade) of an award; None = no sponsor
+/// counts it. Combos have one grade (0).
+fn sponsor_skill(a: &Award) -> Option<(&'static str, usize)> {
+    let name = match a.kind {
+        SkillKind::Drift => "Drift",
+        SkillKind::Air => "Air",
+        SkillKind::NearMiss => "NearMiss",
+        SkillKind::Pass => "Pass",
+        SkillKind::CleanSpeed => "CleanSpeed",
+        SkillKind::Draft => "Draft",
+        SkillKind::Burnout => "Burnout",
+        SkillKind::Combo => {
+            let n = match a.label.as_str() {
+                "DAREDEVIL" => "Daredevil",
+                "SLINGSHOT" => "SlingShot",
+                "STUNTMAN" => "Stuntman",
+                "SUPERMAN" => "Superman",
+                "KANGAROO" => "Kangaroo",
+                "TRIPLE PASS" => "TriplePass",
+                "SHOW OFF" => "ShowOff",
+                "LUCKY ESCAPE" => "LuckyEscape",
+                "QUICK OFF THE MARK" => "QuickOffTheMark",
+                "EBISU STYLE" => "EbisuStyle",
+                _ => return None,
+            };
+            return Some((n, 0));
+        }
+    };
+    // HorizonFeats grade 1..4 (4 = Ultimate) from the fame -> sponsor grade 3..0.
+    let (_, fames) = a.kind.grades();
+    let g = fames.iter().position(|&f| f == a.fame).unwrap_or(0);
+    Some((name, 3 - g.min(3)))
+}
+
+/// Pays every SkillChallenge sponsor rank newly reached (once each, in order; profile `sponsor_paid` = ranks paid per
+/// challenge). Skill names: a single skill, `AnySkill` (any non-combo), `AnyCombo`, `Any`. A rank's grade is the
+/// minimum: awards of that grade or better count (4 = any grade). Popularity ranks (FameRankChallenge) stay with
+/// `pay_rank_milestones`.
+fn pay_skill_sponsors(profile: &mut Profile, c: &super::data::CareerData, banners: &mut Banners) {
+    const COMBOS: [&str; 10] =
+        ["Daredevil", "SlingShot", "Stuntman", "Superman", "Kangaroo", "TriplePass", "ShowOff", "LuckyEscape", "QuickOffTheMark", "EbisuStyle"];
+    let count = |p: &super::profile::ProfileData, skill: &str, grade: u32| -> u32 {
+        let of = |name: &str| p.skill_grades.get(name).map_or(0, |g| g.iter().take(grade.min(3) as usize + 1).sum::<u32>());
+        match skill {
+            "AnySkill" => ["Drift", "Air", "NearMiss", "Pass", "CleanSpeed", "Draft", "Burnout"].iter().map(|n| of(n)).sum(),
+            "AnyCombo" => COMBOS.iter().map(|n| of(n)).sum(),
+            "Any" => ["Drift", "Air", "NearMiss", "Pass", "CleanSpeed", "Draft", "Burnout"].iter().chain(COMBOS.iter()).map(|n| of(n)).sum(),
+            name => of(name),
+        }
+    };
+    let mut paid = Vec::new();
+    for sp in &c.sponsors {
+        let done = profile.data.sponsor_paid.get(&sp.id).copied().unwrap_or(0) as usize;
+        let mut reached = done;
+        for r in sp.ranks.iter().skip(done) {
+            let Some(skill) = r.skill.as_deref() else { break };
+            if count(&profile.data, skill, r.grade) < r.number {
+                break;
+            }
+            reached += 1;
+            paid.push((sp.id.clone(), r.number, r.credits));
+        }
+        if reached > done {
+            profile.data.sponsor_paid.insert(sp.id.clone(), reached as u32);
+        }
+    }
+    for (id, n, cr) in paid {
+        let reason = format!("Sponsor: {id} x{n}");
+        super::wallet::apply(profile, cr, &reason);
+        banners.push(format!("SPONSOR  {id} x{n}  +{} CR", fmt_num(cr)));
+        banners.1.push(super::CareerNotice::Payout { credits: cr, reason });
+    }
 }
 
 /// Send the outbox as `SkillEvent` messages.

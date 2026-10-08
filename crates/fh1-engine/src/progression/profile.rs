@@ -30,6 +30,41 @@ pub struct SkillStats {
     pub chains_lost: u32,
 }
 
+/// How an owned car was acquired (wallet.rs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CarSource {
+    #[default]
+    Starter,
+    Bought,
+    /// Event prize (Rewards_EventPrizes).
+    Prize,
+    /// Wristband reward (Rewards_Wristband).
+    Wristband,
+    BarnFind,
+}
+
+/// One car in the player's garage (profile.json `owned`, version 2).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OwnedCar {
+    /// MediaName.
+    pub car: String,
+    pub source: CarSource,
+    /// Credits paid (0 for starter / prize / reward cars).
+    pub paid: i64,
+}
+
+/// One credits change (profile.json `ledger`, the last [`LEDGER_LEN`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LedgerEntry {
+    pub delta: i64,
+    pub balance: i64,
+    pub reason: String,
+}
+
+pub const LEDGER_LEN: usize = 100;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfileData {
@@ -47,11 +82,19 @@ pub struct ProfileData {
     /// Best popularity rank already paid out (sponsor milestones once).
     pub rank_paid: u32,
     pub skills: SkillStats,
+    /// Version 2 (P10 economy, 2026-10-08): the garage, the last credit changes, sponsor ranks paid per challenge id,
+    /// and skill awards per sponsor skill name and grade (0 = Ultimate .. 3 = base grade).
+    pub owned: Vec<OwnedCar>,
+    pub ledger: Vec<LedgerEntry>,
+    pub sponsor_paid: BTreeMap<String, u32>,
+    pub skill_grades: BTreeMap<String, [u32; 4]>,
 }
 
 #[derive(Resource)]
 pub struct Profile {
     pub data: ProfileData,
+    /// Credit changes not yet sent as `CreditsChanged` messages (wallet.rs; flushed every frame).
+    pub(crate) credit_events: Vec<super::wallet::CreditsChanged>,
     path: PathBuf,
     /// Bumped on every change (catalog / screens rebuild).
     pub generation: u32,
@@ -62,8 +105,9 @@ pub struct Profile {
 impl Profile {
     pub fn load(path: PathBuf, persist: bool) -> Self {
         let data = if persist { read(&path) } else { ProfileData::default() };
-        let data = ProfileData { version: 1, rank_paid: if data.rank_paid == 0 { 250 } else { data.rank_paid }, ..data };
-        Self { data, path, generation: 1, persist }
+        let mut data = ProfileData { rank_paid: if data.rank_paid == 0 { 250 } else { data.rank_paid }, ..data };
+        super::wallet::migrate(&mut data);
+        Self { data, credit_events: Vec::new(), path, generation: 1, persist }
     }
 
     /// Mark changed and save.

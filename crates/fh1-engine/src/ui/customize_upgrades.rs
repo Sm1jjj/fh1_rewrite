@@ -55,6 +55,9 @@ const BARS: [(&str, &str, &str); 2] = [("Platform", "List_UpgradeAntiSwayFront",
 
 const BOOST: [&str; 5] = ["List_UpgradeEngineTurboSingle", "List_UpgradeEngineTurboTwin", "List_UpgradeEngineTurboQuad", "List_UpgradeEngineCSC", "List_UpgradeEngineDSC"];
 
+/// A car's bought parts: gamedb table -> row Ids (garage.json `owned_parts`; row Ids repeat across tables).
+pub type OwnedParts = BTreeMap<String, Vec<i64>>;
+
 /// `FH1_UPGRADES=0`: saved upgrades are not applied to the physics (the menu still shows them).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -68,12 +71,60 @@ pub struct Part {
     pub label: String,
     /// (row Id, option name, short effect vs stock).
     pub options: Vec<(i64, String, String)>,
+    /// Shop price of each option (gamedb `Price`, credits), index-aligned with `options`; 0 for stock / "None".
+    pub prices: Vec<u32>,
 }
 
 impl Part {
     /// Option index of the row `chosen` (0 = stock).
     pub fn index(&self, chosen: Option<i64>) -> usize {
         chosen.and_then(|id| self.options.iter().position(|o| o.0 == id)).unwrap_or(0)
+    }
+
+    /// What installing option `i` costs now: 0 for stock, "None" or a part the car already owns (`owned` = the car's
+    /// garage.json `owned_parts`: table -> bought row Ids; row Ids repeat across tables, so they are kept per table).
+    /// FH1 / FM4 keep bought parts with the car; switching back is free and nothing is refunded (INFERRED for FH1).
+    pub fn cost(&self, i: usize, owned: &OwnedParts) -> u32 {
+        let Some(&(id, ..)) = self.options.get(i) else { return 0 };
+        if id < 0 || owned.get(self.table).is_some_and(|v| v.contains(&id)) {
+            return 0;
+        }
+        self.prices.get(i).copied().unwrap_or(0)
+    }
+}
+
+/// Buying option `i` of `part`: the price to charge (None = free: stock, "None" or owned). Call the wallet's
+/// `can_afford` / `spend` with it, then [`record_owned`] on success.
+pub fn purchase_price(part: &Part, i: usize, owned: &OwnedParts) -> Option<u32> {
+    Some(part.cost(i, owned)).filter(|&c| c > 0)
+}
+
+/// Credits paid for the car's bought parts (`owned` = garage.json `owned_parts`): the gamedb `Price` of each owned row
+/// (stock rows cost nothing). For the sell flow (progression wallet `sell_price(.., parts_value)`).
+pub fn parts_value(doc: &Value, owned: &OwnedParts) -> u32 {
+    owned
+        .iter()
+        .flat_map(|(table, ids)| rows(doc, table).iter().filter(move |r| r["Id"].as_i64().is_some_and(|id| ids.contains(&id))))
+        .filter(|r| r["IsStock"].as_i64() != Some(1))
+        .map(|r| num(r, "Price").unwrap_or(0.0).max(0.0) as u32)
+        .sum()
+}
+
+/// [`parts_value`] for `car` from the installed `upgrades/cars/<car>.json`.
+pub fn parts_value_for(assets: &Path, car: &str, owned: &OwnedParts) -> u32 {
+    if owned.is_empty() {
+        return 0;
+    }
+    parts_value(&read_doc(assets, car), owned)
+}
+
+/// Remember that the car owns option `i` of `part` (after a successful spend).
+pub fn record_owned(part: &Part, i: usize, owned: &mut OwnedParts) {
+    if let Some(&(id, ..)) = part.options.get(i) {
+        let ids = owned.entry(part.table.to_owned()).or_default();
+        if id >= 0 && !ids.contains(&id) {
+            ids.push(id);
+        }
     }
 }
 
@@ -110,9 +161,11 @@ pub fn catalog(doc: &Value) -> Vec<Part> {
             let rows = rows(doc, table);
             let stock = stock_row(doc, table);
             let mut options: Vec<(i64, String, String)> = Vec::new();
+            let mut prices: Vec<u32> = Vec::new();
             // A car without the part (e.g. no turbo): an implicit "None" option first.
             if stock.is_none() {
                 options.push((-1, "None".into(), String::new()));
+                prices.push(0);
             }
             for r in rows {
                 let Some(id) = r["Id"].as_i64() else { continue };
@@ -121,8 +174,9 @@ pub fn catalog(doc: &Value) -> Vec<Part> {
                 // Same level twice (a few tables): keep the names apart.
                 let name = if options.iter().any(|o| o.1 == name) { format!("{name} {}", options.len()) } else { name };
                 options.push((id, name, effect(r, stock)));
+                prices.push(if is_stock { 0 } else { num(r, "Price").unwrap_or(0.0).max(0.0) as u32 });
             }
-            (options.len() > 1).then(|| Part { table, label: format!("{area} · {label}"), options })
+            (options.len() > 1).then(|| Part { table, label: format!("{area} · {label}"), options, prices })
         })
         .collect()
 }
