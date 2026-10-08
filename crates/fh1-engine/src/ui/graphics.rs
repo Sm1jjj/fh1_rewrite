@@ -1,6 +1,6 @@
 //! Options > Graphics (P8-A, 2026-10-08; docs/PERF.md "P8"): quality preset, anti-aliasing, render scale + CAS.
 //!
-//! - **Anti-aliasing** Off / FXAA / SMAA (default) / MSAA 4x. Before this the main camera had no `Msaa` component, so
+//! - **Anti-aliasing** Off / FXAA / SMAA / MSAA 4x (default since 2026-10-08 pm, user). Before this the main camera had no `Msaa` component, so
 //!   Bevy's default 4x MSAA rendered every main pass into 4x HDR targets plus a resolve. FXAA / SMAA go on the main
 //!   camera (after tonemapping and the remaster grade). Every window camera (HUD, world map, render-scale blit) gets the
 //!   same `Msaa`: Bevy keys the shared window texture on it, and a mismatch gives the HUD its own never-cleared texture
@@ -79,8 +79,9 @@ impl Quality {
 pub enum AntiAlias {
     Off,
     Fxaa,
-    #[default]
     Smaa,
+    /// Default since 2026-10-08 pm (user).
+    #[default]
     Msaa4,
 }
 
@@ -119,7 +120,7 @@ pub struct GraphicsSettings {
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
-        Self { quality: Quality::High, aa: AntiAlias::Smaa, render_scale: 1.0 }
+        Self { quality: Quality::High, aa: AntiAlias::Msaa4, render_scale: 1.0 }
     }
 }
 
