@@ -17,13 +17,18 @@ use crate::Error;
 /// Where [`retail_key`] looks for the key file when `FH1_XEX_KEY` is not set.
 pub const KEY_FILE: &str = "data/xex_key.txt";
 
-/// The retail XEX key from `FH1_XEX_KEY` or [`KEY_FILE`] (32 hex digits; spaces, commas and `0x` are ignored).
+/// The retail XEX key from `FH1_XEX_KEY`, [`KEY_FILE`] or, last, the key a release build embedded at compile time
+/// (`FH1_XEX_KEY_EMBED` set while building, by tools/release.ps1; never in the source) (32 hex digits; spaces, commas
+/// and `0x` are ignored).
 pub fn retail_key() -> Result<[u8; 16], Error> {
     let text = match std::env::var("FH1_XEX_KEY") {
         Ok(v) => v,
-        Err(_) => std::fs::read_to_string(KEY_FILE).map_err(|_| {
-            Error::Unsupported(format!("default.xex is encrypted: put the Xbox 360 retail XEX key (32 hex digits) in {KEY_FILE} or FH1_XEX_KEY"))
-        })?,
+        Err(_) => match std::fs::read_to_string(KEY_FILE) {
+            Ok(v) => v,
+            Err(_) => option_env!("FH1_XEX_KEY_EMBED").map(str::to_owned).ok_or_else(|| {
+                Error::Unsupported(format!("default.xex is encrypted: put the Xbox 360 retail XEX key (32 hex digits) in {KEY_FILE} or FH1_XEX_KEY"))
+            })?,
+        },
     };
     parse_key(&text).ok_or_else(|| Error::Unsupported("xex key: expected 32 hex digits".into()))
 }

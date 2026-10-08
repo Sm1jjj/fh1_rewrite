@@ -262,7 +262,9 @@ impl Menu {
     fn open_browsers(&mut self, garage: &Garage, map: &str) {
         let catalog = self.catalog.get_or_insert_with(|| browser::catalog_for(&garage.assets, &garage.cars)).clone();
         self.cars = Some(browser::CarBrowser::new(catalog, garage.current));
-        self.maps = browser::MapBrowser::new(Track::maps_by_game(&garage.assets), map);
+        // Optional games that aren't imported: greyed (FM3, not importable yet, isn't listed here).
+        let locked = crate::track::locked_maps(&garage.assets).into_iter().filter(|l| !l.coming_soon);
+        self.maps = browser::MapBrowser::new(Track::maps_by_game(&garage.assets), map).with_locked(locked);
     }
 }
 
@@ -1639,7 +1641,18 @@ fn draw_menu(
 fn spawn_rows(p: &mut ChildSpawnerCommands, menu: &Menu, rows: &[Item], sel: usize, first: usize, font: &UiFont) {
     for (i, it) in rows.iter().enumerate() {
         let on = i == sel;
-        let fg = if on { Color::WHITE } else { Color::srgba(1.0, 1.0, 1.0, 0.8) };
+        // Browser rows of optional games that aren't imported: greyed, a faint cursor instead of the accent.
+        let locked = match menu.page {
+            Page::Cars => menu.cars.as_ref().is_some_and(|b| b.locked_row(first + i)),
+            Page::Maps => menu.maps.locked_row(first + i),
+            _ => false,
+        };
+        let fg = match (locked, on) {
+            (true, true) => browser::LOCKED_ON,
+            (true, false) => browser::LOCKED,
+            (false, true) => Color::WHITE,
+            (false, false) => Color::srgba(1.0, 1.0, 1.0, 0.8),
+        };
         let selectable = !matches!(it.act, Act::None);
         let mut row = p.spawn((
             MenuRow(i),
@@ -1651,7 +1664,7 @@ fn spawn_rows(p: &mut ChildSpawnerCommands, menu: &Menu, rows: &[Item], sel: usi
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(if on && selectable { ACCENT } else { Color::NONE }),
+            BackgroundColor(if on && locked { browser::LOCKED_CURSOR } else if on && selectable { ACCENT } else { Color::NONE }),
         ));
         if selectable {
             row.insert(Button);

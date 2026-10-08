@@ -4,12 +4,14 @@
 //!
 //! - **HORIZON** (free roam): choose the open world (Colorado = FH1, Southern Europe = FH2, other imported worlds), with
 //!   the last car (settings `car`); the pause menu still changes cars.
-//! - **MOTORSPORT** (shown only when circuits are installed: FM4 `imported/fm4/maps.json`, grouped by track, then
-//!   layout with length / type): track -> vehicle (X1's car browser, ui/browser.rs) ->
+//! - **MOTORSPORT** (circuits: FM4 `imported/fm4/maps.json`, grouped by track, then layout with length / type; greyed
+//!   with its requirement when FM4 isn't imported, FM3 listed greyed as "coming soon"): track -> vehicle (X1's car
+//!   browser, ui/browser.rs) ->
 //!   session: Grid (pole) / Pit / Flying start from the track's `spawns.json` kinds; a lap timer when the track has
 //!   `track.json` timing (ui/laptimer.rs). Racing against AI: "coming soon".
 //!
-//! Map lists come from `Track::maps_by_game` (X1). The choices are remembered in settings.json (`map`,
+//! Map lists come from `Track::maps_by_game` (X1); the maps of optional games that aren't imported are listed greyed
+//! (`track::locked_maps`: FH1 is the only required disc). The choices are remembered in settings.json (`map`,
 //! `motorsport_track`, `car`).
 //!
 //! Without main.rs's L1b patch (no `PendingWorld` inserted, the world already loading behind the screen), the same
@@ -25,7 +27,7 @@ use std::sync::Arc;
 use bevy::input::gamepad::{Gamepad, GamepadButton};
 use bevy::prelude::*;
 
-use super::browser::{catalog_for, BrowserRow, CarBrowser, CarCatalog, MapBrowser, Pick};
+use super::browser::{catalog_for, BrowserRow, CarBrowser, CarCatalog, MapBrowser, Pick, LOCKED, LOCKED_ON};
 use super::loading::{shadow, Fade, FadeBg, Loading};
 use super::world_load::{Mode, PendingWorld, WorldChoice};
 
@@ -34,7 +36,7 @@ use super::world_load::{Mode, PendingWorld, WorldChoice};
 mod online;
 use online::{OnlinePick, OnlineScreen};
 use super::{Settings, SettingsPath, UiFont, ACCENT};
-use crate::track::Track;
+use crate::track::{LockedMap, Track};
 use crate::Garage;
 
 /// The main menu's widgets (children of the loading root), shown only while it is up.
@@ -113,6 +115,12 @@ pub struct MainMenu {
     screen: Screen,
     horizon: Vec<(String, Vec<(String, String)>)>,
     motorsport: Vec<(String, Vec<(String, String)>)>,
+    /// Greyed worlds / circuits of optional games that aren't imported (not in `horizon` / `motorsport`, which ONLINE
+    /// and the loaders read).
+    horizon_locked: Vec<LockedMap>,
+    motorsport_locked: Vec<LockedMap>,
+    /// Requirement of MOTORSPORT when no circuits are imported (the mode is greyed).
+    motorsport_reason: String,
     catalog: Option<Arc<CarCatalog>>,
     track: Option<(String, String)>,
     car: Option<usize>,
@@ -195,10 +203,15 @@ fn sessions(assets: &Path, id: &str) -> Vec<Session> {
 }
 
 /// World browser: opens on the game list (FH1 / FH2 / ...) with the cursor on the current world's game.
-fn worlds(h: &[(String, Vec<(String, String)>)], current: &str) -> MapBrowser {
-    let mut b = MapBrowser::new(h.to_vec(), current);
+fn worlds(h: &[(String, Vec<(String, String)>)], locked: &[LockedMap], current: &str) -> MapBrowser {
+    let mut b = MapBrowser::new(h.to_vec(), current).with_locked(locked.to_vec());
     b.show_games();
     b
+}
+
+/// Track browser of MOTORSPORT, opened on `current`.
+fn tracks(m: &[(String, Vec<(String, String)>)], locked: &[LockedMap], current: &str) -> MapBrowser {
+    MapBrowser::new(m.to_vec(), current).with_locked(locked.to_vec())
 }
 
 impl MainMenu {
@@ -206,21 +219,40 @@ impl MainMenu {
         let by_game = Track::maps_by_game(assets);
         let motorsport = motorsport_groups(assets, &by_game);
         let horizon: Vec<(String, Vec<(String, String)>)> = by_game.into_iter().filter(|(g, _)| g != "FM4").collect();
+        // Optional games that aren't imported: their worlds / circuits greyed.
+        let (motorsport_locked, horizon_locked): (Vec<LockedMap>, Vec<LockedMap>) = crate::track::locked_maps(assets).into_iter().partition(|l| l.circuit);
+        let motorsport_reason = crate::track::OPTIONAL_GAMES.iter().find(|g| g.circuits && !g.coming_soon).map_or_else(String::new, |g| g.requirement());
         // FH1_MAIN_MENU=modes|worlds: open on that screen (screenshots).
         let screen = match std::env::var("FH1_MAIN_MENU").as_deref() {
             Ok("modes") => Screen::Modes { cursor: 0 },
-            Ok("worlds") => Screen::Worlds(worlds(&horizon, "colorado")),
+            Ok("worlds") => Screen::Worlds(worlds(&horizon, &horizon_locked, "colorado")),
             _ => Screen::Title,
         };
-        Self { screen, horizon, motorsport, catalog: None, track: None, car: None, dirty: true, repeat: Default::default() }
+        Self {
+            screen,
+            horizon,
+            motorsport,
+            horizon_locked,
+            motorsport_locked,
+            motorsport_reason,
+            catalog: None,
+            track: None,
+            car: None,
+            dirty: true,
+            repeat: Default::default(),
+        }
     }
 
-    fn modes(&self) -> Vec<(&'static str, &'static str)> {
-        let mut m = vec![("HORIZON", "Free roam in an open world"), ("ONLINE", "Free roam on a server with other players")];
+    /// (label, description, greyed).
+    fn modes(&self) -> Vec<(&'static str, String, bool)> {
+        let mut m = vec![("HORIZON", "Free roam in an open world".to_string(), false), ("ONLINE", "Free roam on a server with other players".to_string(), false)];
         if !self.motorsport.is_empty() {
-            m.push(("MOTORSPORT", "Circuits: free practice and hot laps"));
+            m.push(("MOTORSPORT", "Circuits: free practice and hot laps".to_string(), false));
+        } else {
+            // No circuits imported: shown greyed with what it needs.
+            m.push(("MOTORSPORT", self.motorsport_reason.clone(), true));
         }
-        m.push(("QUIT", ""));
+        m.push(("QUIT", String::new(), false));
         m
     }
 
@@ -229,7 +261,7 @@ impl MainMenu {
             Screen::Title => (String::new(), Vec::new(), 0, String::new()),
             Screen::Modes { cursor } => (
                 "Choose a mode".into(),
-                self.modes().iter().map(|(l, v)| BrowserRow { label: l.to_string(), value: (!v.is_empty()).then(|| v.to_string()) }).collect(),
+                self.modes().into_iter().map(|(l, v, locked)| BrowserRow { label: l.to_string(), value: (!v.is_empty()).then_some(v), locked }).collect(),
                 *cursor,
                 "Enter / A  select      Backspace / B  back".into(),
             ),
@@ -238,7 +270,7 @@ impl MainMenu {
             Screen::Cars(b) => (format!("MOTORSPORT  ·  {}", b.title()), b.rows(), b.cursor, b.hint()),
             Screen::Sessions { cursor, list } => (
                 format!("MOTORSPORT  ·  {}", self.track.as_ref().map_or(String::new(), |t| t.1.trim().to_owned())),
-                list.iter().map(|s| BrowserRow { label: s.label.clone(), value: Some(s.detail.clone()) }).collect(),
+                list.iter().map(|s| BrowserRow { label: s.label.clone(), value: Some(s.detail.clone()), locked: false }).collect(),
                 *cursor,
                 "Enter / A  start      Backspace / B  back".into(),
             ),
@@ -419,21 +451,23 @@ pub fn main_menu(
             } else if input.confirm {
                 match modes.get(*cursor).map(|m| m.0) {
                     Some("HORIZON") => {
-                        let n: usize = menu.horizon.iter().map(|g| g.1.len()).sum();
+                        // Greyed worlds count too: without FH2 the list still opens to show it.
+                        let n: usize = menu.horizon.iter().map(|g| g.1.len()).sum::<usize>() + menu.horizon_locked.len();
                         if n <= 1 {
                             let id = menu.horizon.first().and_then(|g| g.1.first()).map_or_else(|| "colorado".into(), |m| m.0.clone());
                             start = Some(WorldChoice { track: id, car: Some(car_now), mode: Mode::Horizon, start: None });
                         } else {
                             let current = settings.map.clone().unwrap_or_else(|| "colorado".into());
-                            menu.screen = Screen::Worlds(worlds(&menu.horizon, &current));
+                            menu.screen = Screen::Worlds(worlds(&menu.horizon, &menu.horizon_locked, &current));
                         }
                     }
                     Some("ONLINE") => {
                         menu.screen = Screen::Online(OnlineScreen::new(&settings_path.0));
                     }
-                    Some("MOTORSPORT") => {
+                    // Greyed (no circuits imported): stays on the mode list.
+                    Some("MOTORSPORT") if !menu.motorsport.is_empty() => {
                         let current = settings.motorsport_track.clone().unwrap_or_default();
-                        menu.screen = Screen::Tracks(MapBrowser::new(menu.motorsport.clone(), &current));
+                        menu.screen = Screen::Tracks(tracks(&menu.motorsport, &menu.motorsport_locked, &current));
                     }
                     Some("QUIT") => {
                         exit.write(AppExit::Success);
@@ -471,7 +505,7 @@ pub fn main_menu(
             Pick::Browsing { changed } => menu.dirty |= changed,
             Pick::Leave => {
                 let current = menu.track.as_ref().map_or_else(String::new, |t| t.0.clone());
-                menu.screen = Screen::Tracks(MapBrowser::new(menu.motorsport.clone(), &current));
+                menu.screen = Screen::Tracks(tracks(&menu.motorsport, &menu.motorsport_locked, &current));
                 menu.dirty = true;
             }
             Pick::Car(i) => {
@@ -591,7 +625,14 @@ pub fn draw_main_menu(
         let sel = k == cursor;
         t.0 = rows.get(k).map_or_else(String::new, |r| format!("{}{}", if sel { "›  " } else { "   " }, r.label));
         let a = c.0.alpha();
-        c.0 = if sel { ACCENT.with_alpha(a) } else { Color::WHITE.with_alpha(a) };
+        // Greyed rows (optional games that aren't imported, browser.rs LOCKED).
+        let locked = rows.get(k).is_some_and(|r| r.locked);
+        c.0 = match (locked, sel) {
+            (true, true) => LOCKED_ON.with_alpha(a),
+            (true, false) => LOCKED.with_alpha(a),
+            (false, true) => ACCENT.with_alpha(a),
+            (false, false) => Color::WHITE.with_alpha(a),
+        };
     }
     for (mut t, RowValue(i)) in &mut texts.p3() {
         t.0 = rows.get(first + i).and_then(|r| r.value.clone()).unwrap_or_default();

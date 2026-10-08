@@ -135,6 +135,9 @@ pub struct CarCatalog {
     pub games: Vec<String>,
     /// Details-panel stats per entry index, read from `physics.json` the first time a car is selected.
     stats: std::sync::Mutex<HashMap<usize, Option<CarStats>>>,
+    /// Games listed greyed because they aren't imported (crate::track::OPTIONAL_GAMES): label -> requirement. They
+    /// are also in `games` (after the others) and have no entries.
+    pub locked: HashMap<String, String>,
 }
 
 /// Spec figures of a car (gamedb Data_Car columns of its physics.json `car` row; imported cars carry the same columns).
@@ -223,6 +226,14 @@ impl CarCatalog {
                 out.games.push(entry.game.clone());
             }
             out.entries.push(entry);
+        }
+        // Optional games without imported cars: greyed tabs (FM3 isn't importable yet: not listed).
+        for g in crate::track::OPTIONAL_GAMES.iter().filter(|g| !g.coming_soon) {
+            let label = g.label();
+            if !out.games.contains(&label) && !g.cars_imported(assets) {
+                out.games.push(label.clone());
+                out.locked.insert(label, g.requirement());
+            }
         }
         out
     }
@@ -358,14 +369,10 @@ fn imported_entry(index: usize, game: &str, media: &str, row: Option<&Value>) ->
 
 /// Every imported game's selectable car folders, addressed relative to `cars/` (`../imported/<game>/cars/<media>`),
 /// for `Garage::cars`: games with an `imported/<game>/cars/index.json` in the contract shape (rows with `name`),
-/// rows with `has_model` and not `selectable: false`.
+/// rows with `has_model` and not `selectable: false`. Only the known optional games (crate::track::OPTIONAL_GAMES) are
+/// read; other folders under `imported/` (leftovers of removed imports) are ignored.
 pub fn imported_car_folders(assets: &Path) -> Vec<String> {
-    let mut games: Vec<String> = std::fs::read_dir(assets.join("imported"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-        .collect();
+    let mut games: Vec<String> = crate::track::OPTIONAL_GAMES.iter().map(|g| g.folder.to_owned()).collect();
     games.sort();
     let mut out = Vec::new();
     for g in games {
@@ -515,11 +522,20 @@ pub enum Pick {
     Map(String),
 }
 
+/// Label colour of a greyed ([`BrowserRow::locked`]) row, and under the cursor (opaque: the main menu sets its own
+/// fade alpha).
+pub const LOCKED: Color = Color::srgb(0.42, 0.43, 0.46);
+pub const LOCKED_ON: Color = Color::srgb(0.66, 0.67, 0.70);
+/// Cursor background of a greyed row (instead of the accent).
+pub const LOCKED_CURSOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.10);
+
 /// A row to draw.
 #[derive(Clone, Debug)]
 pub struct BrowserRow {
     pub label: String,
     pub value: Option<String>,
+    /// Greyed and not pickable: content of an optional game that isn't imported (`value` = what it needs).
+    pub locked: bool,
 }
 
 /// One game tab of the strip.
@@ -711,6 +727,20 @@ impl CarBrowser {
         self.catalog.games.get(self.game).cloned().unwrap_or_default()
     }
 
+    /// Requirement of the current game when it isn't imported (greyed tab).
+    fn game_locked(&self) -> Option<String> {
+        self.catalog.locked.get(&self.game_name()).cloned()
+    }
+
+    /// Row `row` of the current level is greyed (a game that isn't imported, or its message row).
+    pub fn locked_row(&self, row: usize) -> bool {
+        match self.level {
+            0 => self.catalog.games.get(row).is_some_and(|g| self.catalog.locked.contains_key(g)),
+            1 => self.game_locked().is_some(),
+            _ => false,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn class_filter(&self) -> Option<String> {
         self.class.clone()
@@ -830,15 +860,20 @@ impl CarBrowser {
                 .games
                 .iter()
                 .map(|g| {
+                    if let Some(reason) = cat.locked.get(g) {
+                        return BrowserRow { label: g.clone(), value: Some(reason.clone()), locked: true };
+                    }
                     let n = cat.entries.iter().filter(|e| e.game == *g).count();
                     let brands = cat.makers(g, None).len();
-                    BrowserRow { label: format!("{g}  ({n})"), value: Some(format!("{brands} brands{}", here(current.is_some_and(|c| c.game == *g)))) }
+                    BrowserRow { label: format!("{g}  ({n})"), value: Some(format!("{brands} brands{}", here(current.is_some_and(|c| c.game == *g)))), locked: false }
                 })
                 .collect(),
+            // A game that isn't imported: its message instead of cars.
+            1 if self.game_locked().is_some() => vec![BrowserRow { label: "Not imported".into(), value: self.game_locked(), locked: true }],
             1 => {
                 let makers = self.makers();
                 let total: usize = makers.iter().map(|m| m.1).sum();
-                std::iter::once(BrowserRow { label: format!("All manufacturers  ({total})"), value: None })
+                std::iter::once(BrowserRow { label: format!("All manufacturers  ({total})"), value: None, locked: false })
                     .chain(makers.iter().map(|(m, n)| {
                         let span = class_span(
                             cat.entries
@@ -846,7 +881,7 @@ impl CarBrowser {
                                 .filter(|e| e.game == game && e.maker == *m && passes(e, self.class.as_deref(), self.drive.as_deref()))
                                 .filter_map(|e| e.class.clone()),
                         );
-                        BrowserRow { label: format!("{m}  ({n})"), value: Some(format!("{span}{}", here(current.is_some_and(|c| c.game == game && c.maker == *m)))) }
+                        BrowserRow { label: format!("{m}  ({n})"), value: Some(format!("{span}{}", here(current.is_some_and(|c| c.game == game && c.maker == *m)))), locked: false }
                     }))
                     .collect()
             }
@@ -859,6 +894,7 @@ impl CarBrowser {
                         BrowserRow {
                             label: if all { format!("{} {}", e.maker, e.name) } else { e.name.clone() },
                             value: Some(format!("{}{}{}", e.detail(), self.tag(e.index), here(e.index == self.current))),
+                            locked: false,
                         }
                     })
                     .collect()
@@ -887,6 +923,10 @@ impl CarBrowser {
             let base = if self.level == 0 { self.cursor } else { self.game };
             self.switch_game((base as i32 + input.tab).rem_euclid(games as i32) as usize);
             return Pick::Browsing { changed: true };
+        }
+        // A game that isn't imported shows only its message: no filters, sorts or jumps there.
+        if self.level > 0 && self.game_locked().is_some() && (input.filter || input.drive || input.sort || input.jump != 0) {
+            return Pick::Browsing { changed: false };
         }
         if input.filter && self.level > 0 {
             let classes = self.catalog.classes(&self.game_name());
@@ -955,6 +995,8 @@ impl CarBrowser {
                 self.switch_game(row);
                 Pick::Browsing { changed: true }
             }
+            // The message row of a game that isn't imported.
+            1 if self.game_locked().is_some() => Pick::Browsing { changed: false },
             1 if row < self.len() => {
                 self.maker = if row == 0 { None } else { self.makers().get(row - 1).map(|m| m.0.clone()) };
                 self.mem_maker.insert(self.game_name(), self.maker.clone());
@@ -988,6 +1030,9 @@ impl CarBrowser {
             0 => {
                 let g = cat.games.get(self.cursor).cloned().unwrap_or_default();
                 let details = (!g.is_empty()).then(|| {
+                    if let Some(reason) = cat.locked.get(&g) {
+                        return (g.clone(), vec![(String::new(), reason.clone())]);
+                    }
                     let cars: Vec<&CarEntry> = cat.entries.iter().filter(|e| e.game == g).collect();
                     let mut lines = vec![("Cars".to_string(), cars.len().to_string()), ("Brands".to_string(), cat.makers(&g, None).len().to_string())];
                     lines.push(("Classes".into(), class_span(cat.classes(&g).into_iter())));
@@ -1010,6 +1055,11 @@ impl CarBrowser {
                     lines.push(("Years".into(), y));
                 }
                 let title = sel.unwrap_or_else(|| "All manufacturers".into());
+                if let Some(reason) = self.game_locked() {
+                    // A game that isn't imported: its message, and only the moves that leave it.
+                    let h = vec![back(false), hint(&["LB", "RB"], "Q E", "game")];
+                    return BrowserView { tabs, crumbs: vec![game.clone()], status: String::new(), details: Some((game.clone(), vec![(String::new(), reason)])), hints: h };
+                }
                 let mut h = vec![hint(&["A"], "Enter", "open"), back(false), hint(&["LT", "RT"], "Z C", "letter")];
                 h.extend(common.iter().cloned());
                 (vec![game.clone()], format!("{filters}    ·    {pos}"), Some((title, lines)), h)
@@ -1087,6 +1137,8 @@ pub struct MapBrowser {
     pub current: String,
     /// Last group per game.
     mem_group: HashMap<String, usize>,
+    /// Greyed maps (games that aren't imported, [`MapBrowser::with_locked`]): id -> requirement.
+    locked: HashMap<String, String>,
 }
 
 /// Separator of `"<game>  ·  <track>"` group labels.
@@ -1111,6 +1163,45 @@ impl MapBrowser {
         b.game = b.games().iter().position(|x| *x == gname).unwrap_or(0);
         b.mem_group.insert(b.game_name(), b.group);
         b
+    }
+
+    /// Adds greyed rows that can't be picked (crate::track::locked_maps): each joins its game's group, or a new group
+    /// after the others.
+    pub fn with_locked(mut self, locked: impl IntoIterator<Item = crate::track::LockedMap>) -> Self {
+        for l in locked {
+            match self.groups.iter_mut().find(|g| g.0 == l.game) {
+                Some(g) => g.1.push((l.id.clone(), l.name)),
+                None => self.groups.push((l.game, vec![(l.id.clone(), l.name)])),
+            }
+            self.locked.insert(l.id, l.reason);
+        }
+        self
+    }
+
+    /// Requirement of a greyed map.
+    fn map_locked(&self, id: &str) -> Option<&String> {
+        self.locked.get(id)
+    }
+
+    /// Requirement shared by every map of group `i` (the whole group is greyed), else `None`.
+    fn group_locked(&self, i: usize) -> Option<&String> {
+        let maps = &self.groups.get(i)?.1;
+        if maps.iter().all(|m| self.locked.contains_key(&m.0)) { maps.first().and_then(|m| self.map_locked(&m.0)) } else { None }
+    }
+
+    /// Requirement of game `game` when all of its maps are greyed.
+    fn game_locked(&self, game: &str) -> Option<&String> {
+        let gs: Vec<usize> = (0..self.groups.len()).filter(|&i| group_game(&self.groups[i].0) == game).collect();
+        if gs.iter().all(|&i| self.group_locked(i).is_some()) { gs.first().and_then(|&i| self.group_locked(i)) } else { None }
+    }
+
+    /// Row `row` of the current level is greyed.
+    pub fn locked_row(&self, row: usize) -> bool {
+        match self.level {
+            0 => self.games().get(row).is_some_and(|g| self.game_locked(g).is_some()),
+            1 => self.game_groups().get(row).is_some_and(|&i| self.group_locked(i).is_some()),
+            _ => self.groups.get(self.group).and_then(|g| g.1.get(row)).is_some_and(|m| self.locked.contains_key(&m.0)),
+        }
     }
 
     /// Show the game list instead (when there is more than one game), cursor on the current game.
@@ -1184,6 +1275,9 @@ impl MapBrowser {
                 .games()
                 .iter()
                 .map(|g| {
+                    if let Some(reason) = self.game_locked(g) {
+                        return BrowserRow { label: g.clone(), value: Some(reason.clone()), locked: true };
+                    }
                     let gs: Vec<usize> = (0..self.groups.len()).filter(|&i| group_game(&self.groups[i].0) == g).collect();
                     let maps: usize = gs.iter().map(|&i| self.groups[i].1.len()).sum();
                     let mut value = Vec::new();
@@ -1193,16 +1287,24 @@ impl MapBrowser {
                     if gs.iter().any(|&i| has_current(i)) {
                         value.push("current".to_string());
                     }
-                    BrowserRow { label: format!("{g}  ({maps})"), value: (!value.is_empty()).then(|| value.join("  ·  ")) }
+                    BrowserRow { label: format!("{g}  ({maps})"), value: (!value.is_empty()).then(|| value.join("  ·  ")), locked: false }
                 })
                 .collect(),
             1 => self
                 .game_groups()
                 .iter()
-                .map(|&i| BrowserRow { label: format!("{}  ({})", group_track(&self.groups[i].0), self.groups[i].1.len()), value: has_current(i).then(|| "current".into()) })
+                .map(|&i| match self.group_locked(i) {
+                    Some(reason) => BrowserRow { label: group_track(&self.groups[i].0).to_owned(), value: Some(reason.clone()), locked: true },
+                    None => BrowserRow { label: format!("{}  ({})", group_track(&self.groups[i].0), self.groups[i].1.len()), value: has_current(i).then(|| "current".into()), locked: false },
+                })
                 .collect(),
             _ => self.groups.get(self.group).map_or(Vec::new(), |g| {
-                g.1.iter().map(|(id, name)| BrowserRow { label: name.trim().to_owned(), value: (*id == self.current).then(|| "current".into()) }).collect()
+                g.1.iter()
+                    .map(|(id, name)| match self.map_locked(id) {
+                        Some(reason) => BrowserRow { label: name.trim().to_owned(), value: Some(reason.clone()), locked: true },
+                        None => BrowserRow { label: name.trim().to_owned(), value: (*id == self.current).then(|| "current".into()), locked: false },
+                    })
+                    .collect()
             }),
         }
     }
@@ -1279,6 +1381,8 @@ impl MapBrowser {
                 }
                 None => Pick::Browsing { changed: false },
             },
+            // A greyed map (game not imported) can't be picked.
+            2 if self.locked_row(row) => Pick::Browsing { changed: false },
             2 => self.groups.get(self.group).and_then(|g| g.1.get(row)).map_or(Pick::Browsing { changed: false }, |m| Pick::Map(m.0.clone())),
             _ => Pick::Browsing { changed: false },
         }
@@ -1423,9 +1527,15 @@ pub fn spawn_view(
             commands,
             list,
             Node { height: Val::Px(38.0), padding: UiRect::horizontal(Val::Px(14.0)), column_gap: Val::Px(30.0), justify_content: JustifyContent::SpaceBetween, align_items: AlignItems::Center, ..default() },
-            if on { ACCENT } else { Color::NONE },
+            if on && rows[k].locked { LOCKED_CURSOR } else if on { ACCENT } else { Color::NONE },
         );
-        text(commands, r, rows[k].label.clone(), 21.0, if on { Color::WHITE } else { Color::srgba(1.0, 1.0, 1.0, 0.85) }, Node::default());
+        let label_color = match (rows[k].locked, on) {
+            (true, true) => LOCKED_ON,
+            (true, false) => LOCKED,
+            (false, true) => Color::WHITE,
+            (false, false) => Color::srgba(1.0, 1.0, 1.0, 0.85),
+        };
+        text(commands, r, rows[k].label.clone(), 21.0, label_color, Node::default());
         if let Some(v) = &rows[k].value {
             text(commands, r, v.clone(), 17.0, if on { Color::WHITE } else { DIM }, Node::default());
         }
@@ -1677,6 +1787,39 @@ mod tests {
         assert_eq!((b.level, b.group), (2, 0));
         b.show_games();
         assert_eq!((b.level, b.cursor), (0, 0));
+    }
+
+    /// Games that aren't imported: greyed rows that can't be picked; LB / RB pass through their tabs.
+    #[test]
+    fn locked_games() {
+        let groups = vec![("FH1".to_string(), vec![("colorado".to_string(), "Colorado".to_string())])];
+        let lock = crate::track::LockedMap {
+            game: "FH2".into(),
+            id: "fh2/anthem".into(),
+            name: "Southern Europe (FH2)".into(),
+            reason: "Requires Forza Horizon 2".into(),
+            circuit: false,
+            coming_soon: false,
+        };
+        let mut b = MapBrowser::new(groups, "colorado").with_locked(vec![lock]);
+        b.show_games();
+        assert_eq!(b.rows().iter().map(|r| r.locked).collect::<Vec<_>>(), [false, true]);
+        b.step(key(|i| i.vertical = 1));
+        b.step(key(|i| i.confirm = true));
+        assert_eq!((b.level, b.locked_row(0)), (2, true));
+        assert_eq!(b.step(key(|i| i.confirm = true)), Pick::Browsing { changed: false });
+
+        let mut cat = CarCatalog { entries: vec![car(0, "FH1", "Alfa", "8C", "S", 700)], games: vec!["FH1".into(), "FM4".into()], ..Default::default() };
+        cat.locked.insert("FM4".into(), "Requires Forza Motorsport 4".into());
+        let mut c = CarBrowser::new(std::sync::Arc::new(cat), 0);
+        c.step(key(|i| i.tab = 1));
+        assert_eq!((c.game, c.level, c.len()), (1, 1, 1));
+        assert!(c.locked_row(0) && c.rows()[0].locked);
+        assert_eq!(c.step(key(|i| i.confirm = true)), Pick::Browsing { changed: false });
+        assert_eq!(c.step(key(|i| i.filter = true)), Pick::Browsing { changed: false });
+        c.step(key(|i| i.tab = 1));
+        assert_eq!((c.game, c.level), (0, 1));
+        assert!(c.selected().is_none());
     }
 
     #[test]

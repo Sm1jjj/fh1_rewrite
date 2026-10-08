@@ -6,7 +6,18 @@ not affiliated with Microsoft, Turn 10 or Playground Games.
 **No game assets, keys or decompiled code are included.** You need your own copy of the game disc;
 the setup tool converts it locally into a git-ignored `data/` folder.
 
-## Setup
+## Playing (release build)
+
+Download `FH1Rewrite-<version>-win64.zip` from the GitHub Releases page, unzip it anywhere with ~30 GB free, open
+**FH1 Rewrite.exe** and choose your Forza Horizon disc (the `.iso`, a `.zip` holding it, or the folder it is in).
+Forza Horizon is the only requirement. If you also own Forza Horizon 2 or Forza Motorsport 4 (Xbox 360), tick them and
+choose their discs to add their cars and maps; games you don't add stay locked in the menus (Forza Motorsport 3:
+coming later). Click Install, wait, then PLAY.
+
+Maintainers build the release with `powershell -ExecutionPolicy Bypass -File tools\release.ps1`
+(launcher = `crates/fh1-launcher`).
+
+## Building from source
 
 1. Rust (stable, MSVC toolchain on Windows).
 2. Your own Forza Horizon disc image (`.iso`) or an extracted disc folder.
@@ -28,7 +39,7 @@ same install. These importers are behind cargo features:
 
 ```
 cargo run --release -p fh1setup --features fh2 -- import-fh2 "path/to/FH2.iso"
-cargo run --release -p fh1setup --features fm4 -- import-fm4 "path/to/FM4 disc folder"
+cargo run --release -p fh1setup --features fm4 -- import-fm4 "path/to/FM4 Play Disc.iso" --content "path/to/FM4 Content Install Disc.iso"
 ```
 
 ## Controls

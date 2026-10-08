@@ -46,10 +46,10 @@ pub fn run(disc: &Path, data: &Path, force: bool, only: Option<&[String]>) -> Re
     let private = data.join("installations").join(&id).join("assets").join("private");
     std::fs::create_dir_all(&private)?;
 
-    for &(group, version) in GROUPS {
-        if only.is_some_and(|o| !o.iter().any(|g| g == group)) {
-            continue;
-        }
+    let selected: Vec<_> = GROUPS.iter().filter(|(g, _)| only.is_none_or(|o| o.iter().any(|x| x == g))).collect();
+    for (i, &&(group, version)) in selected.iter().enumerate() {
+        // Machine-readable progress for the launcher (fh1-launcher): `[progress] <done>/<total> <group>`.
+        println!("[progress] {i}/{} {group}", selected.len());
         let hash = pipeline_hash(group, version);
         let out = private.join(group);
         if !force && out.is_dir() && inst.pipelines.get(group) == Some(&hash) {
@@ -107,6 +107,7 @@ pub fn run(disc: &Path, data: &Path, force: bool, only: Option<&[String]>) -> Re
         std::fs::write(&manifest_path, serde_json::to_vec_pretty(&inst)?)?;
     }
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&inst)?)?;
+    println!("[progress] {0}/{0} done", selected.len());
     println!("installation {id} ready in {}", private.display());
     Ok(())
 }

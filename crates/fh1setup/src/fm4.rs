@@ -1,10 +1,13 @@
-//! `fh1setup import-fm4 <FM4 root> [--data <dir>] [--only cars]`: Forza Motorsport 4 (Xbox 360) cars into the ACTIVE
-//! install, through the same readers and converters as FH1 (FM4 is the same engine family, docs/FM4_RECON.md).
+//! `fh1setup import-fm4 <Play Disc ISO|zip|folder> [--content <Content Install Disc ISO|zip|folder>] [--data <dir>]
+//! [--only cars,maps]`: Forza Motorsport 4 (Xbox 360) cars and circuits into the ACTIVE install, through the same readers
+//! and converters as FH1 (FM4 is the same engine family, docs/FM4_RECON.md).
 //!
-//! `<FM4 root>` is a folder laid out like an FH1 disc (`media/db/gamedb.slt`, `media/cars/<CAR>.zip`, ...): the Play
-//! Disc's `Media` plus the Content Install Disc's car packs, which ship as folders inside one zip per pack and are
-//! repacked to one zip per car / rim. `tools/fm4/merge.py` builds it from the two extracted discs (STFS packages
-//! included); the gamedb on the Play Disc already lists every pack car (503 rows).
+//! The importer reads an "FM4 root", a folder laid out like an FH1 disc (`media/db/gamedb.slt`, `media/cars/<CAR>.zip`,
+//! ...): the Play Disc's `Media` plus the Content Install Disc's car packs, which ship as folders inside one zip per pack
+//! and are repacked to one zip per car / rim. [`crate::fm4_merge`] builds it from the two discs (STFS packages included)
+//! in `<data>/work_fm4/merged`; without `--content` only the Play Disc's cars are imported. A ready FM4 root (an older
+//! `tools/fm4/merge.py` output, now superseded) is accepted as the source as is. The gamedb on the Play Disc already
+//! lists every pack car (503 rows).
 //!
 //! Output (git-ignored install data only):
 //! - `imported/fm4/cars/<MediaName>/` exactly like `cars/<MediaName>/` (the cars group), plus FM4's shared folders.
@@ -43,17 +46,41 @@ const FH1_ONLY_CAR_COLUMNS: &[(&str, f64)] = &[
 
 pub fn run() -> Result<()> {
     let mut it = std::env::args().skip(2);
-    let (mut source, mut data, mut only) = (None, PathBuf::from("data"), None::<Vec<String>>);
+    let (mut source, mut content, mut data, mut only) = (None, None::<PathBuf>, PathBuf::from("data"), None::<Vec<String>>);
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--content" => content = Some(it.next().context("--content needs the Content Install Disc")?.into()),
             "--data" => data = it.next().context("--data needs a path")?.into(),
             "--only" => only = Some(it.next().context("--only needs cars,maps")?.split(',').map(str::to_owned).collect()),
             _ => source = Some(PathBuf::from(a)),
         }
     }
-    let disc = source.context("usage: fh1setup import-fm4 <FM4 root (tools/fm4/merge.py)> [--data <dir>] [--only cars]")?;
-    anyhow::ensure!(disc.join("media/db/gamedb.slt").exists(), "{}: no media/db/gamedb.slt (run tools/fm4/merge.py first)", disc.display());
+    let source = source.context(
+        "usage: fh1setup import-fm4 <Play Disc ISO|zip|folder> [--content <Content Install Disc ISO|zip|folder>] [--data <dir>] [--only cars,maps]",
+    )?;
     let inst: Value = serde_json::from_slice(&std::fs::read(data.join("installation.json")).context("installation.json: run fh1setup on the FH1 disc first")?)?;
+    // A ready FM4 root (no default.xex, media/db/gamedb.slt) is used as is; otherwise the discs are resolved and merged.
+    let disc = if source.is_dir() && source.join("media/db/gamedb.slt").exists() && !source.join("default.xex").exists() {
+        if content.is_some() {
+            println!("[fm4] {} is already a merged FM4 root: --content ignored", source.display());
+        }
+        source
+    } else {
+        println!("[fm4] Play Disc: {}", source.display());
+        let disc1 = crate::extract::resolve_any(&source, &data.join("work_fm4_disc1"))?;
+        let disc2 = match &content {
+            Some(c) => {
+                println!("[fm4] Content Install Disc: {}", c.display());
+                Some(crate::extract::resolve_any(c, &data.join("work_fm4_disc2"))?)
+            }
+            None => {
+                println!("[fm4] no --content disc: Play Disc cars only (the 188 car-pack cars need the Content Install Disc)");
+                None
+            }
+        };
+        crate::fm4_merge::merge(&disc1, disc2.as_deref(), &data.join("work_fm4"))?
+    };
+    anyhow::ensure!(disc.join("media/db/gamedb.slt").exists(), "{}: no media/db/gamedb.slt (not an FM4 root)", disc.display());
     let private = data.join("installations").join(inst["id"].as_str().context("installation.json id")?).join("assets/private");
     let root = private.join("imported/fm4");
     std::fs::create_dir_all(&root)?;
@@ -69,7 +96,7 @@ pub fn run() -> Result<()> {
 }
 
 /// English strings: the Play Disc's `EN.zip`, with each car pack's `Data_Car.str` merged into its `Data_Car` table
-/// (the game mounts the packs' StringTables zips over `game:\Media\StringTables\`; `merge.py` copies them to
+/// (the game mounts the packs' StringTables zips over `game:\Media\StringTables\`; `fm4_merge` copies them to
 /// `media/stringtables/dlc/`).
 fn strings(disc: &Path) -> Option<fh1_ui::strtable::StringTables> {
     let mut s = fh1_ui::strtable::StringTables::load_language(disc, "EN").ok()?;

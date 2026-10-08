@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fh1-formats", "crates/fh1setup", "crates/fh1-engine", "crates/fh1-world", "crates/fh1-audio", "crates/fh1-radio", "crates/fh1-net", "crates/fh1-shaders", "crates/fh1-render", "crates/fh1-ui", "crates/fh1-remaster"]
+members = ["crates/fh1-formats", "crates/fh1setup", "crates/fh1-engine", "crates/fh1-world", "crates/fh1-audio", "crates/fh1-radio", "crates/fh1-net", "crates/fh1-shaders", "crates/fh1-render", "crates/fh1-ui", "crates/fh1-remaster", "crates/fh1-launcher"]
 exclude = ["vendor/bevy_solarik", "vendor/bevy_pbr"]
 
 [workspace.package]

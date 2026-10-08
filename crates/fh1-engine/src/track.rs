@@ -52,23 +52,23 @@ impl Track {
         Self::open_world(&assets.join("imported").join(map).join("world"), map, name, false)
     }
 
-    /// Maps the menu can switch to: Colorado plus every `imported/<map>` with a converted world.
-    /// (id, display name).
+    /// Maps the menu can switch to: Colorado plus the converted worlds of the imported [`OPTIONAL_GAMES`] (other
+    /// folders under `imported/`, e.g. a leftover `imported/gtasa`, are ignored). (id, display name).
     pub fn available(assets: &Path) -> Vec<(String, String)> {
         let mut out = vec![("colorado".to_string(), "Colorado".to_string())];
         if !IMPORTED_MAPS {
             return out;
         }
-        for e in std::fs::read_dir(assets.join("imported")).into_iter().flatten().flatten() {
-            let id = e.file_name().to_string_lossy().into_owned();
-            // Another game's import (FH2, FM4, ...): `imported/<game>/maps.json` = [{id, name}], id = folder under
+        for g in &OPTIONAL_GAMES {
+            let dir = assets.join("imported").join(g.folder);
+            // Another game's import (FH2, FM4): `imported/<game>/maps.json` = [{id, name}], id = folder under
             // `imported/` (docs/FH2_RECON.md).
-            if let Some(maps) = game_maps(&e.path()) {
+            if let Some(maps) = game_maps(&dir) {
                 out.extend(maps.into_iter().filter(|(mid, _)| assets.join("imported").join(mid).join("world/collision.bin").exists()));
                 continue;
             }
-            if e.path().join("world/collision.bin").exists() {
-                out.push((id.clone(), imported_name(&id)));
+            if dir.join("world/collision.bin").exists() {
+                out.push((g.folder.to_owned(), imported_name(g.folder)));
             }
         }
         out
@@ -176,6 +176,85 @@ pub fn post_config(assets: &Path, id: &str) -> fh1_render::postfx::FxPostConfig 
 
 /// Imported maps (docs/RENDERING.md) on/off: when false they don't load and the map menu lists only Colorado.
 pub const IMPORTED_MAPS: bool = true;
+
+/// A game the setup can import next to FH1 (FH1 is the only required disc; `fh1setup import-fh2` / `import-fm4` write
+/// `imported/<folder>`). Only these folders are read as imports. A game that isn't imported stays in the menus, greyed
+/// ("locked") with [`OptionalGame::requirement`] as its hint.
+pub struct OptionalGame {
+    /// Folder under `imported/`; upper-cased it is the menu group (`fh2` -> FH2).
+    pub folder: &'static str,
+    /// `Forza Horizon 2`.
+    pub name: &'static str,
+    /// Open worlds (HORIZON) listed locked while the game is missing: (map id, name).
+    pub worlds: &'static [(&'static str, &'static str)],
+    /// Has circuits (MOTORSPORT).
+    pub circuits: bool,
+    /// The setup can't import it yet.
+    pub coming_soon: bool,
+}
+
+pub const OPTIONAL_GAMES: [OptionalGame; 3] = [
+    // fh1setup fh2.rs MAP_NAME.
+    OptionalGame { folder: "fh2", name: "Forza Horizon 2", worlds: &[("fh2/anthem", "Southern Europe (FH2)")], circuits: false, coming_soon: false },
+    OptionalGame { folder: "fm4", name: "Forza Motorsport 4", worlds: &[], circuits: true, coming_soon: false },
+    OptionalGame { folder: "fm3", name: "Forza Motorsport 3", worlds: &[], circuits: true, coming_soon: true },
+];
+
+impl OptionalGame {
+    /// Menu group / car-list game: `FH2`.
+    pub fn label(&self) -> String {
+        self.folder.to_ascii_uppercase()
+    }
+
+    /// At least one of its maps is converted (the [`Track::available`] check).
+    pub fn maps_imported(&self, assets: &Path) -> bool {
+        let dir = assets.join("imported").join(self.folder);
+        match game_maps(&dir) {
+            Some(maps) => maps.iter().any(|(id, _)| assets.join("imported").join(id).join("world/collision.bin").exists()),
+            None => dir.join("world/collision.bin").exists(),
+        }
+    }
+
+    /// Its car list is converted (`imported/<folder>/cars/index.json`, ui/browser.rs `imported_car_folders`).
+    pub fn cars_imported(&self, assets: &Path) -> bool {
+        assets.join("imported").join(self.folder).join("cars/index.json").exists()
+    }
+
+    /// The greyed rows' hint.
+    pub fn requirement(&self) -> String {
+        if self.coming_soon { "Coming soon".into() } else { format!("Requires {} — run FH1 Rewrite setup to add it", self.name) }
+    }
+}
+
+/// A map row of a game that isn't imported (drawn greyed, can't be picked).
+#[derive(Clone, Debug)]
+pub struct LockedMap {
+    /// Menu group (`FH2`).
+    pub game: String,
+    /// Never loaded: a world's real id (`fh2/anthem`), or `<folder>/*` for a game's circuits.
+    pub id: String,
+    pub name: String,
+    pub reason: String,
+    /// The game's circuits (MOTORSPORT) rather than an open world.
+    pub circuit: bool,
+    pub coming_soon: bool,
+}
+
+/// Locked rows of every [`OPTIONAL_GAMES`] game whose maps aren't imported: its open worlds, and one row for its circuits.
+pub fn locked_maps(assets: &Path) -> Vec<LockedMap> {
+    let mut out = Vec::new();
+    if !IMPORTED_MAPS {
+        return out;
+    }
+    for g in OPTIONAL_GAMES.iter().filter(|g| !g.maps_imported(assets)) {
+        let row = |id: String, name: String, circuit: bool| LockedMap { game: g.label(), id, name, reason: g.requirement(), circuit, coming_soon: g.coming_soon };
+        out.extend(g.worlds.iter().map(|(id, name)| row((*id).to_owned(), (*name).to_owned(), false)));
+        if g.circuits {
+            out.push(row(format!("{}/*", g.folder), format!("{} circuits", g.name), true));
+        }
+    }
+    out
+}
 
 /// Display name of an imported map: `imported/<id>/track.json` "name", else [`imported_name`].
 pub fn imported_name_at(assets: &Path, id: &str) -> String {

@@ -124,7 +124,7 @@ impl OnlineScreen {
     pub fn rows(&self, maps: &[(String, Vec<(String, String)>)]) -> Vec<BrowserRow> {
         let map_name = |id: &str| maps.iter().flat_map(|g| g.1.iter()).find(|m| m.0 == id).map(|m| m.1.trim().to_owned());
         if let Some(Edit::Password { text, .. }) = &self.edit {
-            return vec![BrowserRow { label: "Password".into(), value: Some(format!("{}_", "*".repeat(text.chars().count()))) }];
+            return vec![BrowserRow { label: "Password".into(), value: Some(format!("{}_", "*".repeat(text.chars().count()))), locked: false }];
         }
         let direct = match &self.edit {
             Some(Edit::Direct(t)) => format!("{t}_"),
@@ -134,7 +134,7 @@ impl OnlineScreen {
             Some(r) => format!("server list {r}"),
             None => "no server list set (data/online.json \"registry\"): direct connect only".into(),
         });
-        let mut rows = vec![BrowserRow { label: "Direct connect".into(), value: Some(direct) }, BrowserRow { label: "Refresh".into(), value: Some(status) }];
+        let mut rows = vec![BrowserRow { label: "Direct connect".into(), value: Some(direct), locked: false }, BrowserRow { label: "Refresh".into(), value: Some(status), locked: false }];
         for r in self.servers() {
             let row = match &r.info {
                 Some(i) => {
@@ -146,10 +146,10 @@ impl OnlineScreen {
                     if i.version != VERSION {
                         v += &format!("  ·  protocol {}", i.version);
                     }
-                    BrowserRow { label: if i.name.is_empty() { r.addr.to_string() } else { i.name.clone() }, value: Some(v) }
+                    BrowserRow { label: if i.name.is_empty() { r.addr.to_string() } else { i.name.clone() }, value: Some(v), locked: false }
                 }
-                None if r.unreachable() => BrowserRow { label: r.addr.to_string(), value: Some("no answer".into()) },
-                None => BrowserRow { label: r.addr.to_string(), value: Some("asking…".into()) },
+                None if r.unreachable() => BrowserRow { label: r.addr.to_string(), value: Some("no answer".into()), locked: false },
+                None => BrowserRow { label: r.addr.to_string(), value: Some("asking…".into()), locked: false },
             };
             rows.push(row);
         }

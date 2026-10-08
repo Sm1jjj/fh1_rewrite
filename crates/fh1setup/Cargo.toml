@@ -22,6 +22,8 @@ anyhow = "1"
 png = "0.18"
 texpresso = { version = "2", features = ["rayon"] }
 rayon = "1"
+# Disc images handed over inside a .zip (zip64, deflate/deflate64/lzma as 7-Zip and Windows write them).
+zip = { version = "6", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "lzma"] }
 
 [features]
 # Optional importers for other Forza games the user owns (off by default): `fh1setup import-fh2` / `import-fm4`.
