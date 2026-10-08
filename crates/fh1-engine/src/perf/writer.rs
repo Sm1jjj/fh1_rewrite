@@ -93,12 +93,30 @@ pub fn flush(timeout: Duration) {
     }
 }
 
-/// Drain the queue and write everything after this in place (exit).
+/// Drain the queue and write everything after this in place (exit). At most 1 s (was 3 s: a stalled disk made quitting
+/// hang); saves are a few KB.
 pub fn finish() {
     if !EXITING.load(Ordering::Relaxed) {
-        flush(Duration::from_secs(3));
+        flush(Duration::from_secs(1));
         EXITING.store(true, Ordering::Relaxed);
     }
+}
+
+/// Quit without tearing the app down (2026-10-08, user: "quit via the menu froze"): after `App::run` returns, dropping the
+/// world (~40k scenery entities, GPU resources, the render thread, task pools with streaming tasks in flight) took seconds.
+/// The exit frame has already queued the saves and the perf summary; drain the writer (at most 1 s), give the log pipe's
+/// writer thread 100 ms, then end the process. `FH1_FAST_EXIT=0` = return normally (old).
+pub fn exit_now(code: AppExit) -> AppExit {
+    if std::env::var("FH1_FAST_EXIT").is_ok_and(|v| v == "0") {
+        return code;
+    }
+    finish();
+    std::thread::sleep(Duration::from_millis(100));
+    let status = match code {
+        AppExit::Success => 0,
+        AppExit::Error(n) => n.get() as i32,
+    };
+    std::process::exit(status)
 }
 
 /// Drain the queue when the app exits (registered by PerfPlugin, always on). Writes queued later in the exit frame run

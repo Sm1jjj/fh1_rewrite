@@ -7,6 +7,9 @@
 //! band from the LOD eye, frustum vs world AABB, per-kind rules) and writes its `DrawIndexedIndirect` args into the view's
 //! own region with instance_count 1 or 0; each bin is then one `multi_draw_indexed_indirect`. Per-frame CPU work is
 //! O(views x bins), independent of the record count.
+//! Compaction (chunk 5, default when the GPU has MULTI_DRAW_INDIRECT_COUNT; `FH1_STATIC_WORLD_COMPACT=0` = off): visible
+//! candidates are appended per (view, bin) with an atomic counter and each bin is drawn with
+//! `multi_draw_indexed_indirect_count`, so culled entries cost nothing (no zero-instance draws for the command processor).
 //! Chunk 4: the same cull feeds (a) the car probe faces (fh1-remaster car_probe.rs `CarProbeFace`, 47's rules: radius >=
 //! `probe_min_radius()`, within the face's far plane) and (b) a depth-only pass into each directional shadow cascade of the
 //! main camera after Bevy's shadow pass (records with the casts flag; small casters (half-diagonal < 1.5 m) only within
@@ -47,6 +50,10 @@ use crate::material::RemasterMaterial;
 pub(super) const CULL_SHADER: Handle<Shader> = bevy::asset::uuid_handle!("7c1f3a52-9b0e-4d61-a8c2-5e4f90d1b3a7");
 pub(super) const SHADOW_SHADER: Handle<Shader> = bevy::asset::uuid_handle!("3e8b6d14-2a7f-4c95-b0e1-9d7c5a2f6e48");
 
+/// Render-world counters for the perf CSV (static_world::render_stats): candidates, views culled this frame.
+pub(super) static CANDIDATES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(super) static VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Views drawn per frame at most (main, probe face, cascades); each owns an args region.
 const MAX_VIEWS: u32 = 12;
 
@@ -62,6 +69,11 @@ fn cull_on() -> bool {
 fn shadows_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| flag_on("FH1_STATIC_WORLD_SHADOWS"))
+}
+
+fn compact_wanted() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| flag_on("FH1_STATIC_WORLD_COMPACT"))
 }
 
 fn probe_on() -> bool {
@@ -217,6 +229,8 @@ impl SpecializedRenderPipeline for ShadowPipeline {
 pub(super) struct CullPipeline {
     layout: BindGroupLayoutDescriptor,
     id: CachedComputePipelineId,
+    /// Compacted args + indirect count draws.
+    compact: bool,
 }
 
 fn init_pipelines(
@@ -260,20 +274,24 @@ fn init_pipelines(
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_sized(false, None),
             ),
         ),
     );
+    let compact = compact_wanted() && device.features().contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT);
     let id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("static world cull".into()),
         layout: vec![cull_layout.clone()],
         shader: CULL_SHADER,
+        shader_defs: if compact { vec!["COMPACT".into()] } else { Vec::new() },
         entry_point: Some("cull".into()),
         ..default()
     });
     let unclipped = device.features().contains(WgpuFeatures::DEPTH_CLIP_CONTROL);
-    info!("static world: pipelines ready (bindless materials: {bindless}, unclipped shadow depth: {unclipped})");
+    info!("static world: pipelines ready (bindless materials: {bindless}, unclipped shadow depth: {unclipped}, compacted draws: {compact})");
     commands.insert_resource(ShadowPipeline { view_layout, arena_layout: arena_layout.clone(), material_layout: material_layout.clone(), bindless, unclipped });
-    commands.insert_resource(CullPipeline { layout: cull_layout, id });
+    commands.insert_resource(CullPipeline { layout: cull_layout, id, compact });
     commands.insert_resource(SwPipeline { mesh_pipeline: mp.clone(), layout_ref, arena_layout, material_layout, bindless });
 }
 
@@ -320,21 +338,29 @@ fn specialize_views(
 // ---------------------------------------------------------------- draw lists (CPU, on change only)
 
 /// Looks up the bindless slot of each record waiting for its material.
-fn resolve_materials(mut arena: ResMut<Arena>, bindings: Res<RenderMaterialBindings>, device: Res<RenderDevice>, queue: Res<RenderQueue>) {
-    if arena.pending.is_empty() {
+/// Re-bound slots (material changes) are checked once more the frame after, in case Bevy's re-preparation lands a frame
+/// later than the change; only a changed slot / slab writes the record and rebuilds the lists.
+fn resolve_materials(mut arena: ResMut<Arena>, bindings: Res<RenderMaterialBindings>, device: Res<RenderDevice>, queue: Res<RenderQueue>, mut later: Local<Vec<u32>>) {
+    let mut pending = std::mem::take(&mut arena.pending);
+    pending.append(&mut later);
+    *later = std::mem::take(&mut arena.recheck);
+    if pending.is_empty() {
         return;
     }
-    let pending = std::mem::take(&mut arena.pending);
+    pending.sort_unstable();
+    pending.dedup();
     let mut still = Vec::new();
     for slot in pending {
         let s = slot as usize;
         let Some(Some((_, material))) = arena.slot_mesh.get(s).cloned() else { continue };
         match bindings.get(&material) {
             Some(b) => {
-                arena.records[s].material = b.slot.0;
-                arena.slot_group[s] = Some(b.group.0);
-                arena.write_record(&device, &queue, slot);
-                arena.dirty = true;
+                if arena.records[s].material != b.slot.0 || arena.slot_group[s] != Some(b.group.0) {
+                    arena.records[s].material = b.slot.0;
+                    arena.slot_group[s] = Some(b.group.0);
+                    arena.write_record(&device, &queue, slot);
+                    arena.dirty = true;
+                }
             }
             None => still.push(slot),
         }
@@ -375,6 +401,11 @@ pub(super) struct DrawLists {
     /// holds every candidate's args (written by the CPU).
     args: Option<Buffer>,
     region: u32,
+    /// Compaction: each candidate's bin is in the candidate buffer (slot, bin pairs); first arg entry per bin; one draw
+    /// count per (view, bin) (MAX_VIEWS x `bins_cap`).
+    bin_first: Option<Buffer>,
+    counts: Option<Buffer>,
+    bins_cap: u32,
     arena_bind_group: Option<(u32, BindGroup)>,
     shadow_pipelines: HashMap<Variant, CachedRenderPipelineId>,
 }
@@ -446,6 +477,31 @@ fn build_lists(mut arena: ResMut<Arena>, mut lists: ResMut<DrawLists>, device: R
         }
         return;
     }
+    // Candidates as (slot, bin) pairs; the bins' first arg entries; the per-(view, bin) counts.
+    let mut pairs: Vec<u32> = Vec::with_capacity(slots.len() * 2);
+    for (b, bin) in lists.bins.iter().enumerate() {
+        for &slot in &slots[bin.first as usize..(bin.first + bin.count) as usize] {
+            pairs.push(slot);
+            pairs.push(b as u32);
+        }
+    }
+    let firsts: Vec<u32> = lists.bins.iter().map(|b| b.first).collect();
+    let nb = firsts.len() as u32;
+    if lists.bin_first.is_none() || lists.bins_cap < nb {
+        let cap = (nb * 2).max(64);
+        lists.bin_first = Some(device.create_buffer(&BufferDescriptor { label: Some("static world bin firsts"), size: cap as u64 * 4, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, mapped_at_creation: false }));
+        lists.counts = Some(device.create_buffer(&BufferDescriptor {
+            label: Some("static world draw counts"),
+            size: cap as u64 * MAX_VIEWS as u64 * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        lists.bins_cap = cap;
+    }
+    if let Some(b) = &lists.bin_first {
+        queue.write_buffer(b, 0, super::bytemuck_words(&firsts));
+    }
+    let slots = pairs;
     let bytes = slots.len() as u64 * 4;
     if lists.candidates.is_none() || lists.candidates_cap < bytes {
         let cap = ((bytes + bytes / 2).max(1 << 16) + 15) & !15; // storage bindings must be 4-byte multiples
@@ -468,7 +524,7 @@ pub(super) struct ViewUniform {
     eye: Vec4,
     /// x min radius (probe), y max distance (0 = none), z small-caster distance (shadows), w plane count.
     params: Vec4,
-    /// x kind (0 main, 1 shadow, 2 probe), y args base (entries), z candidate count.
+    /// x kind (0 main, 1 shadow, 2 probe), y args base (entries), z candidate count, w draw-count base (compaction).
     info: UVec4,
 }
 
@@ -481,6 +537,8 @@ const KIND_PROBE: u32 = 2;
 pub(super) struct SwCullView {
     offset: u32,
     base: u32,
+    /// First draw count of this view (compaction).
+    counts: u32,
 }
 
 #[derive(Resource, Default)]
@@ -540,18 +598,21 @@ fn prepare_views(
     }
     let u = &mut *uniforms;
     u.buffer.clear();
+    CANDIDATES.store(lists.count, std::sync::atomic::Ordering::Relaxed);
+    VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
     if !cull_on() || lists.count == 0 {
         return;
     }
-    let (count, region) = (lists.count, lists.region);
+    let (count, region, bins_cap) = (lists.count, lists.region, lists.bins_cap);
     let mut slot = 0u32;
     let mut push = |commands: &mut Commands, e: Entity, vu: ViewUniform, buffer: &mut DynamicUniformBuffer<ViewUniform>| {
         if slot >= MAX_VIEWS {
             return;
         }
         let base = slot * region;
-        let offset = buffer.push(&ViewUniform { info: UVec4::new(vu.info.x, base, count, 0), ..vu });
-        commands.entity(e).insert(SwCullView { offset, base });
+        let counts = slot * bins_cap;
+        let offset = buffer.push(&ViewUniform { info: UVec4::new(vu.info.x, base, count, counts), ..vu });
+        commands.entity(e).insert(SwCullView { offset, base, counts });
         slot += 1;
     };
     let skip_mask = skip.map_or(0, |s| s.0);
@@ -599,6 +660,7 @@ fn prepare_views(
             }
         }
     }
+    VIEWS.store(slot, std::sync::atomic::Ordering::Relaxed);
     u.buffer.write_buffer(&device, &queue);
 }
 
@@ -626,10 +688,15 @@ fn prepare_bind_groups(
     u.cull_bind_group = None;
     u.shadow_view_bind_group = None;
     let Some(view_binding) = u.buffer.binding() else { return };
-    if let (Some(r), Some(c), Some(a)) = (arena.record_buffer.as_ref(), lists.candidates.as_ref(), lists.args.as_ref()) {
+    if let (Some(r), Some(c), Some(a), Some(bf), Some(n)) =
+        (arena.record_buffer.as_ref(), lists.candidates.as_ref(), lists.args.as_ref(), lists.bin_first.as_ref(), lists.counts.as_ref())
+    {
         let layout = cache.get_bind_group_layout(&cull.layout);
-        u.cull_bind_group =
-            Some(device.create_bind_group("static world cull", &layout, &BindGroupEntries::sequential((view_binding.clone(), r.as_entire_binding(), c.as_entire_binding(), a.as_entire_binding()))));
+        u.cull_bind_group = Some(device.create_bind_group(
+            "static world cull",
+            &layout,
+            &BindGroupEntries::sequential((view_binding.clone(), r.as_entire_binding(), c.as_entire_binding(), a.as_entire_binding(), bf.as_entire_binding(), n.as_entire_binding())),
+        ));
     }
     let layout = cache.get_bind_group_layout(&shadow.view_layout);
     u.shadow_view_bind_group = Some(device.create_bind_group("static world shadow view", &layout, &BindGroupEntries::single(view_binding)));
@@ -638,8 +705,12 @@ fn prepare_bind_groups(
 // ---------------------------------------------------------------- passes
 
 /// Culls the view's candidates into its args region.
-fn dispatch_cull(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipeline, uniforms: &ViewUniforms, view: &SwCullView, count: u32) -> bool {
+fn dispatch_cull(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipeline, uniforms: &ViewUniforms, lists: &DrawLists, view: &SwCullView, count: u32) -> bool {
     let (Some(p), Some(bg)) = (cache.get_compute_pipeline(cull.id), uniforms.cull_bind_group.as_ref()) else { return false };
+    if cull.compact {
+        let Some(counts) = lists.counts.as_ref() else { return false };
+        ctx.command_encoder().clear_buffer(counts, view.counts as u64 * 4, Some(lists.bins_cap as u64 * 4));
+    }
     let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor { label: Some("static world cull"), timestamp_writes: None });
     pass.set_pipeline(p);
     pass.set_bind_group(0, bg, &[view.offset]);
@@ -663,10 +734,12 @@ fn draw_static_world(
     if lists.bins.is_empty() {
         return;
     }
-    // Culled: this view's region; unculled (FH1_STATIC_WORLD_CULL=0): region 0, main camera only.
+    // Culled: this view's region (+ its draw counts when compacted); unculled (FH1_STATIC_WORLD_CULL=0): region 0, main
+    // camera only.
+    let counts = cull.as_ref().filter(|c| c.compact && cull_on()).and(lists.counts.as_ref()).zip(cull_view.map(|v| v.counts));
     let base = if cull_on() {
         let (Some(cv), Some(cull)) = (cull_view, cull.as_ref()) else { return };
-        if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, cv, lists.count) {
+        if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
             return;
         }
         cv.base
@@ -700,7 +773,19 @@ fn draw_static_world(
         let Some(material_bg) = slab.bind_group() else { continue };
         pass.set_render_pipeline(p);
         pass.set_bind_group(3, material_bg, &[]);
-        pass.multi_draw_indexed_indirect(args, (base + bin.first) as u64 * ARGS_BYTES, bin.count);
+        draw_bin(&mut pass, args, counts, base, bin, &lists);
+    }
+}
+
+/// One bin's draws: compacted (indirect count) or every candidate (zero-instance when culled).
+fn draw_bin<'a>(pass: &mut bevy::render::render_phase::TrackedRenderPass<'a>, args: &'a Buffer, counts: Option<(&'a Buffer, u32)>, base: u32, bin: &Bin, lists: &DrawLists) {
+    let offset = (base + bin.first) as u64 * ARGS_BYTES;
+    match counts {
+        Some((cb, cbase)) => {
+            let b = lists.bins.iter().position(|x| x.first == bin.first).unwrap_or(0) as u32;
+            pass.multi_draw_indexed_indirect_count(args, offset, cb, (cbase + b) as u64 * 4, bin.count);
+        }
+        None => pass.multi_draw_indexed_indirect(args, offset, bin.count),
     }
 }
 
@@ -727,10 +812,11 @@ fn draw_static_shadows(
         return;
     };
     let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
+    let counts = if cull.compact { lists.counts.as_ref() } else { None };
     for &le in &view_lights.lights {
         // Only the cascades prepare_views gave a slot (skipped / cached cascades have none).
         let Ok((shadow_view, Some(cv))) = lights.get(le) else { continue };
-        if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, cv, lists.count) {
+        if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
             continue;
         }
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
@@ -751,7 +837,7 @@ fn draw_static_shadows(
             let Some(material_bg) = slab.bind_group() else { continue };
             pass.set_render_pipeline(p);
             pass.set_bind_group(2, material_bg, &[]);
-            pass.multi_draw_indexed_indirect(args, (cv.base + bin.first) as u64 * ARGS_BYTES, bin.count);
+            draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, bin, &lists);
         }
     }
 }
@@ -815,6 +901,8 @@ struct Args {
 @group(0) @binding(1) var<storage, read> records: array<SwRecord>;
 @group(0) @binding(2) var<storage, read> candidates: array<u32>;
 @group(0) @binding(3) var<storage, read_write> args: array<Args>;
+@group(0) @binding(4) var<storage, read> bin_first: array<u32>;
+@group(0) @binding(5) var<storage, read_write> counts: array<atomic<u32>>;
 
 const FLAG_CASTS: u32 = 1u;
 const FLAG_LIVE: u32 = 4u;
@@ -827,7 +915,9 @@ fn cull(@builtin(global_invocation_id) id: vec3<u32>) {
     if i >= view.info.z {
         return;
     }
-    let slot = candidates[i];
+    // Candidates are (slot, bin) pairs.
+    let slot = candidates[2u * i];
+    let bin = candidates[2u * i + 1u];
     let r = records[slot];
     var visible = (r.flags & FLAG_LIVE) != 0u && (r.flags & FLAG_HIDDEN) == 0u && r.index_count > 0u;
     let c = 0.5 * (r.aabb_min.xyz + r.aabb_max.xyz);
@@ -868,7 +958,14 @@ fn cull(@builtin(global_invocation_id) id: vec3<u32>) {
     a.first_index = r.first_index;
     a.base_vertex = i32(r.base_vertex);
     a.first_instance = slot;
+#ifdef COMPACT
+    if visible {
+        let k = atomicAdd(&counts[view.info.w + bin], 1u);
+        args[view.info.y + bin_first[bin] + k] = a;
+    }
+#else
     args[view.info.y + i] = a;
+#endif
 }
 "#;
 

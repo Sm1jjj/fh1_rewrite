@@ -293,7 +293,9 @@ fn main() -> AppExit {
             render_app.insert_resource(s);
         }
     }
-    app.run()
+    // Quit at once (perf/writer.rs exit_now: saves flushed, no slow teardown).
+    let code = app.run();
+    perf::writer::exit_now(code)
 }
 
 /// Thread pools (2026-10-08 perf, e1): the render thread rose and fell with the main world's load (r = 0.92), because both

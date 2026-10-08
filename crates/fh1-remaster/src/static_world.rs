@@ -15,6 +15,9 @@
 //!   buffer, one index buffer (first-fit ranges, grown x1.5 with a GPU copy) and a record buffer (one 96-byte
 //!   [`GpuRecord`] per instance slot). Uploads only what changed.
 //! Next chunks: material table + draw (2), GPU cull (3), shadows / probe (4), parity (5).
+//! Bake path (P12 chunk 5, fh1-rewrite-15): geometry is keyed by [`GeoKey`] (a mesh asset, or a baked key from a bundle
+//! file); [`bake`] writes / reads per-bundle files (prop tiles, zone models, the prop templates) and loads them as blocks
+//! of geometry + instances without mesh assets or ECS entities.
 
 use bevy::asset::UntypedAssetId;
 use std::collections::{BTreeMap, HashMap};
@@ -28,12 +31,21 @@ use bevy::render::render_resource::{Buffer, BufferDescriptor, BufferUsages, Comm
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{Render, RenderApp, RenderSystems};
 
+pub mod bake;
 mod draw;
+
+/// What a geometry in the arena is keyed by: a scenery mesh asset (the live path), or a baked bundle geometry ([`bake`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum GeoKey {
+    Mesh(AssetId<Mesh>),
+    Baked(u64),
+}
 
 /// `FH1_STATIC_WORLD=1` (remaster only).
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::enabled() && std::env::var("FH1_STATIC_WORLD").is_ok_and(|v| v == "1"))
+    // Bake mode (bake.rs, FH1_BAKE_CELLS) records what the static world receives, so it needs it on.
+    *ON.get_or_init(|| crate::enabled() && (std::env::var("FH1_STATIC_WORLD").is_ok_and(|v| v == "1") || bake::baking()))
 }
 
 /// Packed vertex: position (3), normal (3), uv0 (2), uv1 (2), uv2 (2) as f32, colour as unorm8x4 = 13 words.
@@ -99,19 +111,21 @@ pub struct InstanceDesc {
 }
 
 enum Op {
-    AddGeometry { mesh: AssetId<Mesh>, vertices: Vec<u32>, indices: Vec<u32> },
-    RemoveGeometry(AssetId<Mesh>),
-    AddInstance { slot: u32, mesh: AssetId<Mesh>, material: UntypedAssetId, record: GpuRecord },
+    AddGeometry { mesh: GeoKey, vertices: Vec<u32>, indices: Vec<u32> },
+    RemoveGeometry(GeoKey),
+    AddInstance { slot: u32, mesh: GeoKey, material: UntypedAssetId, record: GpuRecord },
     RemoveInstance(u32),
     SetTag(u32, i32),
     SetHidden(u32, bool),
+    /// A material was modified (night writes): re-resolve its records' bindless slot / slab.
+    Rebind(UntypedAssetId),
 }
 
 /// Main-world bookkeeping: packed geometry ids and free instance slots.
 #[derive(Default)]
 struct MainState {
     /// Packed geometry and its flags (FLAG_MASK / FLAG_TWO_SIDED).
-    geometry: HashMap<AssetId<Mesh>, u32>,
+    geometry: HashMap<GeoKey, u32>,
     next_slot: u32,
     free_slots: Vec<u32>,
     ops: Vec<Op>,
@@ -143,6 +157,12 @@ fn push(op: Op) {
     });
 }
 
+/// Render-world counters (perf CSV): draw candidates and views culled in the last frame.
+pub fn render_stats() -> (u32, u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (draw::CANDIDATES.load(Relaxed), draw::VIEWS.load(Relaxed))
+}
+
 /// Main-world counters (perf CSV / logs).
 pub fn stats() -> Stats {
     with(|s| s.stats)
@@ -166,26 +186,66 @@ pub fn pack_mesh(mesh: &Mesh) -> Option<Packed> {
 /// Registers packed geometry for mesh asset `id` (once; later calls for the same id are ignored). `flags`: FLAG_MASK /
 /// FLAG_TWO_SIDED of its material.
 pub fn add_packed(id: AssetId<Mesh>, p: Packed, flags: u32) {
+    bake::record_geometry(id, &p, flags);
+    add_geometry(GeoKey::Mesh(id), p.vertices, p.indices, flags);
+}
+
+/// Registers geometry under `key` (once). False when it was already there.
+fn add_geometry(key: GeoKey, vertices: Vec<u32>, indices: Vec<u32>, flags: u32) -> bool {
     with(|s| {
-        if s.geometry.insert(id, flags).is_some() {
-            return;
+        if s.geometry.insert(key, flags).is_some() {
+            return false;
         }
         s.stats.geometries += 1;
-        s.stats.vertex_bytes += p.vertices.len() as u64 * 4;
-        s.stats.index_bytes += p.indices.len() as u64 * 4;
-        s.ops.push(Op::AddGeometry { mesh: id, vertices: p.vertices, indices: p.indices });
+        s.stats.vertex_bytes += vertices.len() as u64 * 4;
+        s.stats.index_bytes += indices.len() as u64 * 4;
+        s.ops.push(Op::AddGeometry { mesh: key, vertices, indices });
+        true
+    })
+}
+
+/// Frees geometry `key` (baked bundles; mesh-asset geometry goes with its asset).
+fn remove_geometry(key: GeoKey) {
+    let gone = with(|s| {
+        let had = s.geometry.remove(&key).is_some();
+        if had {
+            s.stats.geometries = s.stats.geometries.saturating_sub(1);
+        }
+        had
     });
+    if gone {
+        push(Op::RemoveGeometry(key));
+    }
 }
 
 /// Whether `id` has packed geometry.
 pub fn has_geometry(id: AssetId<Mesh>) -> bool {
-    on() && with(|s| s.geometry.contains_key(&id))
+    on() && with(|s| s.geometry.contains_key(&GeoKey::Mesh(id)))
 }
 
 /// Adds an instance; returns the component for its entity (None when off or the mesh isn't packed).
 pub fn add_instance(d: InstanceDesc) -> Option<StaticInstance> {
-    let geo_flags = if on() { with(|s| s.geometry.get(&d.mesh).copied()) } else { None };
-    let geo_flags = geo_flags?;
+    if !on() {
+        return None;
+    }
+    bake::record_instance(&d);
+    add_instance_key(GeoKey::Mesh(d.mesh), d.material, d.transform, d.local_min, d.local_max, d.range, d.casts, d.tag).map(StaticInstance)
+}
+
+/// [`add_instance`] for any geometry key; returns the record slot.
+#[allow(clippy::too_many_arguments)]
+fn add_instance_key(
+    geo: GeoKey,
+    material: UntypedAssetId,
+    transform: Mat4,
+    local_min: Vec3,
+    local_max: Vec3,
+    range: Option<(std::ops::Range<f32>, std::ops::Range<f32>)>,
+    casts: bool,
+    tag: i32,
+) -> Option<u32> {
+    let geo_flags = with(|s| s.geometry.get(&geo).copied())?;
+    let d = InstanceDescKey { transform, local_min, local_max, range, casts, tag };
     let (wmin, wmax) = world_bounds(d.transform, d.local_min, d.local_max);
     let t = d.transform.transpose();
     let rows = [t.x_axis.to_array(), t.y_axis.to_array(), t.z_axis.to_array()];
@@ -199,10 +259,25 @@ pub fn add_instance(d: InstanceDesc) -> Option<StaticInstance> {
             s.next_slot - 1
         });
         s.stats.instances += 1;
-        s.ops.push(Op::AddInstance { slot, mesh: d.mesh, material: d.material, record });
+        s.ops.push(Op::AddInstance { slot, mesh: geo, material, record });
         slot
     });
-    Some(StaticInstance(slot))
+    Some(slot)
+}
+
+/// The placement half of [`InstanceDesc`] (shared by the live and the baked path).
+struct InstanceDescKey {
+    transform: Mat4,
+    local_min: Vec3,
+    local_max: Vec3,
+    range: Option<(std::ops::Range<f32>, std::ops::Range<f32>)>,
+    casts: bool,
+    tag: i32,
+}
+
+/// Hidden flag of a record slot (baked bundles: zone switches).
+fn set_hidden_slot(slot: u32, hidden: bool) {
+    with(|s| s.ops.push(Op::SetHidden(slot, hidden)));
 }
 
 /// Zone fade dither level of an instance (record slot).
@@ -278,17 +353,28 @@ fn pack(mesh: &Mesh) -> Option<(Vec<u32>, Vec<u32>)> {
 fn free_geometry(mut events: MessageReader<AssetEvent<Mesh>>) {
     for e in events.read() {
         if let AssetEvent::Removed { id } = e {
-            let gone = with(|s| {
-                let had = s.geometry.remove(id).is_some();
-                if had {
-                    s.stats.geometries = s.stats.geometries.saturating_sub(1);
-                }
-                had
-            });
-            if gone {
-                push(Op::RemoveGeometry(*id));
-            }
+            remove_geometry(GeoKey::Mesh(*id));
         }
+    }
+}
+
+/// Material changes (47's dusk / dawn night writes, 256 per frame): Bevy re-prepares the material, which may move it to
+/// another bindless slot or slab; the records using it are re-resolved (draw.rs resolve_materials).
+/// `FH1_STATIC_WORLD_REBIND=0` = never re-resolve (chunk 4).
+fn watch_materials(mut events: MessageReader<AssetEvent<crate::material::RemasterMaterial>>) {
+    if std::env::var("FH1_STATIC_WORLD_REBIND").is_ok_and(|v| v == "0") {
+        events.clear();
+        return;
+    }
+    let mut ops: Vec<Op> = events
+        .read()
+        .filter_map(|e| match e {
+            AssetEvent::Modified { id } | AssetEvent::Added { id } => Some(Op::Rebind(id.untyped())),
+            _ => None,
+        })
+        .collect();
+    if !ops.is_empty() {
+        with(|s| s.ops.append(&mut ops));
     }
 }
 
@@ -314,7 +400,7 @@ pub fn plugin(app: &mut App) {
     }
     info!("static world: ON (P12: scenery drawn from the GPU arena, GPU-culled per view, shadows + car probe)");
     draw::register_shaders(app);
-    app.add_systems(Last, (free_geometry, log_stats)).add_systems(PostUpdate, sync_visibility.after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate));
+    app.add_systems(Last, (free_geometry, log_stats, watch_materials)).add_systems(PostUpdate, sync_visibility.after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate));
     if let Some(ra) = app.get_sub_app_mut(RenderApp) {
         ra.init_resource::<Arena>().add_systems(Render, apply_ops.in_set(RenderSystems::PrepareResources));
         draw::plugin(ra);
@@ -433,15 +519,18 @@ struct GeoRange {
 pub struct Arena {
     vertices: WordBuffer,
     indices: WordBuffer,
-    geometry: HashMap<AssetId<Mesh>, GeoRange>,
+    geometry: HashMap<GeoKey, GeoRange>,
     /// CPU copy of every record slot (uploaded per changed slot) and the slots' meshes / materials.
     pub(crate) records: Vec<GpuRecord>,
-    pub(crate) slot_mesh: Vec<Option<(AssetId<Mesh>, UntypedAssetId)>>,
+    pub(crate) slot_mesh: Vec<Option<(GeoKey, UntypedAssetId)>>,
     pub(crate) record_buffer: Option<Buffer>,
     record_cap: u32,
     /// Material bind group (bindless slab) per slot, once resolved; slots waiting for their material's binding.
     pub(crate) slot_group: Vec<Option<u32>>,
     pub(crate) pending: Vec<u32>,
+    /// Material -> its record slots (re-binding), and slots to re-resolve once more next frame.
+    by_material: HashMap<UntypedAssetId, Vec<u32>>,
+    pub(crate) recheck: Vec<u32>,
     /// Records / buffers changed since the draw lists were built (draw.rs).
     pub(crate) dirty: bool,
     /// Bumped whenever a GPU buffer is re-created (the draw bind group must be rebuilt).
@@ -460,6 +549,8 @@ impl Default for Arena {
             record_cap: 0,
             slot_group: Vec::new(),
             pending: Vec::new(),
+            by_material: HashMap::new(),
+            recheck: Vec::new(),
             dirty: false,
             buffers_generation: 0,
         }
@@ -552,9 +643,15 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                 }
                 a.records[s] = record;
                 a.slot_mesh[s] = Some((mesh, material));
+                a.by_material.entry(material).or_default().push(slot);
                 a.write_record(&device, &queue, slot);
             }
             Op::RemoveInstance(slot) => {
+                if let Some(Some((_, m))) = a.slot_mesh.get(slot as usize) {
+                    if let Some(v) = a.by_material.get_mut(m) {
+                        v.retain(|&x| x != slot);
+                    }
+                }
                 if let Some(r) = a.records.get_mut(slot as usize) {
                     *r = GpuRecord::default();
                     a.slot_mesh[slot as usize] = None;
@@ -566,6 +663,12 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                 if let Some(r) = a.records.get_mut(slot as usize) {
                     r.tag = level;
                     a.write_record(&device, &queue, slot);
+                }
+            }
+            Op::Rebind(material) => {
+                if let Some(v) = a.by_material.get(&material) {
+                    a.pending.extend_from_slice(v);
+                    a.recheck.extend_from_slice(v);
                 }
             }
             Op::SetHidden(slot, hidden) => {

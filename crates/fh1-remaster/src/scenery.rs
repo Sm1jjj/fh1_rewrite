@@ -211,6 +211,22 @@ impl RemasterScenery {
         self.build(track, index, m, Some(lightmap), night, materials)
     }
 
+    /// P12 bake (static_world/bake.rs): the stable key of a scenery material: game material, night lightmap, mirrored.
+    pub fn bake_key(&self, id: AssetId<RemasterMaterial>) -> Option<crate::static_world::bake::MatKey> {
+        let &(_, index, mirrored, lightmap) = self.origin.get(&id)?;
+        Some(crate::static_world::bake::MatKey { game_material: index as u32, lightmap, mirrored })
+    }
+
+    /// P12 bake: the material for a baked key, in the track of `scenery_dir` (None = no remaster record / skipped class).
+    pub fn from_bake_key(&mut self, scenery_dir: &Path, key: crate::static_world::bake::MatKey, materials: &mut Assets<RemasterMaterial>) -> Option<Handle<RemasterMaterial>> {
+        let RemasterBatch::Material(h, _) = self.batch(scenery_dir, key.game_material, materials) else { return None };
+        let h = if key.mirrored { self.mirrored(&h, materials) } else { h };
+        Some(match key.lightmap {
+            Some(lm) => self.lightmap_variant(&h, lm, materials),
+            None => h,
+        })
+    }
+
     /// The material for a W4 merged batch (meshes already in world space; mirrored parts carry flipped winding).
     pub fn lookup(&mut self, scenery_dir: &Path, game_material: u32, materials: &mut Assets<RemasterMaterial>) -> Option<(Handle<RemasterMaterial>, Class)> {
         match self.batch(scenery_dir, game_material, materials) {
@@ -253,6 +269,19 @@ impl RemasterParams<'_> {
         match (self.scenery.as_mut(), self.materials.as_mut()) {
             (Some(s), Some(m)) => s.lightmap_variant(h, lightmap, m),
             _ => h.clone(),
+        }
+    }
+
+    /// See [`RemasterScenery::bake_key`].
+    pub fn bake_key(&self, id: AssetId<RemasterMaterial>) -> Option<crate::static_world::bake::MatKey> {
+        self.scenery.as_ref().and_then(|s| s.bake_key(id))
+    }
+
+    /// See [`RemasterScenery::from_bake_key`].
+    pub fn from_bake_key(&mut self, scenery_dir: &Path, key: crate::static_world::bake::MatKey) -> Option<Handle<RemasterMaterial>> {
+        match (self.scenery.as_mut(), self.materials.as_mut()) {
+            (Some(s), Some(m)) if crate::enabled() => s.from_bake_key(scenery_dir, key, m),
+            _ => None,
         }
     }
 }

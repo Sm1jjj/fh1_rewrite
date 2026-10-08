@@ -106,7 +106,7 @@ impl Plugin for RemasterLightPlugin {
             .add_systems(Startup, (sky::setup_sky, spawn_moon))
             .add_systems(Update, main_only_light_layers)
             .add_systems(Update, (setup_camera, sky::update_sky, env_refresh.after(setup_camera)))
-            .add_systems(Update, (game_shader_casters, game_shader_probe_skip))
+            .add_systems(Update, (game_shader_casters, game_shader_probe_skip, hiz_depth_usage))
             .add_systems(Update, apply_quality)
             .add_systems(PostUpdate, game_fog.after(update_lights))
             .add_systems(PostUpdate, update_lights.before(bevy::transform::TransformSystems::Propagate))
@@ -749,6 +749,22 @@ fn game_shader_casters(
         let huge = aabb.is_some_and(|b| b.half_extents.max_element() > 1500.0);
         if sky || huge || materials.get(&m.0).is_some_and(|m| m.alpha_blend) {
             commands.entity(e).try_insert(bevy::light::NotShadowCaster);
+        }
+    }
+}
+
+/// The static world's Hi-Z (static_world/hiz.rs) reads the main camera's depth in a compute pass: its depth texture
+/// needs TEXTURE_BINDING (Bevy's default is RENDER_ATTACHMENT only). Only with `FH1_STATIC_WORLD=1` and the Hi-Z on.
+fn hiz_depth_usage(mut cams: Query<&mut Camera3d, With<RemasterView>>) {
+    // Same switch as static_world/hiz.rs `hiz_on` (FH1_STATIC_WORLD_HIZ=0 = off).
+    if !crate::static_world::on() || std::env::var("FH1_STATIC_WORLD_HIZ").is_ok_and(|v| v == "0") {
+        return;
+    }
+    use bevy::render::render_resource::TextureUsages;
+    let want = (TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING).bits();
+    for mut c in &mut cams {
+        if c.depth_texture_usages.0 & want != want {
+            c.depth_texture_usages.0 |= want;
         }
     }
 }

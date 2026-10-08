@@ -115,9 +115,12 @@ fn pack_t_s(section: &FxCarSection) -> Aabb {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn load_fx_wheels(
     mut commands: Commands,
-    added: Query<(Entity, &FxCarBody, Option<&crate::car::FxCarRim>), Added<FxCarBody>>,
+    new_bodies: Query<Entity, Added<FxCarBody>>,
+    bodies: Query<(Entity, &FxCarBody, Option<&crate::car::FxCarRim>)>,
+    mut waiting: Local<Vec<Entity>>,
     mut lib: ResMut<FxLibrary>,
     mut globals: ResMut<FxCarGlobals>,
     mut shaders: ResMut<Assets<Shader>>,
@@ -126,7 +129,29 @@ fn load_fx_wheels(
 ) {
     let log = std::env::var_os("FH1_CARFX_LOG").is_some();
     let env_dynamic = env.as_ref().filter(|c| c.use_dynamic).map(|c| c.dynamic.clone());
-    for (e, body, rim_override) in &added {
+    // Wait until the car's files and its rim folder are in RAM (files::car_ready on the IO pool; an aftermarket rim was
+    // read on the main thread on first use): no disk read on the main thread.
+    waiting.extend(new_bodies.iter());
+    let mut ready_now = Vec::new();
+    waiting.retain(|&e| match bodies.get(e) {
+        Err(_) => false,
+        Ok((_, body, rim_override)) => {
+            // The car first (model.json comes from RAM after it), then its rim folder.
+            if !crate::files::car_ready(&body.assets, &body.car, &body.track, None) {
+                return true;
+            }
+            let cars = body.assets.join("cars");
+            let rim = rim_override.map(|r| r.0.clone()).or_else(|| crate::files::read_json(&cars.join(&body.car).join("model.json")).and_then(|m| m["rim"].as_str().map(str::to_owned)));
+            let rim_dir = rim.map(|r| cars.join(&body.car).parent().map_or_else(|| cars.clone(), |p| p.to_path_buf()).join("wheels").join(r));
+            if crate::files::car_ready(&body.assets, &body.car, &body.track, rim_dir.as_deref()) {
+                ready_now.push(e);
+                false
+            } else {
+                true
+            }
+        }
+    });
+    for (e, body, rim_override) in ready_now.iter().filter_map(|&e| bodies.get(e).ok()) {
         let cars = body.assets.join("cars");
         let model: serde_json::Value = crate::files::read_json(&cars.join(&body.car).join("model.json")).unwrap_or_default();
         let read = |p: std::path::PathBuf| crate::files::read_to_string(&p);

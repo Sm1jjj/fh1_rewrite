@@ -65,7 +65,7 @@ const HEADER: &str = "kind,t_s,utc,map,car,renderer,state,x,y,z,speed_kmh,fps,fr
 rt_extract,rt_prepare_assets,rt_specialize,rt_queue,rt_prepare,rt_render,rt_total,main_wait,main_to_preupdate,main_to_update,\
 main_to_postupdate,main_to_last,main_busy,cpu_process,cpu_system,ram_process_mb,ram_system_mb,gpu_util,vram_mb,vram_total_mb,gpu_temp,\
 entities,meshes,meshes_visible,zones_loaded,zones_pending,prop_tiles,prop_pending,prop_placing,zone_loads,prop_tile_loads,\
-scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms,hitch_spans,mesh_uploads,mesh_upload_mb";
+scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms,hitch_spans,mesh_uploads,mesh_upload_mb,sw_geometries,sw_instances,sw_arena_mb,sw_candidates,sw_views";
 
 /// One (map, car, renderer) stretch of play.
 #[derive(Default)]
@@ -379,6 +379,14 @@ fn record(
                 row.text(c, n.to_string());
             }
             row.text("sched_gap_ms", super::watchdog::take_sched_gap_ms().to_string());
+            // P12 static world (FH1_STATIC_WORLD=1; zeros when off).
+            let sw = fh1_remaster::static_world::stats();
+            let (cand, views) = fh1_remaster::static_world::render_stats();
+            row.text("sw_geometries", sw.geometries.to_string());
+            row.text("sw_instances", sw.instances.to_string());
+            row.set("sw_arena_mb", (sw.vertex_bytes + sw.index_bytes) as f32 / (1024.0 * 1024.0), 1);
+            row.text("sw_candidates", cand.to_string());
+            row.text("sw_views", views.to_string());
             row.text("mesh_uploads", r.uploads_sec.0.to_string());
             row.set("mesh_upload_mb", r.uploads_sec.1 as f32 / (1024.0 * 1024.0), 1);
             r.uploads_sec = (0, 0);

@@ -1202,9 +1202,15 @@ fn cockpit_eye(cockpit: &[FxCarPart], camera: &serde_json::Value) -> Option<Vec3
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Marks a car whose cockpit model is missing (no retry every frame).
+#[derive(Component)]
+struct FxCockpitMissing;
+
+#[allow(clippy::type_complexity)]
 fn update_fx_cockpit(
     mut commands: Commands,
-    added: Query<(Entity, &FxCarBody, Option<&FxCarPaint>, Option<&FxCarPaintRgb>), Added<FxCockpitView>>,
+    added: Query<Entity, Added<FxCockpitView>>,
+    wanting: Query<(Entity, &FxCarBody, Option<&FxCarPaint>, Option<&FxCarPaintRgb>), (With<FxCockpitView>, Without<FxCockpitMissing>)>,
     mut removed: RemovedComponents<FxCockpitView>,
     viewing: Query<(), With<FxCockpitView>>,
     roots: Query<(Entity, &ChildOf), With<FxCockpitRoot>>,
@@ -1240,9 +1246,19 @@ fn update_fx_cockpit(
             set(e, false, &mut vis);
         }
     }
-    for (e, body, choice, custom) in &added {
-        set(e, true, &mut vis);
+    // A cockpit already built: switch to it now.
+    for e in &added {
         if roots.iter().any(|(_, p)| p.parent() == e) {
+            set(e, true, &mut vis);
+        }
+    }
+    for (e, body, choice, custom) in &wanting {
+        if roots.iter().any(|(_, p)| p.parent() == e) {
+            continue;
+        }
+        // Built only once its files are in RAM (files::car_ready on the IO pool; the view shows the exterior cabin until
+        // then, a few frames): no disk read on the main thread.
+        if !crate::files::car_ready(&body.assets, &body.car, &body.track, None) {
             continue;
         }
         let car_dir = body.assets.join("cars").join(&body.car);
@@ -1253,6 +1269,7 @@ fn update_fx_cockpit(
         let env_dynamic = env.as_ref().filter(|c| c.use_dynamic).map(|c| c.dynamic.clone());
         let Some(parts) = load_cockpit_parts_env(&body.assets, &body.car, track, body_paint(&car_dir, &model, choice, custom), env_dynamic, &mut lib, &mut globals, &mut shaders, &mut images) else {
             warn!("{}: no cockpit model (fx/{}_cockpit.fxcar)", body.car, body.car);
+            commands.entity(e).insert(FxCockpitMissing);
             continue;
         };
         if let Some(eye) = cockpit_eye(&parts, &read_json("physics.json")["camera"]) {
@@ -1264,6 +1281,14 @@ fn update_fx_cockpit(
             p.material.order = order as u32;
             let aabb = bevy::camera::primitives::Aabb::from_min_max(p.min, p.max);
             commands.spawn((Mesh3d(meshes.add(p.mesh)), MeshMaterial3d(materials.add(p.material)), aabb, Transform::default(), ChildOf(root)));
+        }
+        // The new root is visible (Inherited); hide the exterior cabin parts it replaces.
+        for d in children.iter_descendants(e) {
+            if cabin.contains(d) {
+                if let Ok(mut v) = vis.get_mut(d) {
+                    v.set_if_neq(Visibility::Hidden);
+                }
+            }
         }
     }
 }
@@ -1495,9 +1520,12 @@ fn model_paint(model: &serde_json::Value) -> Option<(u32, bool, u32)> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn spawn_fx_car_bodies(
     mut commands: Commands,
-    added: Query<(Entity, &FxCarBody, Option<&FxCarPaint>, Option<&FxCarPaintRgb>, Option<&FxCarKit>, Has<FxCarBodyShared>), Added<FxCarBody>>,
+    new_bodies: Query<Entity, Added<FxCarBody>>,
+    bodies: Query<(Entity, &FxCarBody, Option<&FxCarPaint>, Option<&FxCarPaintRgb>, Option<&FxCarKit>, Has<FxCarBodyShared>)>,
+    mut waiting: Local<Vec<Entity>>,
     mut cache: ResMut<FxBodyCache>,
     mut lib: ResMut<FxLibrary>,
     mut globals: ResMut<FxCarGlobals>,
@@ -1514,7 +1542,21 @@ fn spawn_fx_car_bodies(
     // Body PS (v16 #258): useStaticCubeMap false -> envSampler (live cube), true -> envStaticSampler with
     // the height ramp; psUseBackgroundMap (2D envBackgroundSampler) is off in race (docs/SHADERS.md "Reflections").
     let env_dynamic = env.as_ref().filter(|c| c.use_dynamic).map(|c| c.dynamic.clone());
-    if !added.is_empty() {
+    // New bodies wait until their car's files are in RAM (files::car_ready, IO pool): no disk read on the main thread.
+    waiting.extend(new_bodies.iter());
+    let mut ready_now = Vec::new();
+    waiting.retain(|&e| match bodies.get(e) {
+        Err(_) => false,
+        Ok((_, body, ..)) => {
+            if crate::files::car_ready(&body.assets, &body.car, &body.track, None) {
+                ready_now.push(e);
+                false
+            } else {
+                true
+            }
+        }
+    });
+    if !ready_now.is_empty() {
         globals.0.set_bool("useStaticCubeMap", env_dynamic.is_none());
         globals.0.set_bool("psUseBackgroundMap", false);
         // Mirrors (mirrorLeft/Right, cockpit_mirrorMiddle): the game's mirrorUsesCubeMap path reads the env cube, so
@@ -1527,7 +1569,7 @@ fn spawn_fx_car_bodies(
         let refl = std::env::var("FH1_CAR_REFL").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0f32);
         globals.0.set_vec("reflectionScaler", Vec4::new(refl, 0.0, 0.0, 0.0));
     }
-    for (e, body, choice, custom, kit, shared) in &added {
+    for (e, body, choice, custom, kit, shared) in ready_now.iter().filter_map(|&e| bodies.get(e).ok()) {
         // Tracks without a static car cube of their own (the test plane, imported maps) use Colorado's.
         let cubes = body.assets.join("cars/cubemaps");
         let track = if crate::files::exists(&cubes.join(format!("{}.dds", body.track))) { body.track.as_str() } else { "colorado" };
