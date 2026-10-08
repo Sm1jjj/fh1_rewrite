@@ -1,0 +1,52 @@
+<!doctype html>
+<!-- README hero: an in-game screenshot with the title overlaid. Render (1280x640):
+       msedge --headless=new --hide-scrollbars --window-size=1280,640 --screenshot=hero.png hero.html?shot=shot.png
+     The screenshot defaults to hero-shot.png next to this file. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 1280px; height: 640px; overflow: hidden; background: #000; }
+  /* Crop: ?crop=x,y,w,h in source pixels (default = the whole shot, cover). */
+  .shot { position: absolute; inset: 0; background-repeat: no-repeat; background-size: cover; background-position: center; }
+  .fade { position: absolute; inset: 0;
+    background: radial-gradient(ellipse 60% 70% at 18% 22%, rgba(10,6,24,0.62) 0%, rgba(10,6,24,0.25) 55%, rgba(10,6,24,0) 80%),
+                linear-gradient(0deg, rgba(10,6,24,0.45) 0%, rgba(10,6,24,0) 26%); }
+  .text { position: absolute; left: 56px; top: 44px; font-family: "Segoe UI", Inter, Arial, sans-serif; color: #fff; }
+  .pills { position: absolute; left: 56px; bottom: 40px; display: flex; gap: 10px; font-family: "Segoe UI", Inter, Arial, sans-serif; }
+  .title { font-size: 96px; font-weight: 900; font-style: italic; line-height: 1; letter-spacing: -1px;
+    color: #fff; text-shadow: 0 4px 18px rgba(0,0,0,0.55); white-space: nowrap; }
+  .bar { width: 360px; height: 7px; border-radius: 4px; margin: 14px 0 12px;
+    background: linear-gradient(90deg, #ff4f8b, #ff9a3c 55%, #ffd23f); }
+  .tag { font-size: 26px; font-weight: 600; color: #ffe8cf; text-shadow: 0 2px 8px rgba(0,0,0,0.7); }
+  .pill { font-size: 17px; font-weight: 700; padding: 7px 14px; border-radius: 999px; color: #1b1446;
+    background: rgba(255,255,255,0.88); }
+</style>
+</head>
+<body>
+  <div class="shot" id="shot"></div>
+  <div class="fade"></div>
+  <div class="text">
+    <div class="title">FH1 REWRITE</div>
+    <div class="bar"></div>
+    <div class="tag">Forza Horizon (2012), rebuilt in Rust + Bevy</div>
+  </div>
+  <div class="pills"><span class="pill">Open world</span><span class="pill">Races &amp; AI</span><span class="pill">Online</span><span class="pill">Your own disc</span></div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    const el = document.getElementById("shot");
+    const shot = q.get("shot") || "hero-shot.png";
+    el.style.backgroundImage = `url("${shot}")`;
+    const crop = (q.get("crop") || "").split(",").map(Number);
+    if (crop.length === 4) {
+      const img = new Image();
+      img.onload = () => {
+        const [x, y, w] = crop, k = 1280 / w;
+        el.style.backgroundSize = `${img.width * k}px ${img.height * k}px`;
+        el.style.backgroundPosition = `${-x * k}px ${-y * k}px`;
+      };
+      img.src = shot;
+    }
+  </script>
+</body>
+</html>

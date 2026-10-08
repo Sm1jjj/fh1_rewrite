@@ -4,7 +4,8 @@
 //! and starts that world like HORIZON does.
 //!
 //! `data/online.json` (next to settings.json): `{"registry": "host:7700", "favourites": ["host:7777"]}`.
-//! `FH1_REGISTRY=host:port` overrides the registry.
+//! `FH1_REGISTRY=host:port` overrides the registry; without either, the project's own list ([`DEFAULT_REGISTRY`]) is
+//! used, and the [`OFFICIAL_SERVERS`] are always listed (even when the list doesn't answer).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -53,16 +54,22 @@ pub struct OnlineScreen {
 /// Rows above the server list.
 const FIXED_ROWS: usize = 2;
 
+/// The project's public server list (server/README.md: `fh1-registry` on the official box).
+pub const DEFAULT_REGISTRY: &str = "217.154.43.130:7700";
+/// Official game servers, always shown in the browser.
+pub const OFFICIAL_SERVERS: &[&str] = &["217.154.43.130:7777"];
+
 impl OnlineScreen {
     /// `settings_path` = data/settings.json (online.json sits next to it).
     pub fn new(settings_path: &Path) -> Self {
         let path = settings_path.with_file_name("online.json");
         let file: OnlineFile = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let registry = std::env::var("FH1_REGISTRY").ok().filter(|s| !s.trim().is_empty()).or_else(|| file.registry.clone());
+        let registry = std::env::var("FH1_REGISTRY").ok().filter(|s| !s.trim().is_empty()).or_else(|| file.registry.clone())
+            .or_else(|| Some(DEFAULT_REGISTRY.to_owned()));
         let mut message = None;
         let browser = match ServerBrowser::new(registry.as_deref()) {
             Ok(mut b) => {
-                for f in &file.favourites {
+                for f in OFFICIAL_SERVERS.iter().copied().chain(file.favourites.iter().map(String::as_str)) {
                     let _ = b.add_direct(f);
                 }
                 b.refresh();

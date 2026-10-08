@@ -36,3 +36,9 @@ keys.txt
 # Local screenshots and capture output
 /screenshots/
 *.rdc
+
+# Working notes stay local (2026-10-08): research docs, session notes, plans
+/CLAUDE.md
+/MODDING_PLAN.md
+/docs/
+/assets/branding/hero-shot.png

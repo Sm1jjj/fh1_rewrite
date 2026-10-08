@@ -1,46 +1,52 @@
+<p align="center">
+  <img src="assets/branding/hero.png" alt="FH1 Rewrite: an orange supercar at the Horizon festival in Colorado" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Sm1jjj/fh1_rewrite/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/Sm1jjj/fh1_rewrite?label=download&style=for-the-badge&color=ff7a3c"></a>
+  <img alt="Windows x64" src="https://img.shields.io/badge/windows-x64-1b1446?style=for-the-badge">
+  <img alt="Rust + Bevy" src="https://img.shields.io/badge/rust-bevy%200.19-1b1446?style=for-the-badge">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-1b1446?style=for-the-badge">
+</p>
+
 # FH1 Rewrite
 
-An unofficial, clean reimplementation of **Forza Horizon** (Xbox 360, 2012) in Rust + Bevy. It is
-not affiliated with Microsoft, Turn 10 or Playground Games.
+A clean reimplementation of **Forza Horizon** (Xbox 360, 2012) in Rust and Bevy. Drive the Colorado open world with
+the original cars, physics data, music and festival, rebuilt as a new PC engine. Bring your own disc: the installer
+converts it on your machine, and nothing from the game is shipped here.
 
-**No game assets, keys or decompiled code are included.** You need your own copy of the game disc;
-the setup tool converts it locally into a git-ignored `data/` folder.
+**What works today:** the full Colorado map with streaming scenery, props, crowds and traffic; 175 cars with their
+own handling data, engine sounds and the in-game radio; races with AI drivers, wristband progression and credits;
+a garage with paint, rims, body kits and upgrades; a PBR "remaster" renderer with time of day; and online free roam
+on dedicated servers. Parity with the original is the goal and still a work in progress.
 
-## Playing (release build)
+## Play
 
-Download `FH1Rewrite-<version>-win64.zip` from the GitHub Releases page, unzip it anywhere with ~30 GB free, open
-**FH1 Rewrite.exe** and choose your Forza Horizon disc (the `.iso`, a `.zip` holding it, or the folder it is in).
-Forza Horizon is the only requirement. If you also own Forza Horizon 2 or Forza Motorsport 4 (Xbox 360), tick them and
-choose their discs to add their cars and maps; games you don't add stay locked in the menus (Forza Motorsport 3:
-coming later). Click Install, wait, then PLAY.
+1. [Download the latest release](https://github.com/Sm1jjj/fh1_rewrite/releases/latest) and unzip it anywhere with
+   about 30 GB free.
+2. Open **FH1 Rewrite.exe** and choose your Forza Horizon disc: the `.iso`, a `.zip` holding it, or the folder it's in.
+3. Click **Install**, wait (up to an hour on slower PCs), then **PLAY**.
 
-Maintainers build the release with `powershell -ExecutionPolicy Bypass -File tools\release.ps1`
-(launcher = `crates/fh1-launcher`).
+No Rust, Python or other tools needed. A gamepad is recommended; keyboard works too.
 
-## Building from source
+### Got other Forza discs?
 
-1. Rust (stable, MSVC toolchain on Windows).
-2. Your own Forza Horizon disc image (`.iso`) or an extracted disc folder.
-3. The Xbox 360 retail XEX key (32 hex digits), needed to read the shaders inside `default.xex`. It is not
-   shipped here: put it in `data/xex_key.txt` or set `FH1_XEX_KEY`.
+Forza Horizon is the only requirement. If you also own these Xbox 360 games, tick them in the installer to add
+their content to the same game. Anything you don't own stays locked in the menus.
 
-```
-cargo run --release -p fh1setup -- "path/to/Forza Horizon.iso"   # or an extracted disc folder
-cargo run --release -p fh1-engine
-```
+| Game | Adds |
+|---|---|
+| Forza Horizon 2 | 216 cars and the Southern Europe open world |
+| Forza Motorsport 4 | 501 cars and 83 circuit layouts (a MOTORSPORT mode with grid, pit and flying starts) |
+| Forza Motorsport 3 | coming later |
 
-`fh1setup` writes `data/installations/<id>/assets/private/`, with one pipeline hash per asset group, so later
-updates re-convert only what changed (`--force`, `--only <group>,...`).
+## Online
 
-### Optional imports (off by default)
+Pick **ONLINE** in the main menu. The official server and every public community server are listed with their map,
+player count and ping, or use **Direct connect** with `host:port`. A server holds up to 24 players on one map.
 
-If you also own Forza Horizon 2 or Forza Motorsport 4 (Xbox 360), their cars and maps can be imported into the
-same install. These importers are behind cargo features:
-
-```
-cargo run --release -p fh1setup --features fh2 -- import-fh2 "path/to/FH2.iso"
-cargo run --release -p fh1setup --features fm4 -- import-fm4 "path/to/FM4 Play Disc.iso" --content "path/to/FM4 Content Install Disc.iso"
-```
+Want to host? The server needs no game files and no GPU: see [`server/README.md`](server/README.md) (Ubuntu or
+Windows, systemd units included).
 
 ## Controls
 
@@ -54,27 +60,63 @@ cargo run --release -p fh1setup --features fm4 -- import-fm4 "path/to/FM4 Play D
 | Rewind (hold) | X | Back |
 | Reset car | R | Y |
 | Camera | C | RB |
+| Photo mode | F | |
 | Radio station | , / . | D-pad left / right |
 | Pause | Esc | Start |
 
-## Layout
+## How it works
+
+FH1 Rewrite is a new engine, not an emulator. The setup tool reads the game's own archives, models, textures,
+database and audio from your disc and converts them into formats a modern engine can stream. Gameplay is then
+rebuilt system by system from reverse-engineering research: the tyre model, drivetrain, brakes and steering are
+checked against the original game running in a static recompilation, and the menus and HUD follow the original
+layouts.
 
 | Crate | Purpose |
 |---|---|
-| `fh1-formats` | Parsers: Forza zips (XMemCompress LZX, headerless world archive), `.xds`/`.bix` textures, `.carbin` models, `.rmb.bin` scenery, PVS zones |
-| `fh1setup` | Disc → converted assets (glTF, DDS, JSON) with per-group hashing |
+| `fh1-formats` | Parsers: Forza zips (XMemCompress LZX), Xbox 360 textures, `.carbin` car models, scenery, PVS zones |
+| `fh1setup` | Your disc → converted assets, per asset group, so updates only re-convert what changed |
+| `fh1-launcher` | The installer and launcher (`FH1 Rewrite.exe`) |
 | `fh1-engine` | The game: vehicle simulation, cameras, world streaming, races, AI, traffic, HUD and menus |
+| `fh1-remaster` | The default PBR renderer |
+| `fh1-shaders` / `fh1-render` | Xenos shader microcode → WGSL, and the "original shaders" renderer |
 | `fh1-world` | Track collision and surfaces |
-| `fh1-shaders` / `fh1-render` | Xenos shader microcode → WGSL, and the renderer that runs the game's own shaders |
-| `fh1-remaster` | The default PBR "remaster" renderer |
-| `fh1-audio` / `fh1-radio` | Engine audio from the game's FMOD banks; the in-game radio |
-| `fh1-ui` | Game UI data (string tables, fonts, HUD scenes) |
-| `fh1-net` | Multiplayer protocol and server |
+| `fh1-audio` / `fh1-radio` | Engine sound from the game's FMOD banks, and the radio |
+| `fh1-ui` | UI data: string tables, fonts, HUD scenes |
+| `fh1-net` | Multiplayer protocol, game server and server list |
 
-Research notes are in `docs/`. Vendored crates keep their own licenses: `vendor/lzxd` (patched for XMemCompress
-streams, see `vendor/lzxd/FH1_PATCHES.md`) and `vendor/bevy_solarik`.
+## Build from source
+
+Requires Windows, Rust (stable, MSVC toolchain) and your own Forza Horizon disc.
+
+```
+cargo run --release -p fh1setup -- "path/to/Forza Horizon.iso"     # or an extracted disc folder
+cargo run --release -p fh1-engine
+```
+
+The Xbox 360 retail XEX key is needed to read the shaders inside `default.xex`. Source builds look for it in
+`data/xex_key.txt` or `FH1_XEX_KEY`; it is not part of this repository. Optional importers:
+
+```
+cargo run --release -p fh1setup --features fh2 -- import-fh2 "path/to/FH2.iso"
+cargo run --release -p fh1setup --features fm4 -- import-fm4 "path/to/FM4 Play Disc.iso" --content "path/to/FM4 Content Install Disc.iso"
+```
+
+`tools\release.ps1` builds the Windows release zip. Vendored crates keep their own licenses: `vendor/lzxd` (patched for
+XMemCompress streams), `vendor/bevy_pbr` (shadow cascade caching) and `vendor/bevy_solarik`.
+
+## AI usage
+
+This project was built with AI coding tools, working from the game's own data files and from reverse-engineering
+research against the original game. Every format, number and behaviour is checked against the real disc or the
+original running game before it is called verified. AI did the typing; the goal is still to understand how Forza
+Horizon actually works, and parity is measured rather than assumed.
 
 ## License
 
-The code in this repository is dual-licensed under MIT or Apache-2.0, at your option. Forza Horizon and all game
-content belong to their owners; this project contains none of it.
+The code in this repository is dual-licensed under MIT or Apache-2.0, at your option. Vendored third-party code keeps
+its own licenses.
+
+This is an unofficial fan project, not affiliated with or endorsed by Microsoft, Xbox Game Studios, Turn 10 Studios
+or Playground Games. Forza Horizon and all game content, names and trademarks belong to their owners. This repository
+contains no game assets, keys or decompiled code; you need your own copy of the game.

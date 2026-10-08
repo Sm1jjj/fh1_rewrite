@@ -23,20 +23,25 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, RichText};
+
+mod style;
 use serde::{Deserialize, Serialize};
 
 /// No console window for the child processes.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// Bump with every release whose setup output changes, so existing installs are offered an update.
-const RELEASE: &str = env!("CARGO_PKG_VERSION");
-const ACCENT: Color32 = Color32::from_rgb(255, 120, 30);
+/// The converted-data revision: bump ONLY when a release's setup output changes (a new fh1setup group version), so
+/// existing installs are offered an update. Game-only releases keep it, so nobody re-converts their disc for nothing.
+const RELEASE: &str = "0.1.0";
+/// Shown in the title bar.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const ACCENT: Color32 = style::MAGENTA;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FH1 Rewrite")
-            .with_inner_size([760.0, 600.0])
-            .with_min_inner_size([620.0, 480.0]),
+            .with_inner_size([1100.0, 640.0])
+            .with_min_inner_size([860.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native("FH1 Rewrite", options, Box::new(|cc| Ok(Box::new(Launcher::new(&cc.egui_ctx)))))
@@ -120,12 +125,16 @@ struct Launcher {
     game_running: bool,
     game_rx: Option<Receiver<Msg>>,
     status: Option<String>,
+    /// FH1's loading backdrop from the converted data (None before install: painted gradient).
+    backdrop: Option<egui::TextureHandle>,
+    backdrop_pending: bool,
 }
 
 impl Launcher {
     fn new(ctx: &egui::Context) -> Self {
-        ctx.set_visuals(egui::Visuals::dark());
+        style::install(ctx);
         let paths = Paths::find();
+        let backdrop = paths.private().and_then(|p| style::load_backdrop(ctx, &p));
         let saved: Saved =
             std::fs::read(paths.data.join("launcher.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let screen = if paths.private().is_some() { Screen::Home } else { Screen::Setup };
@@ -146,6 +155,8 @@ impl Launcher {
             game_running: false,
             game_rx: None,
             status: None,
+            backdrop,
+            backdrop_pending: false,
         }
     }
 
@@ -302,6 +313,9 @@ impl Launcher {
                     self.save();
                     self.screen = Screen::Home;
                     self.status = Some("Install complete.".into());
+                    if self.backdrop.is_none() {
+                        self.backdrop_pending = true;
+                    }
                 }
                 Some(Err(e)) => {
                     self.rx = None;
@@ -320,35 +334,34 @@ impl Launcher {
     }
 
     fn ui_setup(&mut self, ui: &mut egui::Ui) {
-        ui.label("FH1 Rewrite converts your own game discs into its own files. Nothing is downloaded and no game files are included.");
-        ui.add_space(12.0);
-
-        section(ui, "Forza Horizon (required)");
-        ui.label("Your Forza Horizon (Xbox 360) disc image: the .iso, a .zip holding it, or the folder it is in.");
-        path_row(ui, "fh1", &mut self.saved.fh1);
-        ui.add_space(14.0);
-
-        section(ui, "Do you also own these games? (optional)");
-        ui.label(RichText::new("Content from games you don't add stays locked in the game's menus.").weak());
-        ui.add_space(4.0);
-        ui.checkbox(&mut self.saved.own_fh2, "Forza Horizon 2 (Xbox 360): its cars and the Southern Europe map");
-        if self.saved.own_fh2 {
-            ui.indent("fh2", |ui| path_row(ui, "fh2", &mut self.saved.fh2));
-        }
-        ui.checkbox(&mut self.saved.own_fm4, "Forza Motorsport 4: its cars and circuits (MOTORSPORT mode)");
-        if self.saved.own_fm4 {
-            ui.indent("fm4", |ui| {
-                ui.label("Play Disc (Disc 1):");
-                path_row(ui, "fm4a", &mut self.saved.fm4_play);
-                ui.label("Content Install Disc (Disc 2, optional: adds the car-pack cars):");
-                path_row(ui, "fm4b", &mut self.saved.fm4_content);
-            });
-        }
-        let mut no = false;
-        ui.add_enabled(false, egui::Checkbox::new(&mut no, "Forza Motorsport 3 (coming soon)"));
-        ui.add_space(14.0);
-
-        ui.checkbox(&mut self.delete_work, "Delete the extracted disc files afterwards (saves space; your disc images are never touched)");
+        style::panel(ui, |ui| {
+            style::header(ui, "Forza Horizon  ·  required");
+            ui.label(RichText::new("Your Xbox 360 disc image: the .iso, a .zip holding it, or the folder it's in.").color(style::DIM));
+            path_row(ui, "fh1", &mut self.saved.fh1);
+        });
+        ui.add_space(10.0);
+        style::panel(ui, |ui| {
+            style::header(ui, "Got other Forza discs?  ·  optional");
+            ui.label(RichText::new("Games you don't add stay locked in the menus.").color(style::DIM));
+            ui.add_space(2.0);
+            ui.checkbox(&mut self.saved.own_fh2, RichText::new("FORZA HORIZON 2  ·  216 cars + the Southern Europe open world").strong());
+            if self.saved.own_fh2 {
+                ui.indent("fh2", |ui| path_row(ui, "fh2", &mut self.saved.fh2));
+            }
+            ui.checkbox(&mut self.saved.own_fm4, RichText::new("FORZA MOTORSPORT 4  ·  501 cars + 83 circuits (MOTORSPORT mode)").strong());
+            if self.saved.own_fm4 {
+                ui.indent("fm4", |ui| {
+                    ui.label(RichText::new("Play Disc (Disc 1)").color(style::DIM));
+                    path_row(ui, "fm4a", &mut self.saved.fm4_play);
+                    ui.label(RichText::new("Content Install Disc (Disc 2, optional: the car-pack cars)").color(style::DIM));
+                    path_row(ui, "fm4b", &mut self.saved.fm4_content);
+                });
+            }
+            let mut no = false;
+            ui.add_enabled(false, egui::Checkbox::new(&mut no, RichText::new("FORZA MOTORSPORT 3  ·  coming soon").strong()));
+        });
+        ui.add_space(10.0);
+        ui.checkbox(&mut self.delete_work, "Delete the extracted disc files afterwards (your disc images are never touched)");
         let mut gb = 12 + 15;
         if self.saved.release == RELEASE && self.paths.private().is_some() {
             gb = 0;
@@ -359,22 +372,21 @@ impl Launcher {
         if self.saved.own_fm4 {
             gb += 42 + 15;
         }
-        ui.label(RichText::new(format!("Needs about {gb} GB free next to this program while installing. It takes a while: up to an hour on slower PCs.")).weak());
-        ui.add_space(10.0);
+        ui.label(RichText::new(format!("Needs about {gb} GB free next to this program while installing; up to an hour on slower PCs.")).color(style::DIM));
+        ui.add_space(12.0);
 
         let missing = self.missing();
         ui.horizontal(|ui| {
-            let go = ui.add_enabled(missing.is_none(), egui::Button::new(RichText::new("  Install  ").size(18.0).strong()).fill(ACCENT));
-            if go.clicked() {
+            if style::menu_item(ui, "Install", 34.0, missing.is_none(), true).clicked() {
                 self.start_install(ui.ctx());
             }
-            if self.paths.private().is_some() && ui.button("Back").clicked() {
+            if self.paths.private().is_some() && style::menu_item(ui, "Back", 26.0, true, false).clicked() {
                 self.screen = Screen::Home;
             }
-            if let Some(m) = missing {
-                ui.label(RichText::new(m).color(Color32::LIGHT_RED));
-            }
         });
+        if let Some(m) = missing {
+            ui.label(RichText::new(m).color(style::BAD));
+        }
     }
 
     /// Why Install is disabled, if it is.
@@ -402,84 +414,93 @@ impl Launcher {
 
     fn ui_installing(&mut self, ui: &mut egui::Ui) {
         let running = self.rx.is_some();
-        for (i, title) in self.steps.iter().enumerate() {
-            let (mark, color) = if i < self.step || (!running && self.error.is_none() && !self.steps.is_empty()) {
-                ("✔", Color32::LIGHT_GREEN)
-            } else if i == self.step {
-                if self.error.is_some() { ("✖", Color32::LIGHT_RED) } else { ("▶", ACCENT) }
-            } else {
-                ("•", Color32::GRAY)
-            };
-            ui.label(RichText::new(format!("{mark}  {title}")).color(color).size(16.0));
-        }
-        ui.add_space(8.0);
-        if running {
-            let text = if self.progress_text.is_empty() { "working...".to_owned() } else { self.progress_text.clone() };
-            ui.add(egui::ProgressBar::new(self.progress).text(text).animate(true));
-        }
-        if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(Color32::LIGHT_RED).strong());
-            if let Some(last) = self.log.iter().rev().find(|l| l.to_ascii_lowercase().contains("error")) {
-                ui.label(RichText::new(last).color(Color32::LIGHT_RED));
+        style::panel(ui, |ui| {
+            style::header(ui, if running { "Installing" } else if self.error.is_some() { "Install stopped" } else { "Installed" });
+            ui.add_space(4.0);
+            for (i, title) in self.steps.iter().enumerate() {
+                let (mark, color) = if i < self.step || (!running && self.error.is_none() && !self.steps.is_empty()) {
+                    ("✔", style::OK)
+                } else if i == self.step {
+                    if self.error.is_some() { ("✖", style::BAD) } else { ("▶", ACCENT) }
+                } else {
+                    ("•", style::DIM)
+                };
+                ui.label(RichText::new(format!("{mark}  {}", title.to_uppercase())).font(style::heavy(17.0)).color(color));
             }
-        }
+            ui.add_space(8.0);
+            if running {
+                let text = if self.progress_text.is_empty() { "working...".to_owned() } else { self.progress_text.clone() };
+                style::progress(ui, self.progress, &text);
+            }
+            if let Some(e) = &self.error {
+                ui.label(RichText::new(e).color(style::BAD).strong());
+                if let Some(last) = self.log.iter().rev().find(|l| l.to_ascii_lowercase().contains("error")) {
+                    ui.label(RichText::new(last).color(style::BAD));
+                }
+            }
+        });
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             if running {
-                if ui.button("Cancel").clicked() {
+                if style::menu_item(ui, "Cancel", 24.0, true, false).clicked() {
                     *self.cancelled.lock().unwrap() = true;
                     if let Some(c) = self.child.lock().unwrap().as_mut() {
                         let _ = c.kill();
                     }
                 }
-            } else if ui.button("Back").clicked() {
+            } else if style::menu_item(ui, "Back", 24.0, true, false).clicked() {
                 self.screen = Screen::Setup;
             }
         });
-        ui.add_space(6.0);
-        ui.label(RichText::new("Details").weak());
-        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            for l in &self.log {
-                ui.label(RichText::new(l).monospace().size(11.0));
-            }
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(RichText::new("Details").color(style::DIM)).default_open(false).show(ui, |ui| {
+            egui::Frame::new().fill(style::PANEL).inner_margin(8).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
+                    for l in &self.log {
+                        ui.label(RichText::new(l).monospace().size(11.0).color(style::DIM));
+                    }
+                });
+            });
         });
     }
 
     fn ui_home(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(30.0);
-        ui.vertical_centered(|ui| {
-            let play = ui.add_enabled(
-                !self.game_running,
-                egui::Button::new(RichText::new(if self.game_running { "  Running...  " } else { "  PLAY  " }).size(30.0).strong())
-                    .fill(ACCENT)
-                    .min_size(egui::vec2(260.0, 64.0)),
-            );
-            if play.clicked() {
-                self.play(ui.ctx());
-            }
-        });
-        ui.add_space(24.0);
-        section(ui, "Installed games");
-        let fh1 = self.paths.private().is_some();
-        for (name, ok, note) in [
-            ("Forza Horizon", fh1, ""),
-            ("Forza Horizon 2", self.paths.imported("fh2"), "locked in the menus"),
-            ("Forza Motorsport 4", self.paths.imported("fm4"), "locked in the menus"),
-            ("Forza Motorsport 3", false, "coming soon"),
-        ] {
-            let (mark, color) = if ok { ("✔", Color32::LIGHT_GREEN) } else { ("—", Color32::GRAY) };
-            let text = if ok || note.is_empty() { format!("{mark}  {name}") } else { format!("{mark}  {name}  ({note})") };
-            ui.label(RichText::new(text).color(color).size(15.0));
+        let play_text = if self.game_running { "Running..." } else { "Play" };
+        if style::menu_item(ui, play_text, 52.0, !self.game_running, !self.game_running).clicked() {
+            self.play(ui.ctx());
         }
-        ui.add_space(12.0);
+        ui.add_space(4.0);
+        if style::menu_item(ui, "Add games / update", 30.0, true, false).clicked() {
+            self.screen = Screen::Setup;
+        }
+        if style::menu_item(ui, "Data folder", 30.0, true, false).clicked() {
+            let _ = Command::new("explorer").arg(&self.paths.data).spawn();
+        }
+        if style::menu_item(ui, "Quit", 30.0, true, false).clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ui.add_space(18.0);
         if !self.saved.release.is_empty() && self.saved.release != RELEASE {
-            ui.label(RichText::new("This version converts some files differently: run Update before playing.").color(ACCENT));
+            ui.label(RichText::new("This version converts some files differently: choose ADD GAMES / UPDATE before playing.").color(style::ORANGE));
         }
-        ui.horizontal(|ui| {
-            if ui.button("Add games / update").clicked() {
-                self.screen = Screen::Setup;
-            }
-            if ui.button("Open data folder").clicked() {
-                let _ = Command::new("explorer").arg(&self.paths.data).spawn();
+    }
+}
+
+impl Launcher {
+    /// Installed games card (bottom right of the home screen).
+    fn games_card(&self, ui: &mut egui::Ui) {
+        style::panel(ui, |ui| {
+            style::header(ui, "Your games");
+            let fh1 = self.paths.private().is_some();
+            for (name, ok, note) in [
+                ("Forza Horizon", fh1, ""),
+                ("Forza Horizon 2", self.paths.imported("fh2"), "locked"),
+                ("Forza Motorsport 4", self.paths.imported("fm4"), "locked"),
+                ("Forza Motorsport 3", false, "coming soon"),
+            ] {
+                let (mark, color) = if ok { ("✔", style::OK) } else { ("—", style::DIM) };
+                let text = if ok || note.is_empty() { format!("{mark}  {name}") } else { format!("{mark}  {name}  ·  {note}") };
+                ui.label(RichText::new(text).color(color));
             }
         });
     }
@@ -488,14 +509,33 @@ impl Launcher {
 impl eframe::App for Launcher {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("FH1 Rewrite").size(26.0).strong().color(ACCENT));
-                ui.label(RichText::new(format!("v{RELEASE}  ·  unofficial; not affiliated with Microsoft, Turn 10 or Playground Games")).weak());
-            });
-            ui.separator();
+        if self.backdrop_pending {
+            self.backdrop_pending = false;
+            self.backdrop = self.paths.private().and_then(|p| style::load_backdrop(ui.ctx(), &p));
+        }
+        let full = ui.max_rect();
+        style::paint_backdrop(ui.painter(), full, self.backdrop.as_ref());
+        // Version + disclaimer, bottom right.
+        ui.painter().text(
+            full.right_bottom() + egui::vec2(-16.0, -12.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("v{VERSION}  ·  unofficial, not affiliated with Microsoft, Turn 10 or Playground Games"),
+            style::body(12.0),
+            Color32::from_white_alpha(150),
+        );
+        let home = self.screen == Screen::Home;
+        if home {
+            egui::Area::new(egui::Id::new("games")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -36.0)).show(ui.ctx(), |ui| self.games_card(ui));
+        }
+        let column = egui::Rect::from_min_size(
+            full.min + egui::vec2(48.0, 32.0),
+            egui::vec2((full.width() * 0.55).clamp(520.0, 680.0), full.height() - 64.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(column), |ui| {
+            style::logo(ui, if home { 1.0 } else { 0.62 });
+            ui.add_space(if home { 26.0 } else { 12.0 });
             if let Some(s) = &self.status {
-                ui.label(RichText::new(s).color(Color32::LIGHT_YELLOW));
+                ui.label(RichText::new(s).color(Color32::from_rgb(255, 226, 140)));
             }
             egui::ScrollArea::vertical().id_salt("page").auto_shrink([false, false]).show(ui, |ui| match self.screen {
                 Screen::Setup => self.ui_setup(ui),
@@ -504,10 +544,6 @@ impl eframe::App for Launcher {
             });
         });
     }
-}
-
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.label(RichText::new(title).size(17.0).strong());
 }
 
 /// A path box with "ISO / ZIP..." and "Folder..." pickers.
