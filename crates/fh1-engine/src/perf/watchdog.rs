@@ -364,8 +364,10 @@ pub(crate) fn take_frame_spans(top: usize) -> Vec<(String, f64)> {
 }
 
 /// LogPlugin `custom_layer`: the system-span tracker above.
+/// Only with the perf recorder on (FH1_PERF_REC=1) or FH1_SPANS=1: the layer sees every system enter/exit on every thread.
 pub fn system_span_layer(_app: &mut App) -> Option<bevy::log::BoxedLayer> {
-    Some(Box::new(spans::SystemSpans))
+    let on = super::record::on() || std::env::var("FH1_SPANS").is_ok_and(|v| v == "1");
+    on.then(|| Box::new(spans::SystemSpans) as bevy::log::BoxedLayer)
 }
 
 /// Systems inside their span for over 0.5 s at `now` (empty without the bevy `trace` feature).

@@ -229,10 +229,11 @@ fn sleep_on() -> bool {
 }
 
 /// Lean faces (P8-B, log 20261008_140912: the every-frame face cost ~4 ms, transparent pass +1.0 ms, opaque +0.5, queue
-/// 1.1): with the even cadence the cube sees only the big opaque world. FH1_RM_PROBE_LEAN=0 = the old face content.
+/// 1.1): the cube sees only the big opaque world (either cadence). FH1_RM_PROBE_LEAN=0 = the old face content.
 pub fn lean_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| even_on() && std::env::var("FH1_RM_PROBE_LEAN").map_or(true, |v| v != "0"))
+    // Independent of the cadence (the even cadence is opt-in since d24cb7a; the bursts carry the lean content too).
+    *V.get_or_init(|| std::env::var("FH1_RM_PROBE_LEAN").map_or(true, |v| v != "0"))
 }
 
 /// Layers for an entity the lean faces skip (transparent scenery, blended game-shader parts, small props): the main
