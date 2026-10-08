@@ -1,0 +1,12 @@
+[package]
+name = "fh1-ui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "FH1 UI data: Anark scenes, string tables, vector fonts (owned by the UI session)"
+
+[dependencies]
+fh1-formats = { path = "../fh1-formats" }
+thiserror = "2"
+png = "0.18"

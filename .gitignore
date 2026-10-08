@@ -1,0 +1,38 @@
+# Game data — never commit (see CLAUDE.md rules)
+/disc/
+/assets/private/
+/data/
+*.iso
+*.7z
+/Forza Horizon*/
+# Tools downloaded at runtime
+/tools/extract-xiso/
+/tools/xiso.zip
+/tools/*.log
+/tools/disc_listing.txt
+# Build output
+/target/
+/target-*/
+# Ghidra install, project and decompiler output (never commit decompiled code)
+/tools/ghidra_*/
+/tools/ghidra-projects/
+/tools/*.zip
+/re/out/
+# Xenia emulator (binary, source clone, config, cache, dumps)
+/tools/xenia/
+/tools/xenia-canary-src/
+# Python bytecode
+__pycache__/
+
+# Other games and third-party mods (user-supplied input for the import mods; never committed)
+/mods/
+dist/
+
+# Disc images / extracted game folders of any Forza title, and keys (never committed)
+/Forza*/
+*.xex
+xex_key.txt
+keys.txt
+# Local screenshots and capture output
+/screenshots/
+*.rdc

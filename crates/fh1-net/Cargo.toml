@@ -1,0 +1,14 @@
+[package]
+name = "fh1-net"
+version = "0.2.0"
+# Explicit (not `.workspace = true`) so the crate also builds on its own, copied to a Linux server (server/server.sh pack).
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "FH1 multiplayer: protocol v2, the per-map relay server, the server list and the browser client"
+
+[[bin]]
+name = "fh1-server"
+path = "src/bin/server.rs"
+
+[dependencies]

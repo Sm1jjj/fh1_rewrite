@@ -1,0 +1,33 @@
+# fh1-server config: one file per game server (one map each). Copy to server.cfg (or colorado.cfg, ...) and edit.
+# Run:  ./server.sh run server.cfg   (Linux)      server.bat --config server\server.cfg   (Windows)
+# Lines are `key = value`; # starts a comment. Command-line flags override these.
+
+# UDP address and port players connect to. Open this port (UDP) in the firewall / router.
+bind = 0.0.0.0:7777
+
+# Shown in the in-game browser (48 bytes max).
+name = FH1 Colorado
+
+# The map every player on this server drives. Players on another map are told to switch.
+# colorado = FH1's open world; imported maps use their id (e.g. fh2/anthem).
+map = colorado
+
+# 1..32 (24 recommended: ~37 KB/s down per player when everyone is close, ~0.9 MB/s up for the server).
+max_players = 24
+
+# Optional. Empty = open server. Players set it in the browser's password prompt (or FH1_SERVER_PASSWORD).
+password =
+
+# Shown when a player joins (64 bytes max).
+motd = Welcome to the festival!
+
+# Slots one IP address may hold (two players behind the same router).
+per_ip = 2
+
+# Banned addresses (one per line; the console's `ban <id>` lasts until restart).
+# ban = 203.0.113.7
+
+# The server list the in-game browser reads (fh1-server --registry). Leave empty to be direct-connect only.
+registry = 127.0.0.1:7700
+# true = list this server there.
+public = true

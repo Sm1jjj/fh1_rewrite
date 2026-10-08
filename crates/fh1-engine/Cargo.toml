@@ -1,0 +1,46 @@
+[package]
+name = "fh1-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Forza Horizon reimplementation: Bevy game"
+
+[[bin]]
+name = "fh1-engine"
+path = "src/main.rs"
+
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+
+[[bin]]
+name = "drive_probe"
+path = "src/bin/drive_probe.rs"
+
+[dependencies]
+libloading = "0.8"
+sysinfo = "0.38"
+fh1-world = { path = "../fh1-world" }
+fh1-formats = { path = "../fh1-formats" }
+fh1-audio = { path = "../fh1-audio" }
+fh1-radio = { path = "../fh1-radio" }
+fh1-net = { path = "../fh1-net" }
+fh1-render = { path = "../fh1-render" }
+fh1-remaster = { path = "../fh1-remaster" }
+fh1-ui = { path = "../fh1-ui" }
+# `trace`: every system run is a tracing span; the stall watchdog (src/perf/watchdog.rs) uses it to name a blocking system.
+bevy = { version = "0.19.1", features = ["trace", "debug"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# Stall watchdog: main-thread stack capture (src/perf/stack.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
+
+[features]
+# Remaster RTX mode (bevy_solarik + DLSS-RR), compiled into the main build; chosen at runtime by Options > Renderer
+# (FH1_RTX=1). Building it needs the DLSS SDK, Vulkan headers and libclang (tools/cargo-locked.ps1 sets the paths).
+default = ["rtx"]
+rtx = ["fh1-remaster/rtx"]

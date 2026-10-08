@@ -1,0 +1,91 @@
+mod binder;
+mod blas;
+mod extract;
+mod light_sampling;
+mod types;
+
+use bevy_shader::load_shader_library;
+pub use binder::{RaytracingSceneBindings, SolarikAlphaTesting, SolarikSkyLight};
+pub use types::RaytracingMesh3d;
+
+use crate::SolarikPlugins;
+use bevy_app::{App, Plugin};
+use bevy_ecs::schedule::IntoScheduleConfigs;
+use bevy_render::{
+    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
+    extract_resource::ExtractResourcePlugin,
+    mesh::{
+        RenderMesh,
+        allocator::{MeshAllocatorSettings, allocate_and_free_meshes},
+    },
+    render_asset::prepare_assets,
+    render_resource::BufferUsages,
+    renderer::RenderDevice,
+};
+use binder::prepare_raytracing_scene_bindings;
+use blas::{BlasManager, compact_raytracing_blas, prepare_raytracing_blas};
+use extract::{StandardMaterialAssets, extract_raytracing_scene};
+use tracing::warn;
+
+/// Creates acceleration structures and binding arrays of resources for raytracing.
+pub struct RaytracingScenePlugin;
+
+impl Plugin for RaytracingScenePlugin {
+    fn build(&self, app: &mut App) {
+        load_shader_library!(app, "brdf.wgsl");
+        load_shader_library!(app, "raytracing_scene_bindings.wgsl");
+        load_shader_library!(app, "sampling.wgsl");
+
+        // The sky is optional; the resource exists so the binder can read it
+        // (no image = no sky, upstream behaviour).
+        app.init_resource::<SolarikSkyLight>();
+        app.init_resource::<SolarikAlphaTesting>();
+    }
+
+    fn finish(&self, app: &mut App) {
+        let render_app = app.sub_app_mut(RenderApp);
+        let render_device = render_app.world().resource::<RenderDevice>();
+        let features = render_device.features();
+        if !features.contains(SolarikPlugins::required_wgpu_features()) {
+            warn!(
+                "RaytracingScenePlugin not loaded. GPU lacks support for required features: {:?}.",
+                SolarikPlugins::required_wgpu_features().difference(features)
+            );
+            return;
+        }
+
+        app.add_plugins((
+            ExtractResourcePlugin::<StandardMaterialAssets>::default(),
+            ExtractResourcePlugin::<SolarikSkyLight>::default(),
+            ExtractResourcePlugin::<SolarikAlphaTesting>::default(),
+        ));
+
+        let render_app = app.sub_app_mut(RenderApp);
+
+        render_app
+            .world_mut()
+            .resource_mut::<MeshAllocatorSettings>()
+            .extra_buffer_usages |= BufferUsages::BLAS_INPUT | BufferUsages::STORAGE;
+        render_app.init_resource::<SolarikSkyLight>();
+        render_app.init_resource::<SolarikAlphaTesting>();
+
+        render_app
+            .init_gpu_resource::<BlasManager>()
+            .init_gpu_resource::<StandardMaterialAssets>()
+            .insert_resource(RaytracingSceneBindings::new())
+            .add_systems(ExtractSchedule, extract_raytracing_scene)
+            .add_systems(
+                Render,
+                (
+                    prepare_raytracing_blas
+                        .in_set(RenderSystems::PrepareAssets)
+                        .before(prepare_assets::<RenderMesh>)
+                        .after(allocate_and_free_meshes),
+                    compact_raytracing_blas
+                        .in_set(RenderSystems::PrepareAssets)
+                        .after(prepare_raytracing_blas),
+                    prepare_raytracing_scene_bindings.in_set(RenderSystems::PrepareBindGroups),
+                ),
+            );
+    }
+}

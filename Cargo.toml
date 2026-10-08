@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/fh1-formats", "crates/fh1setup", "crates/fh1-engine", "crates/fh1-world", "crates/fh1-audio", "crates/fh1-radio", "crates/fh1-net", "crates/fh1-shaders", "crates/fh1-render", "crates/fh1-ui", "crates/fh1-remaster"]
+exclude = ["vendor/bevy_solarik"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Vendored lzxd with fixes for XMemCompress streams (see vendor/lzxd/FH1_PATCHES.md).
+[patch.crates-io]
+lzxd = { path = "vendor/lzxd" }
+
+# Bevy is slow unoptimised; optimise dependencies even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

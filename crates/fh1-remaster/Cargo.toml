@@ -1,0 +1,19 @@
+[package]
+name = "fh1-remaster"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Remaster renderer: FH1 data drawn with modern uber-shaders (see docs/REMASTER.md)"
+
+[dependencies]
+bevy = "0.19.1"
+fh1-render = { path = "../fh1-render" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# RTX mode (docs/REMASTER.md "RTX"): bevy_solari fork with sky light, alpha testing, point/spot lights, DLSS-RR
+# (MIT/Apache, github.com/AlrikOlson/bevy_solarik v0.1.0, vendored; FH1_PATCHES.md). Only in `--features rtx` builds.
+bevy_solarik = { path = "../../vendor/bevy_solarik", features = ["dlss"], optional = true }
+
+[features]
+rtx = ["dep:bevy_solarik", "bevy/dlss"]

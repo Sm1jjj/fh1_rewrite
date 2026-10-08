@@ -1,0 +1,24 @@
+# systemd unit for the fh1 server list (the in-game browser's source).
+#
+#   sudo cp server/fh1-registry.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fh1-registry
+#
+# Open UDP 7700 in the firewall. Game servers point at it with `registry = <this host>:7700` in their config.
+[Unit]
+Description=FH1 multiplayer server list
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=fh1
+ExecStart=/opt/fh1-server/fh1-net/target/release/fh1-server --registry --bind 0.0.0.0:7700
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StandardInput=null
+
+[Install]
+WantedBy=multi-user.target

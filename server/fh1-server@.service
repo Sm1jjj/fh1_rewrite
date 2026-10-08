@@ -1,0 +1,28 @@
+# systemd unit for fh1 game servers: one instance per config file.
+#
+#   sudo cp server/fh1-server@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fh1-server@colorado     # runs with /opt/fh1-server/colorado.cfg
+#   journalctl -u fh1-server@colorado -f                 # joins / leaves / timeouts
+#
+# Paths = the unpacked pack in /opt/fh1-server (server.sh pack); adjust User / paths to taste.
+[Unit]
+Description=FH1 multiplayer server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=fh1
+WorkingDirectory=/opt/fh1-server
+ExecStart=/opt/fh1-server/fh1-net/target/release/fh1-server --config /opt/fh1-server/%i.cfg
+Restart=on-failure
+RestartSec=3
+# No game files, no GPU: lock it down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StandardInput=null
+
+[Install]
+WantedBy=multi-user.target

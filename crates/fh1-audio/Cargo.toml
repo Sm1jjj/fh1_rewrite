@@ -1,0 +1,21 @@
+[package]
+name = "fh1-audio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Forza Horizon (Xbox 360) audio: FSB4 banks, engine/tyre tuning XML, and a real-time car sound synth"
+
+[dependencies]
+fh1-formats = { path = "../fh1-formats" }
+anyhow = "1"
+quick-xml = "0.42"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Same version Bevy's audio already pulls in, so it adds nothing new to the build.
+cpal = { version = "0.17", optional = true }
+
+[features]
+default = ["output"]
+# Live playback through the default audio device (the synth itself is device-independent).
+output = ["dep:cpal"]

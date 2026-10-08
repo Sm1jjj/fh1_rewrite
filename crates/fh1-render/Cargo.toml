@@ -1,0 +1,15 @@
+[package]
+name = "fh1-render"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Forza Horizon shading and lighting for the Bevy engine"
+
+[dependencies]
+fh1-shaders = { path = "../fh1-shaders" }
+bevy = "0.19.1"
+serde_json = "1"
+
+[dev-dependencies]
+fh1-formats = { path = "../fh1-formats" }

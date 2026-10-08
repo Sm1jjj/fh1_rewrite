@@ -1,0 +1,29 @@
+[package]
+name = "fh1setup"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Converts the user's own Forza Horizon disc into assets for fh1-engine"
+
+[dependencies]
+fh1-world = { path = "../fh1-world" }
+fh1-audio = { path = "../fh1-audio", default-features = false }
+fh1-formats = { path = "../fh1-formats" }
+fh1-radio = { path = "../fh1-radio", default-features = false }
+fh1-ui = { path = "../fh1-ui" }
+fh1-shaders = { path = "../fh1-shaders" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+quick-xml = "0.42"
+sha2 = "0.11"
+anyhow = "1"
+png = "0.18"
+texpresso = { version = "2", features = ["rayon"] }
+rayon = "1"
+
+[features]
+# Optional importers for other Forza games the user owns (off by default): `fh1setup import-fh2` / `import-fm4`.
+fh2 = []
+fm4 = []
