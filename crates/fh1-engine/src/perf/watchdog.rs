@@ -103,11 +103,30 @@ struct Stall {
     samples: Vec<(u64, String, Vec<super::stack::ThreadStack>)>,
 }
 
+/// Longest gap (ms) between two wake-ups of the watchdog thread (it sleeps 50 ms) since the recorder last read it. A gap of
+/// seconds means this thread was not scheduled either: the whole process (or the machine) was frozen, not one thread
+/// blocked (2026-10-08 freeze bisect; CSV column `sched_gap_ms`).
+static SCHED_GAP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Reads and resets [`SCHED_GAP_MS`] (perf/record.rs, once per CSV row).
+pub(crate) fn take_sched_gap_ms() -> u64 {
+    SCHED_GAP_MS.swap(0, Ordering::Relaxed)
+}
+
+/// FH1_STALL_STACKS=0: stalls are still reported, but no thread is suspended to sample its stack.
+fn stall_stacks() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("FH1_STALL_STACKS").is_ok_and(|v| v == "0"))
+}
+
 fn watch_loop(file: PathBuf) {
     let mut stall: Option<Stall> = None;
+    let mut last_wake = now_ms();
     loop {
         std::thread::sleep(Duration::from_millis(50));
         let (now, beat) = (now_ms(), MAIN_BEAT.load(Ordering::Relaxed));
+        SCHED_GAP_MS.fetch_max(now.saturating_sub(last_wake), Ordering::Relaxed);
+        last_wake = now;
         if beat == 0 {
             continue;
         }
@@ -133,7 +152,7 @@ fn watch_loop(file: PathBuf) {
                 let into = now.saturating_sub(s.start);
                 if SAMPLE_AT.get(s.samples.len()).is_some_and(|&at| into > at) {
                     // Raw return addresses only: naming them waits for the report thread.
-                    s.samples.push((into, running_long(now), super::stack::sample()));
+                    s.samples.push((into, running_long(now), if stall_stacks() { super::stack::sample() } else { Vec::new() }));
                 }
             }
             None => {}

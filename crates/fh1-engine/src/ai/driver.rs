@@ -63,6 +63,31 @@ fn ai_gears() -> bool {
     *V.get_or_init(|| std::env::var("FH1_AI_GEARS").map_or(true, |v| v != "0"))
 }
 
+/// FH1_AI_AWARE=0: the R2/R3 traffic rule (pass / follow on the path only, no side caps, no pass-slot check, no
+/// braking for a car ahead while a pass is set). Default: the P9 rule (docs/AI.md "Traffic").
+pub fn ai_aware() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_AWARE").map_or(true, |v| v != "0"))
+}
+
+/// FH1_AI_LANE_HOLD=m: metres after the start an AI keeps its grid lane (120; 0 = old: straight for the racing line).
+fn lane_hold_m() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_LANE_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(120.0))
+}
+
+/// Lateral speed (m/s) of the merge from the grid lane onto the racing line (FH1_AI_MERGE_RATE, 0.8).
+fn merge_rate() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_MERGE_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8f32).max(0.1))
+}
+
+/// Deceleration (m/s²) the follow rule plans with when closing on a car ahead (FH1_AI_FOLLOW_DECEL, 6).
+fn follow_decel() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_FOLLOW_DECEL").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0f32).max(1.0))
+}
+
 /// The game's rev limit, (RedlineRPM + TorqueCurveMaxRPM) / 2 (vehicle/drivetrain.rs).
 pub fn rev_limit(d: &crate::data::CarData) -> f32 {
     0.5 * (d.redline_rpm + d.torque_curve_max_rpm)
@@ -116,8 +141,10 @@ impl Obstacle {
             position: v.position,
             velocity: v.velocity,
             forward: v.rotation * Vec3::NEG_Z,
-            half_length: 0.5 * (b.z - a.z).abs().max(3.0),
-            half_width: 0.5 * (b.x - a.x).abs().max(1.5),
+            // P9: the car's box with its length clamped to 3.4-6 m and width to 1.5-2.6 m (a bad bbox can't make a car
+            // tiny or road-wide); FH1_AI_AWARE=0 = old (only minimums of 3 / 1.5 m).
+            half_length: if ai_aware() { 0.5 * (b.z - a.z).abs().clamp(3.4, 6.0) } else { 0.5 * (b.z - a.z).abs().max(3.0) },
+            half_width: if ai_aware() { 0.5 * (b.x - a.x).abs().clamp(1.5, 2.6) } else { 0.5 * (b.x - a.x).abs().max(1.5) },
         }
     }
 }
@@ -200,6 +227,9 @@ pub struct Driver {
     shift_wait: f32,
     /// Seconds after the hold ends during which the stuck / reverse-out rule stays off.
     launch_grace: f32,
+    /// Grid lane (m left of the road centre) kept after the start, and the progress where keeping it ends (P9).
+    launch_lane: Option<f32>,
+    lane_until: f64,
 }
 
 /// The driver's decision for one tick.
@@ -257,6 +287,8 @@ impl Driver {
             assist_only: false,
             shift_wait: 0.0,
             launch_grace: 0.0,
+            launch_lane: None,
+            lane_until: 0.0,
         }
     }
 
@@ -385,6 +417,12 @@ impl Driver {
             }
             self.mode = Mode::Drive;
             self.launch_grace = 3.0;
+            // P9: remember the grid lane; it is kept for the first FH1_AI_LANE_HOLD m, then merged onto the line.
+            if ai_aware() && lane_hold_m() > 0.0 && !self.assist_only {
+                self.launch_lane = Some(p.lateral);
+                self.lane_until = self.progress + lane_hold_m() as f64;
+                self.lateral_now = Some(p.lateral);
+            }
             self.stuck_timer = 0.0;
             self.slow_timer = 0.0;
             self.history.clear();
@@ -413,13 +451,60 @@ impl Driver {
         let hw = lat_vec.length().max(1.5);
         let lat_unit = lat_vec / hw;
         let line_lat = line_off * hw;
-        let my_half_width = Obstacle::of(v).half_width + EXTRA_CAR_WIDTH_AI * 0.5;
+        let me = Obstacle::of(v);
+        let my_half_width = me.half_width + EXTRA_CAR_WIDTH_AI * 0.5;
         let tm = self.params.temperament;
+        let aware = ai_aware();
         let mut follow_speed = f32::MAX;
         let mut want_lateral: Option<f32> = None;
         let path_lat = self.lateral_now.unwrap_or(line_lat);
         let edge = (hw - tm.track_edge_clearance - my_half_width).max(0.0);
-        for o in sit.obstacles {
+        // Launch lane (P9): kept until `lane_until` or until a corner needs braking soon, then merged at merge_rate().
+        let mut rate = 2.0;
+        let mut base = line_lat;
+        let mut holding_lane = false;
+        if let Some(lane) = self.launch_lane {
+            let corner_soon = speed > 8.0 && self.v_max_at(p.s + 25.0 + 2.0 * speed) < speed + 4.0;
+            if self.progress < self.lane_until && !corner_soon {
+                base = lane.clamp(-edge, edge);
+                holding_lane = true;
+            } else {
+                rate = merge_rate();
+                if (path_lat - line_lat).abs() < 0.1 {
+                    self.launch_lane = None;
+                }
+            }
+        }
+        // Side caps (P9): a car overlapping us lengthwise bounds how far left / right our path may go.
+        let (mut lat_min, mut lat_max) = (-edge, edge);
+        if aware {
+            for o in sit.obstacles {
+                let rel = o.position - v.position;
+                let along = rel.dot(tangent);
+                let o_lat = p.lateral + rel.dot(lat_unit);
+                let need = my_half_width + o.half_width + tm.car_clearance;
+                if along.abs() < me.half_length + o.half_length + 1.0 && (o_lat - p.lateral).abs() < need + 3.0 {
+                    if o_lat > p.lateral {
+                        lat_max = lat_max.min(o_lat - need);
+                    } else {
+                        lat_min = lat_min.max(o_lat + need);
+                    }
+                }
+            }
+        }
+        // A pass slot is free when no other car ahead (within `max_along`) sits in it.
+        let slot_free = |l: f32, max_along: f32, skip: usize| {
+            sit.obstacles.iter().enumerate().all(|(i, o2)| {
+                if i == skip {
+                    return true;
+                }
+                let rel = o2.position - v.position;
+                let along = rel.dot(tangent);
+                let lat = p.lateral + rel.dot(lat_unit);
+                !(along > 0.0 && along < max_along && (lat - l).abs() < my_half_width + o2.half_width + tm.car_clearance)
+            })
+        };
+        for (i, o) in sit.obstacles.iter().enumerate() {
             let rel = o.position - v.position;
             let along = rel.dot(tangent);
             if !(-8.0..=80.0).contains(&along) {
@@ -428,15 +513,17 @@ impl Driver {
             let o_lat = p.lateral + rel.dot(lat_unit);
             let o_speed = o.velocity.dot(tangent);
             let need = my_half_width + o.half_width + tm.car_clearance;
-            let gap_len = along - o.half_length - 2.2;
-            if along > 0.0 {
+            let gap_len = along - o.half_length - if aware { me.half_length } else { 2.2 };
+            if along > 0.0 && (!aware || gap_len > -1.0) {
                 let closing = speed - o_speed;
                 let tti = if closing > 0.1 { gap_len.max(0.0) / closing } else { f32::MAX };
                 let in_path = (o_lat - path_lat).abs() < need;
-                if in_path && (tti < tm.start_pass_at_impact_time || gap_len < tm.trailing_distance) {
+                let in_goal = aware && (o_lat - base).abs() < need;
+                if (in_path || in_goal) && (tti < tm.start_pass_at_impact_time || gap_len < tm.trailing_distance) {
                     // Pass on the side with room, the one nearer the current path first; else follow.
                     let (left, right) = (o_lat + need, o_lat - need);
-                    let pick = match (left <= edge, right >= -edge) {
+                    let ok = |l: f32| !aware || (l >= lat_min && l <= lat_max && slot_free(l, gap_len + 25.0, i));
+                    let pick = match (left <= edge && ok(left), right >= -edge && ok(right)) {
                         (true, true) => Some(if (left - path_lat).abs() < (right - path_lat).abs() { left } else { right }),
                         (true, false) => Some(left),
                         (false, true) => Some(right),
@@ -447,19 +534,32 @@ impl Driver {
                         None => follow_speed = follow_speed.min(o_speed + (gap_len - tm.trailing_distance) * 0.6),
                     }
                 }
-            } else if (o_lat - path_lat).abs() < need {
+                // Not clear of it yet (P9): never arrive faster than a braking car could still stop behind it.
+                if aware && in_path && closing > 0.0 {
+                    let room = (gap_len - 1.5 - 0.15 * speed.max(0.0)).max(0.0);
+                    let o_fwd = o_speed.max(0.0);
+                    follow_speed = follow_speed.min((o_fwd * o_fwd + 2.0 * follow_decel() * room).sqrt());
+                }
+            } else if !aware && (o_lat - path_lat).abs() < need {
                 // Alongside: step away from it, inside the road.
                 let l = if o_lat > path_lat { (o_lat - need).max(-edge) } else { (o_lat + need).min(edge) };
                 want_lateral.get_or_insert(l);
             }
         }
         self.pass_lateral = want_lateral;
-        // Ease the path's lateral position towards the target (passing) or back to the racing line, 2 m/s.
-        let goal = want_lateral.unwrap_or(line_lat);
-        let cur = self.lateral_now.unwrap_or(line_lat);
-        let step = 2.0 * dt;
-        let next = cur + (goal - cur).clamp(-step, step);
-        self.lateral_now = if want_lateral.is_none() && (next - line_lat).abs() < 0.05 { None } else { Some(next) };
+        // Ease the path's lateral position towards the pass slot, the grid lane, or back to the racing line; never into a
+        // car alongside (P9: faster when moving out of one's way).
+        let mut goal = want_lateral.unwrap_or(base);
+        if aware && lat_min <= lat_max {
+            if goal < lat_min || goal > lat_max || path_lat < lat_min || path_lat > lat_max {
+                rate = rate.max(3.0);
+            }
+            goal = goal.clamp(lat_min, lat_max);
+        }
+        let step = rate * dt;
+        let next = path_lat + (goal - path_lat).clamp(-step, step);
+        let on_line = want_lateral.is_none() && self.launch_lane.is_none() && (goal - line_lat).abs() < 0.05;
+        self.lateral_now = if on_line && (next - line_lat).abs() < 0.05 { None } else { Some(next) };
 
         // ---- steering: pure pursuit + yaw damping ----
         let fwd = v.rotation * Vec3::NEG_Z;
@@ -470,6 +570,8 @@ impl Driver {
         let ts = p.s + look;
         let target = match self.lateral_now {
             None => self.line.point_at(ts),
+            // P9: the grid lane is a fixed distance from the road centre (the line may swing across the road at the start).
+            Some(l) if holding_lane && want_lateral.is_none() => self.line.point_with_lateral(ts, l),
             Some(l) => {
                 // Keep the offset from the racing line, so the path stays line-shaped while passing.
                 let (_, lv, lo) = self.line.road_at(ts);

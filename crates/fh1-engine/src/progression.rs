@@ -189,7 +189,11 @@ pub struct LastRewards {
 /// Career notices for the HUD feed (e4's notifications), sent on the frame they happen.
 #[derive(Message, Clone, Debug)]
 pub enum CareerNotice {
-    RankUp { rank: u32, passed: Option<String> },
+    /// Every rank gained (the popularity bar's LEVEL_UP). `milestone`: one of FH1's milestone ranks
+    /// ([`skill::milestone_rank`]), the only ones that get a notification.
+    RankUp { rank: u32, passed: Option<String>, milestone: bool },
+    /// A popularity-gated event (showcase / exhibition) just opened (PopularityUnlock, HUD_SHOWCASE_UNLOCK_CONTROL).
+    EventUnlocked { name: String },
     Wristband { tier: u8 },
     Payout { credits: i64, reason: String },
     Fame { amount: u64 },

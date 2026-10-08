@@ -17,3 +17,10 @@ Rebase them when Bevy is upgraded (or drop them if upstream gains shadow caching
      sampling matches what was drawn. Queue / specialize / batching still run for the skipped view (the encode and the
      GPU work are what is saved).
    - `enabled: false` (or no resource) = upstream behaviour.
+
+2. **Missing cascade entry = no shadow views for that view** (orchestrator 91, 2026-10-08, crash on map load).
+   `prepare_lights` unwrapped `light.cascades.get(&view)` / `light.frusta.get(&view)` for every Camera3d view that sees
+   the light's layers. fh1-remaster light.rs prunes the cascade entries of views it doesn't need, and its first rule
+   (by render layers) raced with the car probe face switching layers in the same frame. Now a view without an entry
+   despawns its directional shadow views and is skipped. light.rs since prunes only non-Camera3d views (never looked up
+   here), so this is a safety net.

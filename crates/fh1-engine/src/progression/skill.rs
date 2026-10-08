@@ -8,10 +8,17 @@
 //! 100/150/250/500; Burnout under 5 mph, 0.5/2/3.5/5 s -> 100/150/250/500. Combos (1000 each): DareDevil (3 near misses
 //! in 10 s), Stuntman (air + near miss, 2.5 s), Superman (air + pass, 2.5 s), Kangaroo (3 air, 5 s), Triple pass (3 passes,
 //! 2 s), Show off (drift then pass, 2.5 s), Lucky escape (drift then near miss, 2.5 s), Slingshot (draft then pass, 5 s).
-//! Multiplier: x2 at 3 skills, x3 at 6 (HorizonFeats Multiplier); ours continues x4 at 10, x5 at 15.
+//! Also Quick off the mark (burnout then clean speed, 35 s, in order) and Ebisu style (drift of grade >= 2 and air within
+//! 0.5 s). RetriggerDelay (HorizonFeats): burnout 5 s, DareDevil 5 s, the other combos 1 s.
+//! Multiplier: x2 at 3 skills, x3 at 6 (HorizonFeats Multiplier, the cap). `FH1_SKILL_MULT_EXT=1` = ours before P9 (x4 at
+//! 10, x5 at 15).
+//! Chain window: 3 s after the last award (GlobalRegistry UI/RaceFeats/Animation/FadeOut_Duration; `FH1_SKILL_WINDOW=<s>`,
+//! 4 = before P9), paused while a skill runs (INFERRED: xex not read yet). The HUD total counts up over 1.6 s
+//! (Count_Up_Duration) and the multiplier changes 0.24 s after the skill that raised it (WaitTimeToUpdateMultiplier):
+//! `Skills::shown_total` / `shown_mult`.
 //! A crash (> 12 mph speed change in 0.15 s above 10 mph, WorldCollisionThreshold / MinSpeedToCancelFeats) loses the
-//! chain and blocks skills for 3 s (DelayAfterCancelling). Not in the data (ours): the chain window (4 s after the last
-//! award, paused while a skill is running), the near-miss gap test (centre distance), the draft cone.
+//! chain and blocks skills for 3 s (DelayAfterCancelling). Not in the data (ours): the near-miss gap test (centre
+//! distance), the draft cone.
 //! Rewind-friendly: holding rewind pauses the chain, and rewinding within 15 s of a crash gives the lost chain back.
 
 use std::collections::HashMap;
@@ -26,7 +33,16 @@ use crate::race::Events;
 use crate::Car;
 
 const MPH: f32 = 0.44704;
-const CHAIN_WINDOW_S: f32 = 4.0;
+/// GlobalRegistry UI/RaceFeats/Animation/FadeOut_Duration (VERIFIED value; its use as the bank delay is INFERRED).
+const CHAIN_WINDOW_S: f32 = 3.0;
+/// UI/RaceFeats/Animation/Count_Up_Duration: the shown total runs up to the chain total over this long.
+const COUNT_UP_S: f32 = 1.6;
+/// UI/RaceFeats/Animation/WaitTimeToUpdateMultiplier.
+const MULT_WAIT_S: f32 = 0.24;
+/// HorizonFeats RetriggerDelay: Burnout and DareDevil 5 s, the other combos 1 s.
+const BURNOUT_RETRIGGER_S: f32 = 5.0;
+const DAREDEVIL_RETRIGGER_S: f32 = 5.0;
+const COMBO_RETRIGGER_S: f32 = 1.0;
 const CRASH_DV: f32 = 12.0 * MPH;
 const CRASH_MIN_SPEED: f32 = 10.0 * MPH;
 const CANCEL_DELAY_S: f32 = 3.0;
@@ -36,6 +52,18 @@ const NEAR_MISS_M: f32 = 4.0;
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| super::enabled() && std::env::var("FH1_SKILLS").map_or(true, |v| v != "0"))
+}
+
+/// The chain window (s): FH1's 3 s, `FH1_SKILL_WINDOW` overrides.
+fn chain_window_s() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_SKILL_WINDOW").ok().and_then(|v| v.parse().ok()).filter(|v: &f32| *v > 0.0).unwrap_or(CHAIN_WINDOW_S))
+}
+
+/// `FH1_SKILL_MULT_EXT=1`: our x4 / x5 steps past FH1's x3 cap (before P9).
+fn mult_ext() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_SKILL_MULT_EXT").is_ok_and(|v| v == "1"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -108,9 +136,17 @@ impl Chain {
             0..=2 => 1,
             3..=5 => 2,
             6..=9 => 3,
+            _ if !mult_ext() => 3,
             10..=14 => 4,
             _ => 5,
         }
+    }
+
+    /// Skills still needed for the next multiplier step (None at the cap).
+    pub fn to_next_multiplier(&self) -> Option<usize> {
+        let n = self.awards.len();
+        let steps: &[usize] = if mult_ext() { &[3, 6, 10, 15] } else { &[3, 6] };
+        steps.iter().find(|&&s| s > n).map(|s| s - n)
     }
 
     pub fn value(&self) -> u64 {
@@ -144,6 +180,16 @@ pub struct Skills {
     pub toast: Option<(String, f32)>,
     lost: Option<(Chain, f32)>,
     cancel_s: f32,
+    /// HUD count-up: the shown total, the value it started from and the time (s) since the target changed.
+    shown: f64,
+    count_from: f64,
+    count_t: f32,
+    count_target: u64,
+    /// Shown multiplier and the time (s) a new one has been waiting (`MULT_WAIT_S`).
+    shown_mult: u32,
+    mult_wait: f32,
+    /// RetriggerDelay: time (s) of the last award per retriggered skill / combo label.
+    last_award: HashMap<String, f32>,
     // Running skills.
     drift_m: f32,
     drift_off_s: f32,
@@ -164,14 +210,58 @@ pub struct Skills {
 impl Skills {
     /// Chain window left, 0..1 (1 = just extended).
     pub fn chain_window_frac(&self) -> f32 {
-        (self.chain.window / CHAIN_WINDOW_S).clamp(0.0, 1.0)
+        (self.chain.window / chain_window_s()).clamp(0.0, 1.0)
+    }
+
+    /// The chain total as the HUD shows it: counting up to `chain.total` over `COUNT_UP_S` (Count_Up_Duration).
+    pub fn shown_total(&self) -> u64 {
+        self.shown.round() as u64
+    }
+
+    /// The multiplier as the HUD shows it: a new one shows `MULT_WAIT_S` after the skill that raised it.
+    pub fn shown_mult(&self) -> u32 {
+        self.shown_mult.max(1)
+    }
+
+    /// Advance the count-up and the multiplier delay (every frame).
+    fn tick_display(&mut self, dt: f32) {
+        let target = self.chain.total;
+        if target != self.count_target {
+            // A new award: count from where the display is now.
+            self.count_from = if target < self.count_target { 0.0 } else { self.shown };
+            self.count_target = target;
+            self.count_t = 0.0;
+        }
+        self.count_t += dt;
+        let k = (self.count_t / COUNT_UP_S).clamp(0.0, 1.0) as f64;
+        self.shown = self.count_from + (target as f64 - self.count_from) * k;
+        let m = self.chain.multiplier();
+        if m < self.shown_mult || self.shown_mult == 0 {
+            self.shown_mult = m;
+            self.mult_wait = 0.0;
+        } else if m > self.shown_mult {
+            self.mult_wait += dt;
+            if self.mult_wait >= MULT_WAIT_S {
+                self.shown_mult = m;
+                self.mult_wait = 0.0;
+            }
+        }
+    }
+
+    /// RetriggerDelay: true (and noted) when `key` may award now.
+    fn retrigger_ok(&mut self, key: &str, delay: f32, now: f32) -> bool {
+        if self.last_award.get(key).is_some_and(|&t| now - t < delay) {
+            return false;
+        }
+        self.last_award.insert(key.to_owned(), now);
+        true
     }
 
     fn award(&mut self, kind: SkillKind, fame: u32, label: String, now: f32) {
         self.outbox.push(SkillEvent::Award { label: label.clone(), fame, kind, combo: false });
         self.chain.awards.push(Award { label, fame, kind, at: now });
         self.chain.total += fame as u64;
-        self.chain.window = CHAIN_WINDOW_S;
+        self.chain.window = chain_window_s();
         self.combos(now);
     }
 
@@ -180,6 +270,7 @@ impl Skills {
         let last = self.chain.awards.last().map(|a| a.kind);
         let prev_within = |k: SkillKind, within: f32| self.chain.awards.iter().rev().skip(1).any(|a| a.kind == k && now - a.at <= within);
         let mut found: Vec<&str> = Vec::new();
+        let last_award = self.chain.awards.last().cloned();
         match last {
             Some(SkillKind::NearMiss) => {
                 if recent(SkillKind::NearMiss, 10.0) == 3 {
@@ -196,11 +287,28 @@ impl Skills {
                 if recent(SkillKind::Air, 5.0) == 3 {
                     found.push("KANGAROO");
                 }
+                // Ebisu style (air after a grade >= 2 drift).
+                if self.chain.awards.iter().rev().skip(1).any(|a| a.kind == SkillKind::Drift && a.fame >= 250 && now - a.at <= 0.5) {
+                    found.push("EBISU STYLE");
+                }
                 if prev_within(SkillKind::NearMiss, 2.5) {
                     found.push("STUNTMAN");
                 }
                 if prev_within(SkillKind::Pass, 2.5) {
                     found.push("SUPERMAN");
+                }
+            }
+            Some(SkillKind::CleanSpeed) => {
+                // Quick off the mark: burnout, then clean speed within 35 s (InOrder); once per burnout (INFERRED).
+                let burnout = self.chain.awards.iter().rev().find(|a| a.kind == SkillKind::Burnout && now - a.at <= 35.0).map(|a| a.at);
+                if burnout.is_some_and(|tb| !self.chain.awards.iter().any(|a| a.label == "QUICK OFF THE MARK" && a.at >= tb)) {
+                    found.push("QUICK OFF THE MARK");
+                }
+            }
+            Some(SkillKind::Drift) => {
+                // Ebisu style: a drift of grade >= 2 (>= 250) and air within 0.5 s, either order.
+                if last_award.as_ref().is_some_and(|a| a.fame >= 250) && prev_within(SkillKind::Air, 0.5) {
+                    found.push("EBISU STYLE");
                 }
             }
             Some(SkillKind::Pass) => {
@@ -220,6 +328,10 @@ impl Skills {
             _ => {}
         }
         for name in found {
+            let delay = if name == "DAREDEVIL" { DAREDEVIL_RETRIGGER_S } else { COMBO_RETRIGGER_S };
+            if !self.retrigger_ok(name, delay, now) {
+                continue;
+            }
             self.outbox.push(SkillEvent::Award { label: name.into(), fame: 1000, kind: SkillKind::Combo, combo: true });
             self.chain.awards.push(Award { label: name.into(), fame: 1000, kind: SkillKind::Combo, at: now });
             self.chain.total += 1000;
@@ -299,7 +411,7 @@ pub fn detect_skills(
     if rewinding {
         if let Some((chain, at)) = sk.lost.take() {
             if now - at < REWIND_RESTORE_S {
-                sk.chain = Chain { window: CHAIN_WINDOW_S, ..chain };
+                sk.chain = Chain { window: chain_window_s(), ..chain };
                 sk.cancel_s = 0.0;
                 sk.toast = Some(("CHAIN RESTORED".into(), 2.0));
             }
@@ -411,7 +523,9 @@ pub fn detect_skills(
     } else if sk.burnout_s > 0.0 {
         let s = std::mem::take(&mut sk.burnout_s);
         if let Some(f) = SkillKind::Burnout.fame(s) {
-            sk.award(SkillKind::Burnout, f, format!("BURNOUT {s:.1} s"), now);
+            if sk.retrigger_ok("BURNOUT", BURNOUT_RETRIGGER_S, now) {
+                sk.award(SkillKind::Burnout, f, format!("BURNOUT {s:.1} s"), now);
+            }
         }
     }
 
@@ -487,19 +601,32 @@ pub fn detect_skills(
     }
     sk.live = live;
 
+    sk.tick_display(dt);
     // Chain window; bank into popularity when it runs out.
     if !sk.chain.awards.is_empty() && !running {
         sk.chain.window -= dt;
         if sk.chain.window <= 0.0 {
             let chain = std::mem::take(&mut sk.chain);
             sk.outbox.push(SkillEvent::Banked { value: chain.value(), mult: chain.multiplier() });
-            bank(&chain, &events.career, &mut profile, &mut banners);
+            bank(&chain, &events, &mut profile, &mut banners);
             sk.toast = Some((format!("+{} POPULARITY", fmt_num(chain.value() as i64)), 2.5));
         }
     }
 }
 
-fn bank(chain: &Chain, c: &super::data::CareerData, profile: &mut Profile, banners: &mut Banners) {
+/// Fame.xml ranks that carry a dialogueEvent / radioFestivalUpdate (VERIFIED on the EU disc): 249, 240, 230, 175, 155,
+/// 150, 125, 105, 100, 75, 55, 50, 25, 13, 6, 1. Only these rank-ups get a notification; every rank still levels the
+/// popularity bar (P9, INFERRED rule until the xex is read: the game's notification for a plain rank-up is unconfirmed).
+/// `FH1_RANKUP_NOTIFY=all` = every rank (before P9).
+const MILESTONE_RANKS: [u32; 16] = [249, 240, 230, 175, 155, 150, 125, 105, 100, 75, 55, 50, 25, 13, 6, 1];
+
+pub fn milestone_rank(rank: u32) -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| std::env::var("FH1_RANKUP_NOTIFY").is_ok_and(|v| v == "all")) || MILESTONE_RANKS.contains(&rank)
+}
+
+fn bank(chain: &Chain, events: &Events, profile: &mut Profile, banners: &mut Banners) {
+    let c = &events.career;
     let value = chain.value();
     let rank_before = c.rank(profile.data.fame);
     let p = &mut profile.data;
@@ -514,10 +641,19 @@ fn bank(chain: &Chain, c: &super::data::CareerData, profile: &mut Profile, banne
     let rank = c.rank(p.fame);
     if rank < rank_before {
         let board = super::rival_board(c);
-        let passed = board.get(rank as usize).and_then(|id| c.driver_name(*id)).map(|n| format!("  passed {n}")).unwrap_or_default();
-        banners.push(format!("POPULARITY #{rank}{passed}"));
+        // Several ranks in one bank: the notification goes to the best milestone crossed (if any).
+        let milestone = (rank..rank_before).filter(|&r| milestone_rank(r)).min();
+        if let Some(m) = milestone {
+            let passed = board.get(m as usize).and_then(|id| c.driver_name(*id)).map(|n| format!("  passed {n}")).unwrap_or_default();
+            banners.push(format!("POPULARITY #{m}{passed}"));
+        }
         let passed = board.get(rank as usize).and_then(|id| c.driver_name(*id)).map(str::to_owned);
-        banners.1.push(super::CareerNotice::RankUp { rank, passed });
+        banners.1.push(super::CareerNotice::RankUp { rank, passed, milestone: milestone.is_some() });
+        // Popularity-gated events (showcases, exhibitions) that this bank opened.
+        for def in events.races.iter().filter(|d| d.popularity_req > 0 && rank <= d.popularity_req && rank_before > d.popularity_req) {
+            banners.push(format!("EVENT UNLOCKED  {}", def.name));
+            banners.1.push(super::CareerNotice::EventUnlocked { name: def.name.clone() });
+        }
         super::pay_rank_milestones(profile, rank, banners);
     }
     profile.commit();
@@ -548,17 +684,10 @@ pub fn draw_skill_hud(
         if !ch.awards.is_empty() {
             let recent: Vec<String> = ch.awards.iter().rev().take(3).map(|a| format!("{} +{}", a.label, a.fame)).collect();
             s += &recent.join("   ");
-            let bar_n = ((ch.window / CHAIN_WINDOW_S).clamp(0.0, 1.0) * 10.0).round() as usize;
-            s += &format!("\nx{}  CHAIN {}  {}{}", ch.multiplier(), fmt_num(ch.value() as i64), "|".repeat(bar_n), ".".repeat(10 - bar_n));
-            let next = match ch.awards.len() {
-                0..=2 => Some(3),
-                3..=5 => Some(6),
-                6..=9 => Some(10),
-                10..=14 => Some(15),
-                _ => None,
-            };
-            if let Some(n) = next {
-                s += &format!("   ({} to x{})", n - ch.awards.len(), ch.multiplier() + 1);
+            let bar_n = (sk.chain_window_frac() * 10.0).round() as usize;
+            s += &format!("\nx{}  CHAIN {}  {}{}", sk.shown_mult(), fmt_num((sk.shown_total() * sk.shown_mult() as u64) as i64), "|".repeat(bar_n), ".".repeat(10 - bar_n));
+            if let Some(n) = ch.to_next_multiplier() {
+                s += &format!("   ({n} to x{})", ch.multiplier() + 1);
             }
         } else if let Some((t, _)) = &sk.toast {
             s += t;

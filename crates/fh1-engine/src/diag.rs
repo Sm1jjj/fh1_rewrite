@@ -126,7 +126,9 @@ fn sample_loop(shared: Arc<Mutex<SysStats>>) {
     let mut sys = System::new();
     let pid = sysinfo::get_current_pid().ok();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f32;
-    let nvml = Nvml::load();
+    // FH1_NVML=0: no NVML (GPU/VRAM read "n/a"). NVML queries go through the NVIDIA kernel driver; off = freeze
+    // bisect (2026-10-08 whole-machine freezes).
+    let nvml = if std::env::var("FH1_NVML").is_ok_and(|v| v == "0") { None } else { Nvml::load() };
     loop {
         sys.refresh_cpu_usage();
         sys.refresh_memory();

@@ -452,23 +452,25 @@ fn update_lights(
 #[allow(clippy::type_complexity)]
 fn main_view_cascades_only(
     main: Query<Entity, With<RemasterView>>,
-    cams: Query<Option<&bevy::camera::visibility::RenderLayers>, With<Camera>>,
-    mut lights: Query<(&mut Cascades, Option<&bevy::camera::visibility::RenderLayers>)>,
+    cams: Query<Has<Camera3d>, With<Camera>>,
+    mut lights: Query<&mut Cascades>,
 ) {
     let Some(cam) = main.iter().next() else { return };
     // Emptied, not removed: Bevy's prepare_lights unwraps the per-view entry (bevy_pbr render/light.rs
     // `light.cascades.get(&entity).unwrap()`) for every active view that sees the light's layers. Removing it panicked as
     // soon as the car probe's face camera (car_probe.rs) switched to layer 0 for its first bake. An empty list = no
     // shadow views for that camera (fh1-render shadow.rs / reflect.rs keep their extra cameras the same way).
-    // P8 (2026-10-08 pm): a view that does NOT see the light's layers (HUD / world map / minimap Camera2d: Bevy builds
-    // cascades for every active camera with a projection) is skipped by prepare_lights before that unwrap, so its entry
-    // is removed: an empty entry still made check_dir_light_mesh_visibility walk every caster once more per frame for
-    // that view. FH1_RM_CASCADE_PRUNE=0 = old (emptied only).
+    // P8 (2026-10-08 pm): Bevy builds cascades for every active camera with a projection, incl. the HUD / world map /
+    // minimap Camera2d; an empty entry still made check_dir_light_mesh_visibility walk every caster once more per frame
+    // for that view. Entries of views that are not Camera3d are removed: prepare_lights only takes Camera3d views, so it
+    // never looks them up. (The first version pruned by render layers and crashed on map load: the probe face switches
+    // from its idle layer to layer 0 in car_probe.rs `drive`, which can run after this system in the same frame, so the
+    // extracted view saw the light and unwrapped the removed entry; vendor/bevy_pbr now also skips a missing entry.)
+    // FH1_RM_CASCADE_PRUNE=0 = old (emptied only).
     let prune = cascade_prune();
-    for (mut c, light_layers) in &mut lights {
+    for mut c in &mut lights {
         if prune {
-            let light_layers = light_layers.cloned().unwrap_or_default();
-            let blind = |v: &Entity| *v != cam && cams.get(*v).is_ok_and(|l| !light_layers.intersects(&l.cloned().unwrap_or_default()));
+            let blind = |v: &Entity| *v != cam && cams.get(*v).is_ok_and(|is_3d| !is_3d);
             if c.cascades.keys().any(&blind) {
                 c.cascades.retain(|v, _| !blind(v));
             }

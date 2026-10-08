@@ -91,7 +91,7 @@ const HEADER: &str = "kind,t_s,utc,map,car,renderer,state,x,y,z,speed_kmh,fps,fr
 rt_extract,rt_prepare_assets,rt_specialize,rt_queue,rt_prepare,rt_render,rt_total,main_wait,main_to_preupdate,main_to_update,\
 main_to_postupdate,main_to_last,main_busy,cpu_process,cpu_system,ram_process_mb,ram_system_mb,gpu_util,vram_mb,vram_total_mb,gpu_temp,\
 entities,meshes,meshes_visible,zones_loaded,zones_pending,prop_tiles,prop_pending,prop_placing,zone_loads,prop_tile_loads,\
-scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred";
+scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms";
 
 /// One (map, car, renderer) stretch of play.
 #[derive(Default)]
@@ -387,6 +387,7 @@ fn record(
             for (c, n) in ["mesh_props", "mesh_props_visible", "mesh_zones", "mesh_zones_visible", "mesh_crowd", "mesh_grass", "mesh_casters", "mesh_other", "mesh_other_visible"].iter().zip(cat) {
                 row.text(c, n.to_string());
             }
+            row.text("sched_gap_ms", super::watchdog::take_sched_gap_ms().to_string());
             row.text("prop_levels_deferred", scenery.as_ref().map_or(0, |s| s.deferred_prop_levels()).to_string());
             // Last frame's render-phase draw counts (perf/draws.rs).
             for (name, c) in super::draws::NAMES.iter().zip(&super::draws::COUNTS) {

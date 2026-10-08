@@ -101,6 +101,8 @@ fn combo(label: &str) -> Option<(&'static str, &'static str)> {
         "SHOW OFF" => ("SHOWOFF", "IDS_ShowOff"),
         "LUCKY ESCAPE" => ("LUCKYESCAPE", "IDS_LuckyEscape"),
         "SLINGSHOT" => ("SLINGSHOT", "IDS_SlingShot"),
+        // 947_HUD's ComboIcon has an EBISUSTYLE slide; it has none for QUICK OFF THE MARK (that combo shows without an icon).
+        "EBISU STYLE" => ("EBISUSTYLE", "IDS_EbisuStyle"),
         _ => return None,
     })
 }
@@ -404,14 +406,14 @@ fn drive(
         }
     }
     if st.active && st.ending.is_none() {
-        // Running total, its digit-count size, and the multiplier.
+        // Running total (counted up as the game's GlobalRegistry Count_Up_Duration), its digit-count size, and the multiplier.
         let ch = &skills.chain;
-        let total = fmt_num(ch.total as i64);
+        let total = fmt_num(skills.shown_total() as i64);
         p.set_text(o.total, total.clone());
         let digits = total.chars().filter(char::is_ascii_digit).count();
         let size = digits.saturating_sub(2).clamp(1, 5);
         p.fire_at(&format!("MAKE_SIZE_{size}"), o.skill);
-        let m = ch.multiplier();
+        let m = skills.shown_mult();
         if m != st.mult {
             if m > 1 {
                 p.set_text(o.mult, m.to_string());
@@ -450,7 +452,7 @@ fn drive(
     // Career notices: rank-ups on the bar, wristbands on PopularityUnlock, the rest on the notification tape.
     for n in notices.read() {
         match n {
-            CareerNotice::RankUp { rank: r, passed } => {
+            CareerNotice::RankUp { rank: r, passed, milestone } => {
                 if !st.bar_shown {
                     st.bar_shown = true;
                     opacity(p, o.bar_root, true);
@@ -463,12 +465,23 @@ fn drive(
                 if let Some(name) = passed {
                     lines.push(format!("PASSED {}", name.to_uppercase()));
                 }
-                notify.write(HudNotify { lines });
+                // The bar levels up on every rank; only Fame.xml milestone ranks get the notification tape.
+                if *milestone {
+                    notify.write(HudNotify { lines });
+                }
             }
             CareerNotice::Wristband { tier } => {
                 let band = crate::progression::TIER_NAMES.get(*tier as usize).copied().unwrap_or("NEW").to_uppercase();
                 p.set_text(o.unlock_title, text(data, "PostRaceFlow", "IDS_WristbandUnlocked", "WRISTBAND UNLOCKED!"));
                 p.set_text(o.unlock_show, format!("{band} WRISTBAND"));
+                opacity(p, o.unlock, true);
+                p.fire_at("SHOW", o.unlock);
+                st.unlock_left = Some(UNLOCK_S);
+            }
+            // A popularity-gated showcase / exhibition opened: the same HUD_SHOWCASE_UNLOCK_CONTROL widget.
+            CareerNotice::EventUnlocked { name } => {
+                p.set_text(o.unlock_title, "EVENT UNLOCKED".to_owned());
+                p.set_text(o.unlock_show, name.to_uppercase());
                 opacity(p, o.unlock, true);
                 p.fire_at("SHOW", o.unlock);
                 st.unlock_left = Some(UNLOCK_S);

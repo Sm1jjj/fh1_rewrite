@@ -26,6 +26,14 @@
 //! Layer order = a sub-millimetre `translation.z` per layer (the 2D phase sorts by z, and z is a ground axis here);
 //! the view-depth Secondary→Primary road tint is `RoadFogMaterial` (ui/minimap_road.wgsl) instead of DistanceFog.
 //!
+//! Sharpness (2026-10-08 pm, user: fuzzy / pixelated since the Camera2d): the target is sized to the disc's on-screen
+//! pixels (256 × the HUD's 1280×720 → window scale, rounded up to 32, 256..1024; resized with the window) and the map
+//! camera draws with 4x MSAA (the old Camera3d had Bevy's default 4x; the Camera2d had none, so every road edge
+//! stair-stepped and the 1440p HUD magnified a 256² image 2x). Sampled linear. The world scale ([`RT_SIZE`],
+//! [`HALF_EXTENT`], [`M_PER_PX`]) stays the game's 256 px logical target. The camera targets its own image, so the
+//! Graphics AA / render-scale settings (ui/graphics.rs, window cameras only) never touch it.
+//! `FH1_MINIMAP_RES=<px>` fixes the size (256 = old), `FH1_MINIMAP_MSAA=0` = no MSAA (old).
+//!
 //! GUESSES until the traced WVP answers them:
 //! - The perspective camera ([`TILT_DEG`], [`FOV_DEG`], [`LOOK_AHEAD`]).
 //! - Size = render-target pixels at the ortho scale.
@@ -49,8 +57,26 @@ use crate::Car;
 
 /// Render layer of the minimap's own world (roads, arrow).
 pub const MAP_LAYER: usize = 8;
-/// Render target size (the HUD quad is 256×256 at 1280×720; `MODEL_VIEWPORT` is 256² too).
+/// Logical render target size (the HUD quad is 256×256 at 1280×720; `MODEL_VIEWPORT` is 256² too). The map's world
+/// scale is defined on it; the image itself is [`rt_pixels`].
 const RT_SIZE: u32 = 256;
+
+/// The target's pixel size: the disc's size on screen (the HUD scales 1280×720 to the window, AutoMin), rounded up to
+/// 32 and clamped to 256..1024. `FH1_MINIMAP_RES=<px>` fixes it.
+fn rt_pixels(window: Option<&Window>) -> u32 {
+    if let Some(px) = std::env::var("FH1_MINIMAP_RES").ok().and_then(|v| v.parse::<u32>().ok()) {
+        return px.clamp(64, 2048);
+    }
+    let Some(w) = window else { return RT_SIZE };
+    let phys = w.physical_size().as_vec2();
+    let scale = (phys.x / 1280.0).min(phys.y / 720.0);
+    let px = (RT_SIZE as f32 * scale).ceil() as u32;
+    px.div_ceil(32).saturating_mul(32).clamp(RT_SIZE, 1024)
+}
+
+/// The map render target (resized with the window by [`resize_target`]).
+#[derive(Resource)]
+struct MinimapImage(Handle<Image>);
 /// Free-roam zoom (0x82637AA8: 0.55; 0.2 when the renderer's flag +0x1305 is set).
 const ZOOM: f32 = 0.55;
 /// World metres from the map centre to its edge: (RT_SIZE / 2) / ZOOM.
@@ -268,7 +294,8 @@ impl Plugin for MinimapPlugin {
                 (follow.after(crate::sync_visuals), route.run_if(resource_exists::<RouteData>), pois.after(follow), pace.after(pois).after(route))
                     .run_if(on_colorado),
             )
-            .add_systems(Update, park_camera.run_if(not(on_colorado)));
+            .add_systems(Update, park_camera.run_if(not(on_colorado)))
+            .add_systems(Update, resize_target.before(pace).run_if(resource_exists::<MinimapImage>));
     }
 }
 
@@ -278,6 +305,19 @@ pub fn on_colorado(track: Res<crate::track::Track>) -> bool {
 }
 
 /// Off Colorado the map camera doesn't render (its target keeps the last image; the HUD hides the disc).
+/// Keeps the target at the disc's on-screen pixel size; a resize re-renders the map.
+fn resize_target(windows: Query<&Window, With<bevy::window::PrimaryWindow>>, target: Res<MinimapImage>, mut images: ResMut<Assets<Image>>, mut pace: ResMut<MapPace>) {
+    let px = rt_pixels(windows.single().ok());
+    if images.get(&target.0).is_some_and(|i| i.size() != UVec2::splat(px)) {
+        if let Some(mut i) = images.get_mut(&target.0) {
+            i.resize(bevy::render::render_resource::Extent3d { width: px, height: px, depth_or_array_layers: 1 });
+            i.data = None;
+            pace.dirty = true;
+            info!("minimap: target {px}x{px}");
+        }
+    }
+}
+
 fn park_camera(mut cam: Query<&mut Camera, With<MinimapCamera>>) {
     for mut c in &mut cam {
         if c.is_active {
@@ -406,14 +446,21 @@ pub fn spawn(
         let z = order_z(400.0 + y);
         commands.spawn((Mesh2d(meshes.add(icon_quad(cell, size))), MeshMaterial2d(mat), Transform::from_xyz(0.0, y, z), layer.clone(), MinimapArrow(z)));
     }
-    let image = images.add(Image::new_target_texture(RT_SIZE, RT_SIZE, TextureFormat::Rgba8Unorm, None));
+    // Sized by resize_target on the first frame (the window is not known here).
+    let mut target = Image::new_target_texture(RT_SIZE, RT_SIZE, TextureFormat::Rgba8Unorm, None);
+    target.data = None;
+    target.sampler = bevy::image::ImageSampler::linear();
+    let image = images.add(target);
+    commands.insert_resource(MinimapImage(image.clone()));
+    let msaa = if std::env::var("FH1_MINIMAP_MSAA").is_ok_and(|v| v == "0") { Msaa::Off } else { Msaa::Sample4 };
     commands.spawn((
         MinimapCamera,
         // Marked as a UI camera so systems that look for the main 3D camera skip it.
         UiCamera,
-        // A 2D view under a tilted perspective: the cheap 2D graph (no cascades / atmosphere / prepass), no MSAA.
+        // A 2D view under a tilted perspective: the cheap 2D graph (no cascades / atmosphere / prepass). 4x MSAA on the
+        // road edges (module doc); it renders at 20 Hz into its own target, so the cost is small.
         Camera2d,
-        Msaa::Off,
+        msaa,
         Camera { order: 5, clear_color: ClearColorConfig::Custom(Color::NONE), ..default() },
         RenderTarget::Image(image.clone().into()),
         Projection::Perspective(PerspectiveProjection { fov: FOV_DEG.to_radians(), aspect_ratio: 1.0, near: 1.0, far: dist * 4.0, ..default() }),

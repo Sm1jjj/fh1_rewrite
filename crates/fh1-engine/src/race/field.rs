@@ -55,6 +55,19 @@ pub fn build(def: &RaceDef, ctx: &FieldCtx, count: usize) -> (Vec<FieldEntry>, O
     let c = ctx.career;
     let (skill0, temperament, rubberband) = def.ai[ctx.difficulty.min(3)];
     let mut skill = skill0;
+    // P9 pace (user: AI "pose no threat"): the Events columns give early events AISkills 64-74 (cornering 0.5-0.6 of the
+    // car's grip), FH1's own gentle start. Difficulty now also caps the id (1 = fastest): Easy = the game's column as is,
+    // Medium <= 20, Hard <= 8, Pro <= 1 (Corrado route 005 laps, docs/AI.md Tests: skill 1 65.3 s, 10 66.6, 30 71.2,
+    // 50 77.6, 70 83.6). FH1_AI_SKILL_CAP=n overrides the cap, FH1_AI_PACE=0 = old (columns only). Ids 201+ untouched.
+    if flag("FH1_AI_PACE") && (1..=80).contains(&skill) {
+        let cap = std::env::var("FH1_AI_SKILL_CAP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(match ctx.difficulty {
+            0 => 80,
+            1 => 20,
+            2 => 8,
+            _ => 1,
+        });
+        skill = skill.min(cap.max(1));
+    }
     if flag("FH1_AI_TIER_SCALE") && crate::progression::enabled() && (1..=80).contains(&skill) {
         let above = (ctx.tier as i32 - def.level.max(0)).max(0) as u32;
         skill = skill.saturating_sub(2 * above).max(1);
