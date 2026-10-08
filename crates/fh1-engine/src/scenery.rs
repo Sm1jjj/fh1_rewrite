@@ -95,6 +95,9 @@ pub struct Scenery {
     retire: std::collections::VecDeque<(Entity, usize)>,
     /// P8: scenery mesh -> its bounds, computed once when prepared ([`Scenery::static_bounds`]).
     aabbs: HashMap<AssetId<Mesh>, bevy::camera::primitives::Aabb>,
+    /// New-mesh byte budget left this frame ([`mesh_add_bytes`]); negative = debt from a big item, paid by the next
+    /// frames.
+    mesh_budget: i64,
 }
 
 /// Entities streaming may spawn per frame, and despawn per frame (P5b). A whole prop tile (hundreds of placements x LODs
@@ -123,7 +126,42 @@ fn stream_ms() -> f32 {
 /// Placements per frame that ignore the time budget (progress floor).
 const MIN_PLACE: usize = 64;
 
+/// P9 (2026-10-08): bytes of NEW Mesh assets streaming may add per frame. Bevy's allocate_and_free_meshes copies every
+/// newly extracted mesh's vertex / index data in the frame it appears (47's trace of the stream-in hitches;
+/// RenderAssetBytesPerFrame doesn't throttle it). Zone models, tiles and merged prop chunks wait for room; one item may
+/// overdraw and the next frames pay the debt, so each frame still makes progress. Template placements and parked
+/// zone models reuse existing meshes and don't count. `FH1_MESH_ADD_MB` (default 8; 0 = unlimited, old).
+fn mesh_add_bytes() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let mb: f64 = std::env::var("FH1_MESH_ADD_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+        (mb.max(0.0) * 1024.0 * 1024.0) as i64
+    })
+}
+
+/// CPU size of a mesh's vertex + index data (what the mesh allocator copies).
+fn mesh_bytes(m: &Mesh) -> i64 {
+    let verts = m.count_vertices() as u64 * m.get_vertex_size();
+    let idx = match m.indices() {
+        Some(Indices::U16(i)) => i.len() as u64 * 2,
+        Some(Indices::U32(i)) => i.len() as u64 * 4,
+        None => 0,
+    };
+    (verts + idx) as i64
+}
+
 impl Scenery {
+    /// Room for new mesh data this frame (always true with `FH1_MESH_ADD_MB=0`).
+    fn mesh_room(&self) -> bool {
+        mesh_add_bytes() == 0 || self.mesh_budget > 0
+    }
+
+    fn spend_mesh(&mut self, m: &Mesh) {
+        if mesh_add_bytes() > 0 {
+            self.mesh_budget -= mesh_bytes(m);
+        }
+    }
+
     fn over_time(&self) -> bool {
         self.deadline.is_some_and(|d| std::time::Instant::now() >= d)
     }
@@ -617,14 +655,29 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
         }
     }
     // Finish loads: a few per frame (mesh + material creation for a whole zone in one frame hitched 100+ ms).
-    let ready: Vec<u16> = z.pending.iter().filter_map(|(k, t)| t.is_finished().then_some(*k)).take(ZONE_FINISH_PER_FRAME).collect();
+    // P9: the current zone's models first, then nearest first (the new-mesh budget may let only a few through).
+    let mut ready: Vec<(u16, bool, f32)> = z
+        .pending
+        .iter()
+        .filter(|(_, t)| t.is_finished())
+        .map(|(&n, _)| {
+            let in_current = z.current.is_some_and(|c| z.lists[c].contains(&n));
+            let d = z.models.get(&n).map_or(f32::MAX, |m| {
+                let (lo, hi) = m.bounds;
+                Vec2::new((lo[0] - here.x).max(here.x - hi[0]).max(0.0), (lo[1] - here.y).max(here.y - hi[1]).max(0.0)).length()
+            });
+            (n, !in_current, d)
+        })
+        .collect();
+    ready.sort_by(|a, b| (a.1, a.2).partial_cmp(&(b.1, b.2)).unwrap_or(std::cmp::Ordering::Equal));
+    let ready: Vec<u16> = ready.into_iter().map(|r| r.0).take(ZONE_FINISH_PER_FRAME).collect();
     let budget_on = sc.budget != usize::MAX;
     let started = std::time::Instant::now();
     let mut finished = 0usize;
     for n in ready {
         // Spawn budget shared with the props (P5b): a model is spawned whole, the next waits for the next frame. Mesh
         // and material building also stops after ZONE_FINISH_MS (big models took ~15 ms of main thread per frame).
-        if sc.budget == 0 || (budget_on && started.elapsed().as_secs_f32() * 1000.0 > ZONE_FINISH_MS) {
+        if sc.budget == 0 || (budget_on && started.elapsed().as_secs_f32() * 1000.0 > ZONE_FINISH_MS) || !sc.mesh_room() {
             break;
         }
         // The shared stream deadline, after at least one model this frame (props ran first).
@@ -875,6 +928,7 @@ impl Scenery {
             deadline: None,
             retire: Default::default(),
             aabbs: HashMap::new(),
+            mesh_budget: 0,
         })
     }
 
@@ -1101,6 +1155,7 @@ impl Scenery {
             .map(|(mesh, m)| {
                 use bevy::camera::primitives::MeshAabb;
                 let aabb = mesh.compute_aabb();
+                self.spend_mesh(&mesh);
                 let h = meshes.add(mesh);
                 if let Some(a) = aabb {
                     self.aabbs.insert(h.id(), a);
@@ -1215,6 +1270,8 @@ struct PlaceJob {
     /// Remaster: the tile's merged meshes being built; `merged` = merging placements are skipped by `place_props`.
     merge: Option<fh1_remaster::batch::MergeTask>,
     merged: bool,
+    /// Merged chunks built and not yet spawned (P9 new-mesh budget), spawned in order.
+    chunks: std::collections::VecDeque<(fh1_remaster::batch::MergeKey, fh1_remaster::batch::Merged)>,
     /// P8 lever 1: every placement LOD level of the tile, spawned or not (empty with `FH1_PROP_LEVEL_STREAM=0`).
     levels: Vec<LevelEntry>,
 }
@@ -1433,7 +1490,7 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
                 .collect();
             sc.props.merge.start(placements, &sc.props.lods, PROP_DEFAULT_FADE * prop_lod_scale(), min_end, broken, last_end)
         });
-        sc.props.placing.push_back(PlaceJob { k, ring, list, next: 0, parent, spawned: 0, placed: Vec::new(), merged: merge.is_some(), merge, levels: Vec::new() });
+        sc.props.placing.push_back(PlaceJob { k, ring, list, next: 0, parent, spawned: 0, placed: Vec::new(), merged: merge.is_some(), merge, levels: Vec::new(), chunks: Default::default() });
     }
     // Level changes of placed tiles first: a late one shows as a missing LOD, a late tile only as later detail.
     update_prop_levels(commands, sc, fx);
@@ -1445,7 +1502,15 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
                 sc.props.placing.push_front(job);
                 break;
             }
-            for ((.., material), m) in block_on(future::poll_once(task)).unwrap_or_default() {
+            job.chunks = block_on(future::poll_once(task)).unwrap_or_default().into();
+        }
+        while !job.chunks.is_empty() {
+            if !sc.mesh_room() {
+                break;
+            }
+            let Some(((.., material), m)) = job.chunks.pop_front() else { break };
+            sc.spend_mesh(&m.mesh);
+            {
                 let fh1_remaster::scenery::RemasterBatch::Material(h, _) = fx.remaster.batch(&sc.dir, material) else { continue };
                 // P8 lever 3: the chunk's coarse range = its placements' [min start, max end] widened by the farthest
                 // vertex from the chunk origin (each placement still fades / switches per vertex in batch_lod.wgsl).
@@ -1476,6 +1541,11 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
                 job.spawned += 1;
                 sc.budget = sc.budget.saturating_sub(1);
             }
+        }
+        if !job.chunks.is_empty() {
+            // Out of mesh room: this tile finishes on later frames (its parent stays hidden until then).
+            sc.props.placing.push_front(job);
+            break;
         }
         place_props(commands, sc, &mut job, fx);
         if job.next < job.list.len() {
@@ -1837,6 +1907,9 @@ pub fn stream(
     sc.budget = if budget_on { SPAWN_BUDGET } else { usize::MAX };
     let ms = stream_ms();
     sc.deadline = (budget_on && ms > 0.0).then(|| std::time::Instant::now() + std::time::Duration::from_secs_f32(ms / 1000.0));
+    // New-mesh byte budget (P9): refill, keeping any debt; none under a loading cover (nothing to stutter there).
+    let limit = mesh_add_bytes();
+    sc.mesh_budget = if crate::ui::loading::blocking() { i64::MAX / 4 } else { (sc.mesh_budget + limit).min(limit) };
     {
         let sc = &mut *sc;
         sc.drain_retired(&mut commands, budget_on);
@@ -1916,6 +1989,9 @@ pub fn stream(
     // Finish tile loads that are ready: one child entity per texture batch.
     let ready: Vec<(i32, i32)> = sc.pending.iter_mut().filter_map(|(k, t)| t.is_finished().then_some(*k)).collect();
     for k in ready {
+        if !sc.mesh_room() {
+            break;
+        }
         let task = sc.pending.remove(&k).unwrap();
         if let Some(data) = block_on(future::poll_once(task)).flatten() {
             let parent = commands.spawn((Transform::IDENTITY, Visibility::default(), crate::ui::world_load::WorldEntity)).id();

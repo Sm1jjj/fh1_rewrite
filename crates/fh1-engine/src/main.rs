@@ -276,11 +276,13 @@ fn main() -> AppExit {
         .add_systems(Update, autotest);
     // Mesh slabs (2026-10-08, 47's analysis of log 133825: the streaming hitches are bevy's allocate_and_free_meshes, which
     // regrows a slab by x1.5 from 1 MiB = a new buffer + a full copy each time the resident scenery set grows): start at
-    // 32 MiB and double. FH1_MESH_SLAB=0 = Bevy's defaults (1 MiB, x1.5).
+    // FH1_MESH_SLAB_MB (16; global, so every vertex layout's slab starts that big: watch vram_mb) and double.
+    // FH1_MESH_SLAB=0 = Bevy's defaults (1 MiB, x1.5).
     if !std::env::var("FH1_MESH_SLAB").is_ok_and(|v| v == "0") {
         if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
             let mut s = bevy::render::mesh::allocator::MeshAllocatorSettings::default();
-            s.min_slab_size = 32 << 20;
+            let mb = std::env::var("FH1_MESH_SLAB_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(16).max(1);
+            s.min_slab_size = mb << 20;
             s.growth_factor = 2.0;
             render_app.insert_resource(s);
         }
