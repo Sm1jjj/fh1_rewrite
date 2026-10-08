@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Color32, RichText};
 
 mod style;
+mod update;
 use serde::{Deserialize, Serialize};
 
 /// No console window for the child processes.
@@ -128,6 +129,11 @@ struct Launcher {
     /// FH1's loading backdrop from the converted data (None before install: painted gradient).
     backdrop: Option<egui::TextureHandle>,
     backdrop_pending: bool,
+    /// A newer release on GitHub (update.rs), its download progress, and messages from the update thread.
+    update: Option<update::Release>,
+    update_progress: Option<f32>,
+    update_error: Option<String>,
+    update_rx: Option<Receiver<update::UpdateMsg>>,
 }
 
 impl Launcher {
@@ -135,6 +141,17 @@ impl Launcher {
         style::install(ctx);
         let paths = Paths::find();
         let backdrop = paths.private().and_then(|p| style::load_backdrop(ctx, &p));
+        // Only a release layout updates itself (not a dev build in target\release).
+        let update_rx = (update::enabled() && paths.root.join(update::LAUNCHER).is_file()).then(|| {
+            update::cleanup(&paths.root);
+            let (tx, rx) = channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(update::UpdateMsg::Checked(update::check(VERSION)));
+                ctx.request_repaint();
+            });
+            rx
+        });
         let saved: Saved =
             std::fs::read(paths.data.join("launcher.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let screen = if paths.private().is_some() { Screen::Home } else { Screen::Setup };
@@ -157,6 +174,10 @@ impl Launcher {
             status: None,
             backdrop,
             backdrop_pending: false,
+            update: None,
+            update_progress: None,
+            update_error: None,
+            update_rx,
         }
     }
 
@@ -280,6 +301,66 @@ impl Launcher {
             }
             Err(e) => self.status = Some(format!("Could not start the game: {e}")),
         }
+    }
+
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.update_rx else { return };
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                update::UpdateMsg::Checked(r) => self.update = r,
+                update::UpdateMsg::Progress(p) => self.update_progress = Some(p),
+                update::UpdateMsg::Failed(e) => {
+                    self.update_progress = None;
+                    self.update_error = Some(e);
+                }
+                update::UpdateMsg::Installed => {
+                    update::restart(&self.paths.root);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn start_update(&mut self, ctx: &egui::Context) {
+        let Some(rel) = self.update.clone() else { return };
+        self.update_progress = Some(0.0);
+        self.update_error = None;
+        let (tx, rx) = channel();
+        self.update_rx = Some(rx);
+        let (root, data, ctx) = (self.paths.root.clone(), self.paths.data.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let repaint = || ctx.request_repaint();
+            update::install(&rel, &root, &data, &tx, &repaint);
+        });
+    }
+
+    /// The update card on the home screen: offer, progress or error.
+    fn ui_update(&mut self, ui: &mut egui::Ui) {
+        let Some(rel) = self.update.clone() else { return };
+        style::panel(ui, |ui| {
+            style::header(ui, &format!("Update available  ·  v{}", rel.version));
+            if let Some(p) = self.update_progress {
+                style::progress(ui, p, if p < 0.9 { "downloading" } else { "installing" });
+            } else {
+                ui.label(RichText::new(format!("You have v{VERSION}. Updating keeps your converted games; the launcher restarts when it's done.")).color(style::DIM));
+                if let Some(e) = &self.update_error {
+                    ui.label(RichText::new(e).color(style::BAD));
+                }
+                let busy = self.game_running || self.rx.is_some();
+                ui.horizontal(|ui| {
+                    if style::menu_item(ui, "Update now", 26.0, !busy, !busy).clicked() {
+                        self.start_update(ui.ctx());
+                    }
+                    if !rel.page.is_empty() && ui.link("What's new").clicked() {
+                        let _ = Command::new("explorer").arg(&rel.page).spawn();
+                    }
+                });
+                if busy {
+                    ui.label(RichText::new("Close the game (or finish the install) to update.").color(style::DIM));
+                }
+            }
+        });
+        ui.add_space(10.0);
     }
 
     fn poll(&mut self) {
@@ -465,6 +546,7 @@ impl Launcher {
     }
 
     fn ui_home(&mut self, ui: &mut egui::Ui) {
+        self.ui_update(ui);
         let play_text = if self.game_running { "Running..." } else { "Play" };
         if style::menu_item(ui, play_text, 52.0, !self.game_running, !self.game_running).clicked() {
             self.play(ui.ctx());
@@ -509,6 +591,7 @@ impl Launcher {
 impl eframe::App for Launcher {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        self.poll_update(ui.ctx());
         if self.backdrop_pending {
             self.backdrop_pending = false;
             self.backdrop = self.paths.private().and_then(|p| style::load_backdrop(ui.ctx(), &p));

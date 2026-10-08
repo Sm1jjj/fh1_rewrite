@@ -3009,13 +3009,15 @@ dependencies = [
 
 [[package]]
 name = "fh1-launcher"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "eframe",
  "png",
  "rfd",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "zip",
 ]
 
 [[package]]
