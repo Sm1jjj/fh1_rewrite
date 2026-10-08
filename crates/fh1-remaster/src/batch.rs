@@ -92,6 +92,9 @@ fn fh1_binormal_id() -> MeshVertexAttributeId {
 
 /// One growing merged mesh.
 struct Accum {
+    /// World position the vertices are relative to (the first placement's origin; P8): the entity's translation, so
+    /// Bevy's VisibilityRange (and its dither in the prepass / shadow shaders) measure from inside the chunk.
+    origin: Vec3,
     layout: Vec<MeshVertexAttribute>,
     values: Vec<VertexAttributeValues>,
     indices: Vec<u32>,
@@ -113,10 +116,10 @@ struct Accum {
 }
 
 impl Accum {
-    fn new(template: &Mesh) -> Self {
+    fn new(template: &Mesh, origin: Vec3) -> Self {
         let layout: Vec<MeshVertexAttribute> = template.attributes().map(|(a, _)| a.clone()).collect();
         let values = template.attributes().map(|(_, v)| empty_like(v)).collect();
-        Self { layout, values, indices: Vec::new(), lod: Vec::new(), tint: Vec::new(), min: Vec3::MAX, max: Vec3::MIN, verts: 0, instances: 0, start_sum: 0.0, end_sum: 0.0, finite_ends: 0, max_radius: 0.0, min_start: f32::MAX, max_end: 0.0 }
+        Self { origin, layout, values, indices: Vec::new(), lod: Vec::new(), tint: Vec::new(), min: Vec3::MAX, max: Vec3::MIN, verts: 0, instances: 0, start_sum: 0.0, end_sum: 0.0, finite_ends: 0, max_radius: 0.0, min_start: f32::MAX, max_end: 0.0 }
     }
 
     fn push(&mut self, template: &Mesh, inst: &Instance) {
@@ -132,7 +135,7 @@ impl Accum {
                 (Kind::Point, VertexAttributeValues::Float32x3(s), VertexAttributeValues::Float32x3(o)) => {
                     let (mut pmin, mut pmax) = (Vec3::MAX, Vec3::MIN);
                     for p in s {
-                        let w = m.transform_point3(Vec3::from_array(*p));
+                        let w = m.transform_point3(Vec3::from_array(*p)) - self.origin;
                         pmin = pmin.min(w);
                         pmax = pmax.max(w);
                         o.push(w.to_array());
@@ -201,14 +204,17 @@ impl Accum {
         // Most placements culled -> the mean finite end; else never culled.
         let end = if self.finite_ends * 2 > self.instances { self.end_sum / self.finite_ends as f32 } else { f32::INFINITY };
         let range = (self.min_start.min(self.max_end), self.max_end);
-        Merged { mesh, aabb: Aabb::from_min_max(self.min, self.max), instances: self.instances, range, shadow: ShadowLod { centre: (self.min + self.max) * 0.5, start, end, max_radius: self.max_radius } }
+        let origin = self.origin;
+        Merged { mesh, aabb: Aabb::from_min_max(self.min, self.max), origin, instances: self.instances, range, shadow: ShadowLod { centre: origin + (self.min + self.max) * 0.5, start, end, max_radius: self.max_radius } }
     }
 }
 
-/// A finished merged mesh: world-space vertices (spawn it with `Transform::IDENTITY`) and its bounds.
+/// A finished merged mesh: vertices relative to `origin` (spawn it with `Transform::from_translation(origin)`) and its
+/// bounds (relative to `origin`).
 pub struct Merged {
     pub mesh: Mesh,
     pub aabb: Aabb,
+    pub origin: Vec3,
     pub instances: u32,
     /// Smallest LOD start / largest LOD end (m, `INFINITY` = never culled) of its placements (P8: the cell's coarse
     /// VisibilityRange, widened by the bounds' half diagonal by the caller).
@@ -242,7 +248,7 @@ impl<K: Hash + Eq + Clone> Batcher<K> {
                 self.done.push((k.0.clone(), a.finish()));
             }
         }
-        self.open.entry(k.clone()).or_insert_with(|| Accum::new(template)).push(template, &inst);
+        self.open.entry(k.clone()).or_insert_with(|| Accum::new(template, inst.transform.w_axis.truncate())).push(template, &inst);
     }
 
     pub fn finish(mut self) -> Vec<(K, Merged)> {
@@ -311,8 +317,10 @@ mod tests {
         // Mirrored normal: (0,0,1) under diag(-1,1,1) stays (0,0,1).
         let Some(VertexAttributeValues::Float32x3(n)) = m.mesh.attribute(Mesh::ATTRIBUTE_NORMAL) else { panic!() };
         assert_eq!(n[3], [0.0, 0.0, 1.0]);
-        assert_eq!(m.aabb.min().x, -1.0);
-        assert_eq!(m.aabb.max().x, 11.0);
+        // Vertices relative to the first placement's origin.
+        assert_eq!(m.origin, Vec3::X * 10.0);
+        assert_eq!(m.aabb.min().x + m.origin.x, -1.0);
+        assert_eq!(m.aabb.max().x + m.origin.x, 11.0);
     }
 
     #[test]

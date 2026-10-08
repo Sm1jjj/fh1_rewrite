@@ -1413,9 +1413,19 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
         let parent = commands.spawn((Transform::IDENTITY, Visibility::Hidden, crate::ui::world_load::WorldEntity)).id();
         let merge = merging.then(|| {
             let placements = list.iter().map(|&(model, transform, _, tint, _)| fh1_remaster::batch::Placement { model, transform, tint }).collect();
-            let broken = (0..list.len() as u32).filter(|&i| sc.props.broken.contains(&(k.0, k.1, i))).collect();
+            // Staying entities: broken placements, and (P8) placements with their own night lightmaps (per-placement
+            // material variants).
+            let broken = (0..list.len() as u32).filter(|&i| sc.props.broken.contains(&(k.0, k.1, i)) || has_own_lightmap(&list[i as usize].4)).collect();
             let min_end = ring_min_end(ring);
-            sc.props.merge.start(placements, &sc.props.lods, PROP_DEFAULT_FADE * prop_lod_scale(), min_end, broken)
+            // P4's size-based far cull of each placement's last LOD (`prop_far_end`), as place_props applies it.
+            let last_end = list
+                .iter()
+                .map(|(n, m, ..)| {
+                    let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
+                    prop_far_end(sc.props.extent.get(n).copied(), scale).unwrap_or(0.0)
+                })
+                .collect();
+            sc.props.merge.start(placements, &sc.props.lods, PROP_DEFAULT_FADE * prop_lod_scale(), min_end, broken, last_end)
         });
         sc.props.placing.push_back(PlaceJob { k, ring, list, next: 0, parent, spawned: 0, placed: Vec::new(), merged: merge.is_some(), merge, levels: Vec::new() });
     }
@@ -1429,9 +1439,19 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
                 sc.props.placing.push_front(job);
                 break;
             }
-            for ((_, material), m) in block_on(future::poll_once(task)).unwrap_or_default() {
+            for ((.., material), m) in block_on(future::poll_once(task)).unwrap_or_default() {
                 let fh1_remaster::scenery::RemasterBatch::Material(h, _) = fx.remaster.batch(&sc.dir, material) else { continue };
-                let e = commands.spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(h), m.aabb, m.shadow, Transform::IDENTITY, ChildOf(job.parent))).id();
+                // P8 lever 3: the chunk's coarse range = its placements' [min start, max end] widened by the farthest
+                // vertex from the chunk origin (each placement still fades / switches per vertex in batch_lod.wgsl).
+                let r = (Vec3::from(m.aabb.center).abs() + Vec3::from(m.aabb.half_extents)).length();
+                let (start, end) = ((m.range.0 - r).max(0.0), if m.range.1.is_finite() { m.range.1 + r } else { 1.0e7 });
+                let range = bevy::camera::visibility::VisibilityRange { start_margin: start - 1.0..start, end_margin: end..end + 1.0, use_aabb: false };
+                let e = commands
+                    .spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(h), m.aabb, m.shadow, Transform::from_translation(m.origin), ChildOf(job.parent), p2::PropMesh))
+                    .id();
+                if start > 0.0 || end < 1.0e7 {
+                    commands.entity(e).insert(range);
+                }
                 no_cpu_cull(commands, e);
                 if static_aabb_on() {
                     commands.entity(e).insert(bevy::camera::visibility::NoAutoAabb);
@@ -1591,6 +1611,12 @@ fn spawn_level(
     out
 }
 
+/// A placement with its own night lightmap (LOD0 / LOD1 draw record): its materials are per-placement variants, so it
+/// never goes into the merged prop meshes.
+fn has_own_lightmap(lightmaps: &[u32; 2]) -> bool {
+    lightmaps.iter().any(|&l| l != u32::MAX)
+}
+
 /// Spawn `job`'s placements until the frame's spawn budget is used up.
 fn place_props(commands: &mut Commands, sc: &mut Scenery, job: &mut PlaceJob, fx: &mut FxParams) {
     let (k, ring, parent) = (job.k, job.ring, job.parent);
@@ -1609,7 +1635,7 @@ fn place_props(commands: &mut Commands, sc: &mut Scenery, job: &mut PlaceJob, fx
         if sc.props.broken.contains(&key) {
             continue;
         }
-        if job.merged && sc.props.merge.merges(n, sc.props.lods.get(&n)) {
+        if job.merged && !has_own_lightmap(&lightmaps) && sc.props.merge.merges(n, sc.props.lods.get(&n)) {
             continue;
         }
         // Placement scale (largest axis), for the small-caster radius test and the far cull.

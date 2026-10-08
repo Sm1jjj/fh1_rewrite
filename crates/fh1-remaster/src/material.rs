@@ -73,6 +73,21 @@ pub const FLAG_CLOTH: u16 = 128;
 pub const FLAG_LM_BAKED: u16 = 256;
 pub const FLAG_ROAD: u16 = 512;
 pub const FLAG_TREE: u16 = 1024;
+/// Uniform-only flag (not in the setup table): a decal drawn as an alpha-tested Mask ([`decal_mask_on`]).
+pub const FLAG_DECAL_MASK: u16 = 0x8000;
+
+/// P8 (2026-10-08, OPT-IN `FH1_RM_DECAL_MASK=1`): decals draw as alpha-tested Mask (cutoff `FH1_RM_DECAL_MASK_CUTOFF`,
+/// default 0.5) in the opaque pass instead of sorted Blend draws in the transparent pass (1.0 ms/frame in log 105206).
+/// The decal alpha (texture x vertex alpha / blue) is computed as before and tested; soft edges (road wear, dirt
+/// patches fading into the ground) turn hard, so this waits for the user's look check. Water / Additive unchanged.
+pub fn decal_mask_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_RM_DECAL_MASK").is_ok_and(|v| v == "1"))
+}
+
+fn decal_mask_cutoff() -> f32 {
+    std::env::var("FH1_RM_DECAL_MASK_CUTOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5)
+}
 
 /// One `materials.bin` record.
 #[derive(Clone, Debug)]
@@ -262,7 +277,8 @@ pub fn uniform(r: &Record, night: RemasterNight) -> SceneryUniform {
     };
     let sets = r.uv_set.iter().enumerate().fold(0u32, |a, (k, &s)| a | ((s as u32 & 3) << (2 * k)));
     let present = r.tex.iter().enumerate().fold(0u32, |a, (k, t)| a | ((t.is_some() as u32) << k));
-    u.info = UVec4::new(sets, present, r.flags as u32 | (class << 16), r.layering as u32);
+    let decal_mask = if r.class == Class::Decal && decal_mask_on() { FLAG_DECAL_MASK as u32 } else { 0 };
+    u.info = UVec4::new(sets, present, r.flags as u32 | decal_mask | (class << 16), r.layering as u32);
     u.night = Vec4::new(night.lightmap, night.switch_on, night.emissive_scale, night.lamp_scale);
     u
 }
@@ -275,6 +291,7 @@ pub fn base(r: &Record, mirrored: bool) -> StandardMaterial {
     let two_sided = r.flags & FLAG_TWO_SIDED != 0 || (r.class == Class::Water && !std::env::var("FH1_RM_WATER_CULL").is_ok_and(|v| v == "1"));
     let alpha_mode = match r.class {
         Class::Cutout => AlphaMode::Mask(r.params[2][3].clamp(0.05, 0.95)),
+        Class::Decal if decal_mask_on() => AlphaMode::Mask(decal_mask_cutoff()),
         Class::Decal | Class::Water => AlphaMode::Blend,
         Class::Additive => AlphaMode::Add,
         _ => AlphaMode::Opaque,
@@ -580,6 +597,7 @@ const FLAG_REFLECTIVE: u32 = 32u;
 const FLAG_LM_BAKED: u32 = 256u;
 const FLAG_ROAD: u32 = 512u;
 const FLAG_TREE: u32 = 1024u;
+const FLAG_DECAL_MASK: u32 = 0x8000u;
 
 fn has(p: SceneryParams, role: u32) -> bool {
     return (p.info.y & (1u << role)) != 0u;
@@ -870,7 +888,7 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
 
     pbr.material.base_color = vec4<f32>(col, alpha);
     pbr.material.metallic = 0.0;
-    if cls == CLASS_CUTOUT && alpha < smat.alpha_cutoff {
+    if (cls == CLASS_CUTOUT || (flags & FLAG_DECAL_MASK) != 0u) && alpha < smat.alpha_cutoff {
         discard;
     }
 

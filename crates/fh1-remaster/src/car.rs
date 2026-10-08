@@ -25,6 +25,12 @@
 //!   catches it, the hue stays) in any light; by day the physical level is below the cap and unchanged.
 //! - Lenses and covers get a clear coat (FH1_RM_LAMP_COAT, 1; 0 = none): a sharp sun / env highlight and Fresnel on
 //!   the outer plastic over the emission, so the lamp reads as a lit unit behind a clear cover.
+//!
+//! Transparency LOD (P8, 2026-10-08): every blended car material (glass, lamp layers, lenses, covers) has a far twin
+//! out of the transparent phase (glass opaque with its premultiplied tint, lamp layers alpha-masked at 0.5), and parts
+//! farther than FH1_RM_CAR_TRANSP_LOD_M (60 m, +-5 m hysteresis) from the main camera swap to it, checked 4x a second.
+//! That moves traffic / AI glass and lamps out of the sorted one-draw-per-item transparent pass. The player car is
+//! always nearer than that to the driving camera, so it keeps the full layering. FH1_RM_CAR_TRANSP_LOD=0 = old.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -285,12 +291,45 @@ struct CarMaterials {
     paints: HashMap<(PathBuf, Option<u32>, Option<(u32, bool)>), (Option<(u32, bool)>, bool)>,
     /// Handles this module made (so a restyled primitive is never restyled again).
     made: HashSet<AssetId<StandardMaterial>>,
+    /// Transparency LOD: the far (non-blended) twin of each shared blended material.
+    far: HashMap<AssetId<StandardMaterial>, Handle<StandardMaterial>>,
+}
+
+/// On a car part with a blended material: its near (blended) and far (opaque / masked) materials.
+#[derive(Component)]
+struct TranspLod {
+    near: Handle<StandardMaterial>,
+    far: Handle<StandardMaterial>,
+    far_on: bool,
+}
+
+/// FH1_RM_CAR_TRANSP_LOD=0: car glass and lamps blend at every distance (old).
+fn transp_lod_on() -> bool {
+    !std::env::var("FH1_RM_CAR_TRANSP_LOD").is_ok_and(|v| v == "0")
+}
+
+fn blended(m: &StandardMaterial) -> bool {
+    matches!(m.alpha_mode, AlphaMode::Blend | AlphaMode::Premultiplied | AlphaMode::Add | AlphaMode::Multiply)
+}
+
+/// The far twin: premultiplied glass drawn opaque with its tinted (premultiplied) colour; blended lamp layers, lenses and
+/// covers alpha-masked by the atlas alpha (the alpha-mask phase is batched like the opaque one).
+fn far_twin(near: &StandardMaterial) -> StandardMaterial {
+    let mut m = near.clone();
+    m.alpha_mode = if near.alpha_mode == AlphaMode::Premultiplied { AlphaMode::Opaque } else { AlphaMode::Mask(0.5) };
+    if m.alpha_mode == AlphaMode::Opaque {
+        let c = m.base_color.to_linear();
+        m.base_color = Color::LinearRgba(LinearRgba::new(c.red, c.green, c.blue, 1.0));
+    }
+    m.depth_bias = 0.0;
+    m
 }
 
 /// On the `FxCarBody` holder: this car's own lamp materials (glTF material -> (lamp, emissive scale, restyled)).
 #[derive(Component, Default)]
 pub struct RemasterLamps {
-    lamps: HashMap<AssetId<StandardMaterial>, (Lamp, LinearRgba, Handle<StandardMaterial>)>,
+    /// (lamp, emissive scale, restyled, far twin for the transparency LOD).
+    lamps: HashMap<AssetId<StandardMaterial>, (Lamp, LinearRgba, Handle<StandardMaterial>, Option<Handle<StandardMaterial>>)>,
     /// Last levels written, per lamp.
     levels: HashMap<Lamp, f32>,
 }
@@ -373,6 +412,9 @@ impl Plugin for RemasterCarPlugin {
         app.add_plugins(MaterialPlugin::<CarPaintMaterial>::default()).init_resource::<CarMaterials>().init_resource::<CarFill>();
         let _ = app.world_mut().resource_mut::<Assets<Shader>>().insert(&crate::car_paint::SHADER, Shader::from_wgsl(crate::car_paint::WGSL, "fh1_remaster/car_paint.wgsl"));
         app.add_systems(Update, (update_car_fill, mark_bodies, request_variants, restyle_car_materials, update_lamps).chain()).add_observer(apply_variants);
+        if transp_lod_on() {
+            app.add_systems(Update, transparency_lod.after(restyle_car_materials));
+        }
     }
 }
 
@@ -533,8 +575,9 @@ fn restyle_car_materials(
                     Kind::Cover(Some(l)) => (l, 0.35),
                     _ => unreachable!(),
                 };
-                let handle = match set.lamps.get(&src_id) {
-                    Some((_, _, h)) => h.clone(),
+                let lod = transp_lod_on();
+                let (handle, far) = match set.lamps.get(&src_id) {
+                    Some((_, _, h, f)) => (h.clone(), f.clone()),
                     None => {
                         let mut m = restyle(&src, lk);
                         scale_base(&mut m, paint_scale(&settings, &name.0));
@@ -554,13 +597,20 @@ fn restyle_car_materials(
                             m.clearcoat = coat.min(1.0);
                             m.clearcoat_perceptual_roughness = 0.04;
                         }
+                        let far = (lod && blended(&m)).then(|| standard.add(far_twin(&m)));
                         let h = standard.add(m);
                         cache.made.insert(h.id());
-                        set.lamps.insert(src_id, (l, colour * scale, h.clone()));
+                        if let Some(f) = &far {
+                            cache.made.insert(f.id());
+                        }
+                        set.lamps.insert(src_id, (l, colour * scale, h.clone(), far.clone()));
                         set.levels.clear();
-                        h
+                        (h, far)
                     }
                 };
+                if let Some(far) = far {
+                    commands.entity(e).insert(TranspLod { near: handle.clone(), far, far_on: false });
+                }
                 commands.entity(e).insert(MeshMaterial3d(handle));
             }
             _ => {
@@ -578,12 +628,20 @@ fn restyle_car_materials(
                                 m.reflectance = r;
                             }
                         }
+                        let far = (transp_lod_on() && blended(&m)).then(|| standard.add(far_twin(&m)));
                         let h = standard.add(m);
                         cache.made.insert(h.id());
                         cache.standard.insert(src_id, h.clone());
+                        if let Some(f) = far {
+                            cache.made.insert(f.id());
+                            cache.far.insert(h.id(), f);
+                        }
                         h
                     }
                 };
+                if let Some(far) = cache.far.get(&handle.id()) {
+                    commands.entity(e).insert(TranspLod { near: handle.clone(), far: far.clone(), far_on: false });
+                }
                 commands.entity(e).insert(MeshMaterial3d(handle));
             }
         }
@@ -813,12 +871,40 @@ fn update_lamps(
             continue;
         }
         let RemasterLamps { lamps, levels } = &mut *set;
-        for (lamp, colour, handle) in lamps.values() {
+        for (lamp, colour, handle, far) in lamps.values() {
             let v = level(*lamp);
             levels.insert(*lamp, v);
-            if let Some(mut m) = standard.get_mut(handle) {
-                m.emissive = *colour * (v * *last_gain);
+            for h in std::iter::once(handle).chain(far.as_ref()) {
+                if let Some(mut m) = standard.get_mut(h) {
+                    m.emissive = *colour * (v * *last_gain);
+                }
             }
+        }
+    }
+}
+
+/// Swaps blended car parts to their far twin beyond FH1_RM_CAR_TRANSP_LOD_M (module doc), 4x a second.
+fn transparency_lod(
+    mut commands: Commands,
+    time: Res<Time<Real>>,
+    mut next: Local<f32>,
+    cams: Query<&GlobalTransform, With<fh1_render::post::FxPostCamera>>,
+    mut parts: Query<(Entity, &GlobalTransform, &mut TranspLod)>,
+) {
+    let now = time.elapsed_secs();
+    if now < *next {
+        return;
+    }
+    *next = now + 0.25;
+    let Some(cam) = cams.iter().next().map(|c| c.translation()) else { return };
+    let at = env_f32("FH1_RM_CAR_TRANSP_LOD_M", 60.0);
+    let (out2, in2) = ((at + 5.0).powi(2), (at - 5.0).max(0.0).powi(2));
+    for (e, t, mut lod) in &mut parts {
+        let d2 = t.translation().distance_squared(cam);
+        let far = if lod.far_on { d2 > in2 } else { d2 > out2 };
+        if far != lod.far_on {
+            lod.far_on = far;
+            commands.entity(e).insert(MeshMaterial3d(if far { lod.far.clone() } else { lod.near.clone() }));
         }
     }
 }

@@ -14,8 +14,13 @@
 //! 0.0875 miles in). Fed through the shared car constant bank `FxCarGlobals`.
 //!
 //! FH1_SKIDMARKS=0 / FH1_CAR_DIRT=0 turn either off; FH1_SKID_GAIN scales the mark alpha (default 2, see EFFECTS.md).
+//!
+//! Culling (P8, 2026-10-08): a chunk stays Hidden until a quad is written into it, and then carries the bounds of its
+//! written quads, so the camera frustum culls it (before, all 16 blended chunks were drawn every frame, empty or not).
+//! FH1_SKID_CULL=0 = the old always-drawn chunks.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::primitives::Aabb;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
@@ -44,6 +49,10 @@ const DIRT_MAX: f32 = 1.0;
 
 fn flag(name: &str) -> bool {
     std::env::var(name).map_or(true, |v| v != "0")
+}
+
+fn cull() -> bool {
+    flag("FH1_SKID_CULL")
 }
 
 pub struct DrivingEffectsPlugin;
@@ -83,6 +92,9 @@ struct Edge {
 
 struct Chunk {
     mesh: Handle<Mesh>,
+    entity: Entity,
+    /// Quads ever written (the ring fills each chunk from 0 up).
+    written: usize,
     positions: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
     colors: Vec<[f32; 4]>,
@@ -128,16 +140,21 @@ fn setup_skidmarks(mut commands: Commands, garage: Res<Garage>, mut meshes: ResM
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors.clone());
         mesh.insert_indices(Indices::U16(indices.clone()));
         let handle = meshes.add(mesh);
-        commands.spawn((
+        let mut e = commands.spawn((
             Mesh3d(handle.clone()),
             MeshMaterial3d(material.clone()),
             Transform::default(),
-            NoFrustumCulling,
             NotShadowCaster,
             NotShadowReceiver,
             Name::new("skid marks"),
         ));
-        chunks.push(Chunk { mesh: handle, positions, uvs, colors, dirty: false });
+        if cull() {
+            // Bounds from the written quads only (lay_skidmarks); Bevy's own would include the unwritten ones at 0.
+            e.insert((Visibility::Hidden, bevy::camera::visibility::NoAutoAabb));
+        } else {
+            e.insert(NoFrustumCulling);
+        }
+        chunks.push(Chunk { mesh: handle, entity: e.id(), written: 0, positions, uvs, colors, dirty: false });
     }
     let gain = std::env::var("FH1_SKID_GAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
     commands.insert_resource(SkidMarks { chunks, cursor: 0, last: [None; 4], styles: Vec::new(), styles_for: String::new(), gain });
@@ -199,7 +216,7 @@ fn surface_style(track: &Track, id: u8) -> Option<SkidStyle> {
     })
 }
 
-fn lay_skidmarks(mut marks: ResMut<SkidMarks>, track: Res<Track>, cars: Query<&Car>, mut meshes: ResMut<Assets<Mesh>>) {
+fn lay_skidmarks(mut commands: Commands, mut marks: ResMut<SkidMarks>, track: Res<Track>, cars: Query<&Car>, mut meshes: ResMut<Assets<Mesh>>) {
     let marks = &mut *marks;
     if marks.styles_for != track.id {
         marks.styles = (0..=255u8).map(|id| surface_style(&track, id)).collect();
@@ -245,12 +262,22 @@ fn lay_skidmarks(mut marks: ResMut<SkidMarks>, track: Res<Track>, cars: Query<&C
         write_quad(marks, &last, &next, style.color);
         marks.last[i] = Some(next);
     }
+    let cull = cull();
     for c in marks.chunks.iter_mut().filter(|c| c.dirty) {
         c.dirty = false;
         if let Some(mut m) = meshes.get_mut(&c.mesh) {
             m.insert_attribute(Mesh::ATTRIBUTE_POSITION, c.positions.clone());
             m.insert_attribute(Mesh::ATTRIBUTE_UV_0, c.uvs.clone());
             m.insert_attribute(Mesh::ATTRIBUTE_COLOR, c.colors.clone());
+        }
+        if cull && c.written > 0 {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in &c.positions[..c.written * 4] {
+                lo = lo.min(Vec3::from(*p));
+                hi = hi.max(Vec3::from(*p));
+            }
+            // A few cm of slack for the lift and the depth bias.
+            commands.entity(c.entity).insert((Aabb::from_min_max(lo - 0.1, hi + 0.1), Visibility::Inherited));
         }
     }
 }
@@ -265,6 +292,7 @@ fn write_quad(marks: &mut SkidMarks, a: &Edge, b: &Edge, color: [f32; 3]) {
     let q = marks.cursor;
     marks.cursor = (marks.cursor + 1) % (CHUNKS * SEGS_PER_CHUNK);
     let chunk = &mut marks.chunks[q / SEGS_PER_CHUNK];
+    chunk.written = chunk.written.max(q % SEGS_PER_CHUNK + 1);
     let base = (q % SEGS_PER_CHUNK) * 4;
     // Half a texel in from each column edge so the clamp doesn't bleed the neighbour.
     let col = b.style_column as f32;
