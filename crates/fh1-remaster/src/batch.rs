@@ -205,7 +205,7 @@ impl Accum {
         let end = if self.finite_ends * 2 > self.instances { self.end_sum / self.finite_ends as f32 } else { f32::INFINITY };
         let range = (self.min_start.min(self.max_end), self.max_end);
         let origin = self.origin;
-        Merged { mesh, aabb: Aabb::from_min_max(self.min, self.max), origin, instances: self.instances, range, shadow: ShadowLod { centre: origin + (self.min + self.max) * 0.5, start, end, max_radius: self.max_radius } }
+        Merged { mesh, aabb: Aabb::from_min_max(self.min, self.max), origin, instances: self.instances, range, casts: true, shadow: ShadowLod { centre: origin + (self.min + self.max) * 0.5, start, end, max_radius: self.max_radius } }
     }
 }
 
@@ -221,6 +221,9 @@ pub struct Merged {
     pub range: (f32, f32),
     /// Insert on the spawned entity: picks whether it casts shadows (see [`ShadowLod`]).
     pub shadow: ShadowLod,
+    /// False: the chunk never casts sun shadows (P8 cell shadows: a non-final LOD level of its placements, whose last
+    /// level casts instead). Set by [`merge_props`].
+    pub casts: bool,
 }
 
 /// Collects placements per key `K` (e.g. (LOD level, material)) and merges them. Templates with a different
@@ -575,8 +578,17 @@ pub fn cell_size() -> f32 {
     *V.get_or_init(|| std::env::var("FH1_BATCH_CELL").ok().and_then(|v| v.parse().ok()).filter(|v: &f32| *v >= 0.0).unwrap_or(CELL))
 }
 
-/// Merge key: (cell x, cell z, LOD level, game material).
-pub type MergeKey = (i32, i32, u8, u32);
+/// Merge key: (cell x, cell z, LOD level, final level of its placements, game material).
+pub type MergeKey = (i32, i32, u8, bool, u32);
+
+/// P8 cell shadows (2026-10-08): only each placement's LAST (coarsest) LOD level casts sun shadows, over the whole
+/// [0, end) range; the finer levels' chunks never cast. Chunks are split by "final level or not" for that. Fewer,
+/// cheaper shadow draws (Bevy's shadow pass has no per-vertex LOD: every casting chunk draws all its placements).
+/// `FH1_BATCH_SHADOW_FINAL=0` = every level casts within its mean LOD range (ShadowLod, as before).
+pub fn shadow_final_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_BATCH_SHADOW_FINAL").map_or(true, |v| v != "0"))
+}
 
 /// Merge a prop tile: every placement's every LOD level into one mesh per (cell, LOD level, game material), each vertex
 /// carrying its placement's LOD range. `skip(i)` drops placement `i` (broken / smashable / not mergeable). Placements
@@ -612,11 +624,23 @@ pub fn merge_props(
             }
             let Some(parts) = templates.get(&lod) else { continue };
             for part in parts {
-                b.add((cx, cz, level as u8, part.material), &part.mesh, Instance { transform: p.transform, tint, lod: (from, to) });
+                let last = shadow_final_on() && level + 1 == levels;
+                b.add((cx, cz, level as u8, last, part.material), &part.mesh, Instance { transform: p.transform, tint, lod: (from, to) });
             }
         }
     }
-    b.finish()
+    let mut out = b.finish();
+    if shadow_final_on() {
+        for (k, m) in out.iter_mut() {
+            if k.3 {
+                // The last level stands in for the finer ones in the shadow maps: cast from 0.
+                m.shadow.start = 0.0;
+            } else {
+                m.casts = false;
+            }
+        }
+    }
+    out
 }
 
 /// Engine seam state for merged props (scenery.rs `Props`, remaster mode). W4 was opt-in: tile-sized chunks defeated

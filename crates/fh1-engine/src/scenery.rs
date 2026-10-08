@@ -1173,6 +1173,11 @@ fn small_casters_off() -> bool {
     *ON.get_or_init(|| fh1_remaster::enabled() && std::env::var("FH1_RM_SMALL_CASTERS").as_deref() != Ok("0"))
 }
 
+fn batch_small_nocast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_BATCH_SMALL_NOCAST").map_or(true, |v| v != "0"))
+}
+
 /// Largest |coordinate| of any vertex (half the size of the template's origin-centred box).
 fn template_extent(data: &TileData) -> f32 {
     let r = |m: &Mesh| match m.attribute(Mesh::ATTRIBUTE_POSITION) {
@@ -1448,8 +1453,17 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
                 let (start, end) = ((m.range.0 - r).max(0.0), if m.range.1.is_finite() { m.range.1 + r } else { 1.0e7 });
                 let range = bevy::camera::visibility::VisibilityRange { start_margin: start - 1.0..start, end_margin: end..end + 1.0, use_aabb: false };
                 let e = commands
-                    .spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(h), m.aabb, m.shadow, Transform::from_translation(m.origin), ChildOf(job.parent), p2::PropMesh))
+                    .spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(h), m.aabb, Transform::from_translation(m.origin), ChildOf(job.parent), p2::PropMesh))
                     .id();
+                // P8 cell shadows: chunks of small placements (largest under SMALL_CASTER_RADIUS, as single props) and
+                // non-final LOD levels never cast; the rest cast through ShadowLod. `FH1_BATCH_SMALL_NOCAST=0` = small
+                // chunks cast via ShadowLod's own 1.5 m / 80 m rule (before).
+                let small = small_casters_off() && batch_small_nocast() && m.shadow.max_radius < SMALL_CASTER_RADIUS;
+                if !m.casts || small {
+                    commands.entity(e).insert(bevy::light::NotShadowCaster);
+                } else {
+                    commands.entity(e).insert(m.shadow);
+                }
                 if start > 0.0 || end < 1.0e7 {
                     commands.entity(e).insert(range);
                 }
