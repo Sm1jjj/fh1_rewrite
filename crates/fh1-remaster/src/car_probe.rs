@@ -196,6 +196,9 @@ struct ProbeState {
     remove: Vec<Entity>,
     /// The slots' `LightProbe` falloff (inserted with each env map).
     falloff: Vec3,
+    /// Face camera target and the current face size (resized by the quality preset).
+    target: Handle<Image>,
+    size: u32,
 }
 
 /// Crossfade time (s); 0 = instant swap (before 2026-10-08).
@@ -272,6 +275,8 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut state: R
     commands.insert_resource(CarProbeCube(cube));
     // The camera's own output target (small, unused): the scene is taken from its main texture by the blit.
     let target = images.add(Image::new_target_texture(size, size, FORMAT, None));
+    state.target = target.clone();
+    state.size = size;
     commands.spawn((
         Name::new("fh1_remaster car probe face"),
         Camera3d::default(),
@@ -325,6 +330,8 @@ fn drive(
     mut face: Query<(Entity, &mut CarProbeFace, &mut bevy::camera::visibility::RenderLayers, &mut Transform, &mut GlobalTransform, &mut Projection, &mut Camera), Without<CarProbe>>,
     mut probe: Query<(Entity, &CarProbe, &mut Transform, Option<&mut EnvironmentMapLight>, &mut GlobalTransform), (Without<CarProbeFace>, Without<CarProbeFilter>)>,
     mut filters: Query<(Entity, &mut CarProbeFilter, Option<&EnvironmentMapLight>), Without<CarProbe>>,
+    quality: Option<Res<fh1_render::quality::GraphicsQuality>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let (Some(cube), Some((car, car_children))) = (cube, anchors.iter().next()) else { return };
     let Ok((face_e, mut f, mut layers, mut ft, mut fg, mut proj, mut cam)) = face.single_mut() else { return };
@@ -337,9 +344,13 @@ fn drive(
     let v = speed.0.map_or(0.0, |p| (car_pos - p).length() / dt).min(150.0);
     speed.0 = Some(car_pos);
     speed.1 += (v - speed.1) * (1.0 - (-dt / 0.5).exp());
+    // Options > Graphics > Quality (fh1-render quality.rs): probe_interval_s = the minimum gap between bakes (High 0.25 =
+    // FH1_RM_CAR_PROBE_GAP's old default); the moving / parked intervals scale with it (High 1 / 4 s = the old defaults).
+    // The FH1_RM_CAR_PROBE_* variables, when set, win.
+    let q_gap = quality.as_ref().map_or(0.25, |q| q.probe_interval_s.max(0.05));
     let every = {
-        let fast = env_f32("FH1_RM_CAR_PROBE_EVERY", 1.0);
-        let slow = env_f32("FH1_RM_CAR_PROBE_EVERY_PARKED", 4.0).max(fast);
+        let fast = env_f32("FH1_RM_CAR_PROBE_EVERY", 4.0 * q_gap);
+        let slow = env_f32("FH1_RM_CAR_PROBE_EVERY_PARKED", 16.0 * q_gap).max(fast);
         slow + (fast - slow) * (speed.1 / 10.0).clamp(0.0, 1.0)
     };
     let boxed = probe_box();
@@ -403,8 +414,22 @@ fn drive(
             let due = state.last_bake.is_none_or(|(t, p)| {
                 let age = now - t;
                 age >= every
-                    || (age >= env_f32("FH1_RM_CAR_PROBE_GAP", 0.25) && p.distance(car_pos) > env_f32("FH1_RM_CAR_PROBE_DIST", 10.0))
+                    || (age >= env_f32("FH1_RM_CAR_PROBE_GAP", q_gap) && p.distance(car_pos) > env_f32("FH1_RM_CAR_PROBE_DIST", 10.0))
             });
+            // Face size from the preset (FH1_RM_CAR_PROBE_RES wins): resized in place between bakes (no fade running), so
+            // the cube / target handles and every bind group naming them stay; the next bake fills the new size.
+            if let (Some(q), Err(_), None) = (quality.as_ref(), std::env::var("FH1_RM_CAR_PROBE_RES"), state.fade) {
+                let want = q.probe_res.next_power_of_two().clamp(32, 512);
+                if want != state.size {
+                    state.size = want;
+                    if let Some(mut c) = images.get_mut(&cube.0) {
+                        c.resize(Extent3d { width: want, height: want, depth_or_array_layers: 6 });
+                    }
+                    if let Some(mut t) = images.get_mut(&state.target) {
+                        t.resize(Extent3d { width: want, height: want, depth_or_array_layers: 1 });
+                    }
+                }
+            }
             // Dusk (sun sunk below the horizon by light.rs's twilight, moon not up): the face camera has no atmosphere, so
             // nothing takes the below-horizon sun's ~1e5 lx off walls facing it; the cube blew the car and the ground
             // around it to white at 20:00 (7x the faithful luma). Drop the probe's env (the camera's atmosphere env

@@ -36,7 +36,7 @@
 use bevy::camera::Exposure;
 use bevy::color::Mix;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::light::cascade::{CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades};
+use bevy::light::cascade::{Cascade, CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades};
 use bevy::light::{AtmosphereEnvironmentMapLight, DirectionalLightShadowMap, EnvironmentMapLight, SimulationLightSystems, SunDisk};
 use bevy::light::ShadowFilteringMethod;
 use bevy::pbr::AtmosphereSettings;
@@ -107,9 +107,18 @@ impl Plugin for RemasterLightPlugin {
             .add_systems(Update, main_only_light_layers)
             .add_systems(Update, (setup_camera, sky::update_sky, env_refresh.after(setup_camera)))
             .add_systems(Update, game_shader_casters)
+            .add_systems(Update, apply_quality)
             .add_systems(PostUpdate, game_fog.after(update_lights))
             .add_systems(PostUpdate, update_lights.before(bevy::transform::TransformSystems::Propagate))
-            .add_systems(PostUpdate, main_view_cascades_only.after(SimulationLightSystems::UpdateDirectionalLightCascades).before(SimulationLightSystems::UpdateLightFrusta));
+            .insert_resource(bevy::pbr::DirectionalShadowCache::default())
+            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<bevy::pbr::DirectionalShadowCache>::default())
+            .add_systems(
+                PostUpdate,
+                (main_view_cascades_only, cache_far_cascade)
+                    .chain()
+                    .after(SimulationLightSystems::UpdateDirectionalLightCascades)
+                    .before(SimulationLightSystems::UpdateLightFrusta),
+            );
         crate::post::plugin(app);
         crate::night::plugin(app);
     }
@@ -138,14 +147,42 @@ fn main_only_light_layers(mut commands: Commands, lights: Query<Entity, (With<Di
     }
 }
 
+/// Options > Graphics > Quality (fh1-render quality.rs): shadow map size and cascade count, applied when the preset
+/// changes. FH1_RM_SHADOW_RES / FH1_RM_CASCADES, when set, win over the preset. High = 1024 / 3 = the old defaults.
+fn apply_quality(
+    quality: Option<Res<fh1_render::quality::GraphicsQuality>>,
+    mut map: ResMut<DirectionalLightShadowMap>,
+    mut lights: Query<&mut CascadeShadowConfig, With<DirectionalLight>>,
+) {
+    let Some(q) = quality.filter(|q| q.is_changed()) else { return };
+    if std::env::var("FH1_RM_SHADOW_RES").is_err() {
+        let size = q.shadow_res.next_power_of_two().clamp(512, 8192) as usize;
+        if map.size != size {
+            map.size = size;
+        }
+    }
+    if std::env::var("FH1_RM_CASCADES").is_err() {
+        let n = (q.cascades as usize).clamp(1, 4);
+        for mut c in &mut lights {
+            if c.bounds.len() != n {
+                *c = cascade_config_n(n);
+            }
+        }
+    }
+}
+
 /// FH1_RM_CONTACT_SHADOWS=0 = off (module doc).
 fn contact_shadows_on() -> bool {
     std::env::var("FH1_RM_CONTACT_SHADOWS").map_or(true, |v| v != "0")
 }
 
 fn cascade_config() -> CascadeShadowConfig {
+    cascade_config_n(env_f32("FH1_RM_CASCADES", 3.0) as usize)
+}
+
+fn cascade_config_n(n: usize) -> CascadeShadowConfig {
     CascadeShadowConfigBuilder {
-        num_cascades: env_f32("FH1_RM_CASCADES", 3.0).clamp(1.0, 4.0) as usize,
+        num_cascades: n.clamp(1, 4),
         minimum_distance: 0.1,
         // A small first cascade around the camera: the player car (chase cam ~5-7 m away) gets most of its 1024² texels
         // (~1 cm/texel); only near geometry is drawn into it. FH1_RM_SHADOW_NEAR=m.
@@ -192,7 +229,9 @@ fn setup_camera(mut commands: Commands, cams: Query<Entity, (With<FxPostCamera>,
         let bloom = std::env::var("FH1_RM_BLOOM").ok();
         if bloom.as_deref() != Some("0") {
             let intensity = bloom.and_then(|v| v.parse().ok()).unwrap_or(0.12);
-            c.insert(Bloom { intensity, ..Bloom::NATURAL });
+            // P8-B: 256 px top mip (Bevy 512; 15's GPU analysis). FH1_RM_BLOOM_MIP=n, 512 = old.
+            let mip = std::env::var("FH1_RM_BLOOM_MIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(256).clamp(64, 2048);
+            c.insert(Bloom { intensity, max_mip_dimension: mip, ..Bloom::NATURAL });
         }
         if atmosphere_on() {
             // Smaller LUTs than Bevy's defaults (they are rebuilt every frame): the sky is smooth, the haze low-frequency.
@@ -441,6 +480,147 @@ fn main_view_cascades_only(
                 }
             }
         }
+    }
+}
+
+/// Far cascade caching (P8-B, docs/PERF.md; needs the vendored bevy_pbr patch, vendor/bevy_pbr/FH1_PATCHES.md).
+/// The last cascade of the main view is drawn on a refresh frame with matrices fitted to Bevy's own cascade grown by
+/// FH1_RM_CASCADE_CACHE_MARGIN (0.15 = 15 % wider and deeper, texel-snapped), and then kept: the same matrices are put
+/// back every frame and bevy_pbr skips that cascade's clear + draws (`DirectionalShadowCache::skip_mask`), so the
+/// shadow map holds the refresh frame's depth. A refresh comes when Bevy's fresh cascade no longer fits inside the kept
+/// one (camera moved / turned), the light turned > 0.05 deg (TOD clock), after FH1_RM_CASCADE_CACHE_FRAMES frames (4),
+/// or when the light, cascade count or map size changed. Nearer cascades render every frame.
+/// `FH1_RM_CASCADE_CACHE=0` = off (every cascade every frame, Bevy's matrices).
+#[derive(Default)]
+struct FarCascadeCache {
+    light: Option<Entity>,
+    count: usize,
+    map_size: usize,
+    light_rot: Mat3,
+    kept: Option<Cascade>,
+    /// Kept cascade in light space: centre (x, y), near-plane z, depth range, diameter.
+    centre: Vec2,
+    near: f32,
+    depth: f32,
+    diameter: f32,
+    age: u32,
+}
+
+fn cascade_cache_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !flag_off("FH1_RM_CASCADE_CACHE"))
+}
+
+/// Light-space parameters of a Bevy cascade (bevy_light cascade.rs `calculate_cascade`): rotation (world from light),
+/// near-plane centre (light space), depth range, diameter.
+fn cascade_params(c: &Cascade) -> (Mat3, Vec3, f32, f32) {
+    let rot = Mat3::from_mat4(c.world_from_cascade);
+    let centre = rot.transpose() * c.world_from_cascade.w_axis.truncate();
+    let depth = 1.0 / c.clip_from_cascade.z_axis.z.max(1e-12);
+    let diameter = 2.0 / c.clip_from_cascade.x_axis.x.max(1e-12);
+    (rot, centre, depth, diameter)
+}
+
+/// A cascade built like Bevy's from light-space parameters (same matrix forms, reverse Z).
+fn build_cascade(rot: Mat3, centre: Vec3, depth: f32, diameter: f32, texel: f32) -> Cascade {
+    let wfl = Mat4::from_mat3(rot);
+    let t = wfl.transpose();
+    let cascade_from_world = Mat4::from_cols(t.x_axis, t.y_axis, t.z_axis, (-centre).extend(1.0));
+    let world_from_cascade = Mat4::from_cols(wfl.x_axis, wfl.y_axis, wfl.z_axis, wfl * centre.extend(1.0));
+    let clip_from_cascade = Mat4::from_cols(
+        Vec4::new(2.0 / diameter, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 2.0 / diameter, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, 1.0 / depth, 0.0),
+        Vec4::new(0.0, 0.0, 1.0, 1.0),
+    );
+    Cascade { world_from_cascade, clip_from_cascade, clip_from_world: clip_from_cascade * cascade_from_world, texel_size: texel }
+}
+
+#[allow(clippy::type_complexity)]
+fn cache_far_cascade(
+    main: Query<Entity, With<RemasterView>>,
+    mut lights: Query<(Entity, &DirectionalLight, &mut Cascades)>,
+    map: Res<DirectionalLightShadowMap>,
+    mut cache: ResMut<bevy::pbr::DirectionalShadowCache>,
+    mut st: Local<FarCascadeCache>,
+) {
+    let off = |cache: &mut bevy::pbr::DirectionalShadowCache| {
+        if cache.enabled || cache.skip_mask != 0 {
+            cache.enabled = cascade_cache_on();
+            cache.skip_mask = 0;
+        }
+    };
+    if !cascade_cache_on() {
+        off(&mut *cache);
+        return;
+    }
+    if !cache.enabled {
+        cache.enabled = true;
+    }
+    let Some(cam) = main.iter().next() else {
+        off(&mut *cache);
+        return;
+    };
+    let Some((light, mut cascades)) = lights.iter_mut().find(|(_, l, c)| l.shadow_maps_enabled && c.cascades.get(&cam).is_some_and(|v| !v.is_empty())).map(|(e, _, c)| (e, c)) else {
+        *st = FarCascadeCache::default();
+        cache.skip_mask = 0;
+        return;
+    };
+    let Some(list) = cascades.cascades.get_mut(&cam) else { return };
+    let n = list.len();
+    if n < 2 {
+        *st = FarCascadeCache::default();
+        cache.skip_mask = 0;
+        return;
+    }
+    let k = n - 1;
+    let (rot, fresh_centre, fresh_depth, fresh_d) = cascade_params(&list[k]);
+    let size = map.size.max(1);
+    let fresh_texel = fresh_d / size as f32;
+    let max_frames = env_f32("FH1_RM_CASCADE_CACHE_FRAMES", 4.0).max(1.0) as u32;
+    let fits = st.kept.is_some() && {
+        let half = 0.5 * st.diameter;
+        let d = (fresh_centre.truncate() - st.centre).abs();
+        d.x + 0.5 * fresh_d + fresh_texel <= half
+            && d.y + 0.5 * fresh_d + fresh_texel <= half
+            && fresh_centre.z <= st.near
+            && fresh_centre.z - fresh_depth >= st.near - st.depth
+    };
+    let refresh = !fits
+        || st.light != Some(light)
+        || st.count != n
+        || st.map_size != size
+        || st.light_rot.z_axis.dot(rot.z_axis) < 0.05f32.to_radians().cos()
+        || st.light_rot.x_axis.dot(rot.x_axis) < 0.05f32.to_radians().cos()
+        || st.age + 1 >= max_frames;
+    if refresh {
+        let margin = env_f32("FH1_RM_CASCADE_CACHE_MARGIN", 0.15).clamp(0.0, 1.0);
+        let diameter = (fresh_d * (1.0 + margin)).ceil();
+        let texel = diameter / size as f32;
+        let centre = (fresh_centre.truncate() / texel).floor() * texel;
+        let pad = 0.5 * margin * fresh_d;
+        let near = fresh_centre.z + pad;
+        let depth = fresh_depth + 2.0 * pad;
+        *st = FarCascadeCache {
+            light: Some(light),
+            count: n,
+            map_size: size,
+            light_rot: rot,
+            kept: Some(build_cascade(rot, centre.extend(near), depth, diameter, texel)),
+            centre,
+            near,
+            depth,
+            diameter,
+            age: 0,
+        };
+        cache.skip_mask = 0;
+    } else {
+        // Same rotation as the kept one (within the 0.05 deg refresh threshold).
+        st.age += 1;
+        cache.skip_mask = 1 << k;
+    }
+    if let Some(kept) = &st.kept {
+        list[k] = kept.clone();
     }
 }
 

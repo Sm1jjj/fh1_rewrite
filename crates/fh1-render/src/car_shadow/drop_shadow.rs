@@ -286,7 +286,19 @@ struct DropShadowState {
     /// Inputs of the last silhouette image (redrawn when they change).
     key: Option<[i32; 9]>,
     settings: DropShadowSettings,
+    /// The ground fan entity, and whether the distance cull hides it.
+    fan: Entity,
+    far: bool,
 }
+
+/// Drop shadows of cars farther than this from the main camera (m) are hidden and not updated (P8-B: traffic / AI cars
+/// rewrote their fan mesh, and their silhouette when the suspension moved, every frame at any distance; a 64² contact
+/// shadow is a few pixels there). `FH1_DROPSHADOW_DIST=m` (80), 0 = old (always). 10 m hysteresis.
+fn cull_dist() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_DROPSHADOW_DIST").ok().and_then(|v| v.parse().ok()).unwrap_or(80.0))
+}
+const CULL_HYSTERESIS: f32 = 10.0;
 
 /// Find the entity with [`FxDropShadow`] above `e`.
 fn car_of(mut e: Entity, parents: &Query<&ChildOf>, cars: &Query<(), With<FxDropShadow>>) -> Option<Entity> {
@@ -376,14 +388,17 @@ fn collect_silhouettes(
         let image = images.add(img);
         let mesh = mesh_assets.add(fan_mesh());
         let material = materials.add(DropShadowMaterial { texture: image.clone(), params: DropShadowParams::default() });
-        commands.spawn((
-            Mesh3d(mesh.clone()),
-            MeshMaterial3d(material.clone()),
-            Transform::IDENTITY,
-            NoFrustumCulling,
-            NotShadowCaster,
-            ChildOf(car),
-        ));
+        let fan = commands
+            .spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                Transform::IDENTITY,
+                Visibility::Inherited,
+                NoFrustumCulling,
+                NotShadowCaster,
+                ChildOf(car),
+            ))
+            .id();
         commands.entity(car).insert(DropShadowState {
             tris,
             min: lo,
@@ -396,6 +411,8 @@ fn collect_silhouettes(
             alpha: [0.0; 4],
             key: None,
             settings,
+            fan,
+            far: false,
         });
     }
 }
@@ -484,11 +501,30 @@ fn update_drop_shadows(
     lib: Option<Res<crate::FxLibrary>>,
     globals: Option<Res<crate::FxGlobals>>,
     car_globals: Option<Res<crate::FxCarGlobals>>,
+    cams: Query<&GlobalTransform, With<crate::post::FxPostCamera>>,
+    mut vis: Query<&mut Visibility>,
 ) {
     let dt = time.delta_secs().min(0.1);
     let raw = lib.is_some_and(|l| l.raw_output);
+    let dist = cull_dist();
+    let eye = cams.iter().next().map(|t| t.translation());
     for (input, gt, mut s) in &mut cars {
         let s = &mut *s;
+        if let (true, Some(eye)) = (dist > 0.0, eye) {
+            let d = eye.distance(gt.translation());
+            let far = if s.far { d > dist - CULL_HYSTERESIS } else { d > dist };
+            if far != s.far {
+                s.far = far;
+                if let Ok(mut v) = vis.get_mut(s.fan) {
+                    *v = if far { Visibility::Hidden } else { Visibility::Inherited };
+                }
+            }
+            if far {
+                // Redrawn from the current inputs when it comes back.
+                s.key = None;
+                continue;
+            }
+        }
         if s.dirty {
             s.mask = build_mask(&s.tris, s.min.xz(), s.max.xz());
             s.dirty = false;
