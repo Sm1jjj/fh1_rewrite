@@ -38,6 +38,9 @@ struct CarAudioState {
     others: [OtherSlot; MAX_VOICES],
     loaded_tx: Sender<(usize, Entity, Option<CarSound>)>,
     loaded_rx: Mutex<Receiver<(usize, Entity, Option<CarSound>)>>,
+    /// The player car's sound, loaded on a worker thread: (media name, sound).
+    player_tx: Sender<(String, Option<CarSound>)>,
+    player_rx: Mutex<Receiver<(String, Option<CarSound>)>>,
     /// Media name of the car being played.
     car: String,
     /// Tyre group by world surface id (filled lazily).
@@ -78,7 +81,10 @@ fn start_audio(mut commands: Commands, garage: Res<Garage>) {
                 fh1_audio::output::device_names()
             );
             let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+            let (player_tx, player_rx) = std::sync::mpsc::channel();
             commands.insert_resource(CarAudioState {
+                player_tx,
+                player_rx: Mutex::new(player_rx),
                 player,
                 lib: Arc::new(lib),
                 others: Default::default(),
@@ -93,6 +99,12 @@ fn start_audio(mut commands: Commands, garage: Res<Garage>) {
     }
 }
 
+/// FH1_AUDIO_ASYNC_PLAYER=0: the player car's sound loads inside the frame (old).
+fn player_sound_async() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("FH1_AUDIO_ASYNC_PLAYER").is_ok_and(|v| v == "0"))
+}
+
 fn feed_audio(
     audio: Option<ResMut<CarAudioState>>,
     cars: Query<&Car>,
@@ -101,7 +113,8 @@ fn feed_audio(
     rig: Res<CameraRig>,
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
-    virt: Res<Time<Virtual>>,
+    virt: Res<Time<Virtual>>,
+
 ) {
     let _watch = crate::perf::watch("feed_audio");
     let Some(mut audio) = audio else { return };
@@ -115,11 +128,28 @@ fn feed_audio(
     };
     if audio.car != v.data.sound {
         audio.car = v.data.sound.clone();
-        let sound = CarSound::new(&audio.lib, &audio.car);
-        if let Err(e) = &sound {
-            warn!("audio: {}: {e:#}", audio.car);
+        if player_sound_async() {
+            // 2026-10-08: the synchronous bank load (hundreds of WAV reads) held the main thread for 21 s on a map load
+            // (stall report 20261008_132621, main in feed_audio). The old car keeps playing until the new one is ready.
+            let (lib, tx, name) = (audio.lib.clone(), audio.player_tx.clone(), audio.car.clone());
+            let _ = std::thread::Builder::new().name("fh1-audio-load".into()).spawn(move || {
+                let sound = CarSound::new(&lib, &name).map_err(|e| warn!("audio: {name}: {e:#}")).ok();
+                let _ = tx.send((name, sound));
+            });
+        } else {
+            let sound = CarSound::new(&audio.lib, &audio.car);
+            if let Err(e) = &sound {
+                warn!("audio: {}: {e:#}", audio.car);
+            }
+            audio.player.set_sound(sound.ok());
         }
-        audio.player.set_sound(sound.ok());
+    }
+    let ready: Vec<_> = audio.player_rx.lock().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+    for (name, sound) in ready {
+        // A load for a car switched away from in the meantime is dropped.
+        if name == audio.car {
+            audio.player.set_sound(sound);
+        }
     }
     if audio.groups.is_empty() {
         if let Some(world) = &track.world {
@@ -214,7 +244,8 @@ fn feed_other_cars(
     cam: Query<&GlobalTransform, With<fh1_render::post::FxPostCamera>>,
     settings: Res<Settings>,
     virt: Res<Time<Virtual>>,
-    time: Res<Time<Real>>,
+    time: Res<Time<Real>>,
+
     mut last_cam: Local<Option<Vec3>>,
 ) {
     let _watch = crate::perf::watch("feed_other_cars");

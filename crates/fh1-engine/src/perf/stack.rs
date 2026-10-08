@@ -197,9 +197,14 @@ mod imp {
             if GetThreadTimes(h, &mut c, &mut x, &mut k, &mut u) != 0 {
                 cpu = k + u;
             }
-            let mut ctx: CONTEXT = std::mem::zeroed();
+            // GetThreadContext needs a 16-byte aligned CONTEXT on x64; windows-sys declares it plain repr(C), so an
+            // unaligned one made every call fail and every stall report came out without frames (2026-10-08).
+            #[repr(C, align(16))]
+            struct Aligned(CONTEXT);
+            let mut aligned: Aligned = std::mem::zeroed();
+            let ctx = &mut aligned.0;
             ctx.ContextFlags = 0x0010_000B; // CONTEXT_FULL (AMD64)
-            if GetThreadContext(h, &mut ctx) != 0 {
+            if GetThreadContext(h, ctx) != 0 {
                 while n < MAX && ctx.Rip != 0 {
                     out[n] = ctx.Rip;
                     n += 1;
@@ -215,7 +220,7 @@ mod imp {
                     } else {
                         let mut data = std::ptr::null_mut();
                         let mut frame = 0u64;
-                        RtlVirtualUnwind(0, base, ctx.Rip, f, &mut ctx, &mut data, &mut frame, std::ptr::null_mut());
+                        RtlVirtualUnwind(0, base, ctx.Rip, f, ctx, &mut data, &mut frame, std::ptr::null_mut());
                     }
                 }
             }
