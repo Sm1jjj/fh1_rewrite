@@ -421,6 +421,11 @@ pub struct Boost {
     /// rpm / `redline_rpm` (INFERRED input; the game's 82D230B8 SC factor input isn't re-derived) instead of by power.
     pub supercharger: bool,
     pub redline_rpm: f32,
+    /// The row's raw scales (turbo MinScale / MaxScale, SC ZeroRPMScale / RedlineRPMScale): the boost pressure range
+    /// (docs/DRIVETRAIN.md "Turbo spool": hi psi = (2 x scale - 1) x 14.7) and the turbo's MomentInertia (lag = x 0.01 s).
+    pub raw_lo: f32,
+    pub raw_hi: f32,
+    pub inertia: f32,
 }
 
 impl Boost {
@@ -433,6 +438,27 @@ impl Boost {
             ((hp - self.power_min_hp) / (self.power_max_hp - self.power_min_hp)).clamp(0.0, 1.0)
         };
         self.min_scale + (self.max_scale - self.min_scale) * x
+    }
+
+    /// Full-throttle steady boost factor before drop-off under the game's spool (docs/DRIVETRAIN.md "Turbo spool"): turbo =
+    /// the fixed point of lerp(Min', Max') over BOOSTED power (`t` = unboosted torque N·m); supercharger = its pressure
+    /// lerp over rpm / redline mapped back to the factor.
+    pub fn steady(&self, t: f32, rpm: f32) -> f32 {
+        const LO: f32 = 3.675;
+        if self.supercharger {
+            let (plo, phi) = ((2.0 * self.raw_lo - 1.0) * 14.7, (2.0 * self.raw_hi - 1.0) * 14.7);
+            let p = plo + (phi - plo) * (rpm / self.redline_rpm.max(1.0)).clamp(0.0, 1.0);
+            let y = ((p - LO) / (phi - LO).max(1e-3)).clamp(0.0, 1.0);
+            let min = self.min_scale.min(1.0);
+            return min + (self.max_scale - min) * y;
+        }
+        let mut f = self.min_scale;
+        for _ in 0..8 {
+            let hp = t * f * rpm * std::f32::consts::TAU / 60.0 / 745.7;
+            let x = ((hp - self.power_min_hp) / (self.power_max_hp - self.power_min_hp).max(1e-3)).clamp(0.0, 1.0);
+            f = self.min_scale + (self.max_scale - self.min_scale) * x;
+        }
+        f
     }
 
     pub fn dropoff(&self, rpm: f32) -> f32 {
@@ -616,6 +642,12 @@ fn aero_elements(p: &Value) -> (f32, f32, f32) {
     (df + dr, ff, fr)
 }
 
+/// FH1_TURBO_GAME=0: the old boost rules (also vehicle/drivetrain.rs).
+pub fn turbo_game_rules() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_TURBO_GAME").map_or(true, |v| v != "0"))
+}
+
 /// Aspiration tables in the game's priority order (82BF4FB0): only the first fitted one is kept.
 pub const ASPIRATION: [&str; 6] = [
     "List_UpgradeEngineTurboSingle",
@@ -793,6 +825,9 @@ impl CarData {
                     spool_time: if sc { 0.05 } else { f(t, "MomentInertia").unwrap_or(30.0) / 30.0 },
                     supercharger: sc,
                     redline_rpm: redline_for_sc,
+                    raw_lo: if sc { f(t, "ZeroRPMScale")? } else { f(t, "MinScale")? },
+                    raw_hi: if sc { f(t, "RedlineRPMScale")? } else { f(t, "MaxScale")? },
+                    inertia: f(t, "MomentInertia").unwrap_or(30.0),
                 })
             })
             .transpose()?
@@ -926,6 +961,10 @@ impl CarData {
     pub fn boosted_torque_at(&self, rpm: f32) -> f32 {
         let t = self.torque_at(rpm);
         match self.boost {
+            Some(b) if turbo_game_rules() => {
+                let f = b.steady(t, rpm);
+                t * if f > 1.0 { 1.0 + (f - 1.0) * b.dropoff(rpm) } else { f }
+            }
             Some(b) => t * b.target(t, rpm) * b.dropoff(rpm),
             None => t,
         }

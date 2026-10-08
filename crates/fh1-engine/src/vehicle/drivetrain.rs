@@ -21,6 +21,12 @@ pub struct DrivetrainState {
     pub(super) launch_done: bool,
     /// Normal-play launch: seconds spent launching since it was armed (the game's car+0x16F4 blend, see `launch_target`).
     pub(super) launch_t: f32,
+    /// Boost state (docs/DRIVETRAIN.md "Turbo spool", 82D2B920 / 82D20538): lagged engine power (hp, car+0xC34), boost
+    /// pressure (psi, car+0xC3C / SC +0xC44), the blow-off latch (car+0xC40) and the last tick's engine power (hp, car+0xC60).
+    pub(super) turbo_power: f32,
+    pub(super) boost_psi: f32,
+    pub(super) blowoff: bool,
+    pub(super) engine_power: f32,
 }
 
 impl DrivetrainState {
@@ -145,11 +151,57 @@ impl Vehicle {
 
         s.shift_timer = (s.shift_timer - dt).max(0.0);
         let base = d.torque_at(self.rpm);
+        let game_boost = turbo_game();
         if let Some(b) = d.boost {
-            let target = b.min_scale + (b.target(base, self.rpm) - b.min_scale) * throttle;
-            self.boost += (target - self.boost) * (dt / b.spool_time.max(0.05)).min(1.0);
+            if game_boost {
+                // The game's spool (82D2B920; docs/DRIVETRAIN.md "Turbo spool", VERIFIED from the xex): the last tick's
+                // ACTUAL (boosted) engine power, lagged by tau = MomentInertia x 0.01 s, sets a pressure target between
+                // 3.675 psi and (2 MaxScale - 1) x 14.7 psi over PowerMin..PowerMax hp; the pressure follows at 15/s and
+                // the factor is lerp(Min', Max') by pressure. Throttle < 0.01 latches the blow-off (target power 0,
+                // pressure 3.675) until > 0.05. Superchargers (82D20538): pressure from rpm / redline x throttle, same 15/s.
+                let lo = BOOST_PSI_LO;
+                if b.supercharger {
+                    let (plo, phi) = ((2.0 * b.raw_lo - 1.0) * 14.7, (2.0 * b.raw_hi - 1.0) * 14.7);
+                    let p_rpm = plo + (phi - plo) * (self.rpm / b.redline_rpm.max(1.0)).clamp(0.0, 1.0);
+                    let target = lo + (p_rpm - lo) * throttle.clamp(0.0, 1.0);
+                    s.boost_psi += (target - s.boost_psi) * (BOOST_PSI_RATE * dt).min(1.0);
+                    let y = ((s.boost_psi - lo) / (phi - lo).max(1e-3)).clamp(0.0, 1.0);
+                    let min = b.min_scale.min(1.0);
+                    self.boost = min + (b.max_scale - min) * y;
+                } else {
+                    if throttle < 0.01 {
+                        s.blowoff = true;
+                    } else if throttle > 0.05 {
+                        s.blowoff = false;
+                    }
+                    let p_star = if s.blowoff { 0.0 } else { s.engine_power.clamp(10.0, 1000.0) };
+                    let tau = (b.inertia * 0.01).max(1e-3);
+                    s.turbo_power = (s.turbo_power + (p_star - s.turbo_power) * (dt / tau).min(1.0)).clamp(0.0, b.power_max_hp.max(0.0));
+                    let hi = (2.0 * b.raw_hi - 1.0) * 14.7;
+                    let x = ((s.turbo_power - b.power_min_hp) / (b.power_max_hp - b.power_min_hp).max(1e-3)).clamp(0.0, 1.0);
+                    let target = if s.blowoff { lo } else { lo + (hi - lo) * x };
+                    s.boost_psi += (target - s.boost_psi) * (BOOST_PSI_RATE * dt).min(1.0);
+                    let y = ((s.boost_psi - lo) / (hi - lo).max(1e-3)).clamp(0.0, 1.0);
+                    self.boost = b.min_scale + (b.max_scale - b.min_scale) * y;
+                }
+            } else {
+                let target = b.min_scale + (b.target(base, self.rpm) - b.min_scale) * throttle;
+                self.boost += (target - self.boost) * (dt / b.spool_time.max(0.05)).min(1.0);
+            }
         }
-        let dropoff = d.boost.map(|b| b.dropoff(self.rpm)).unwrap_or(1.0);
+        // Drop-off: the game shrinks only the boost part, b = 1 + (b - 1) x lerp(scale) (82D230B8); the old rule scaled the
+        // whole torque.
+        let dropoff = match d.boost {
+            Some(b) if game_boost => {
+                if self.boost > 1.0 {
+                    (1.0 + (self.boost - 1.0) * b.dropoff(self.rpm)) / self.boost
+                } else {
+                    1.0
+                }
+            }
+            Some(b) => b.dropoff(self.rpm),
+            None => 1.0,
+        };
         let mut engine_torque = if engine_drag_mode() {
             // The game's engine torque (82D23380; docs/DRIVETRAIN.md "Engine torque", VERIFIED live to 0.005 hN·m):
             // T = a(ω) + t·(b(ω)·k − a(ω)), a = zero-throttle drag (engine braking), b = the full-throttle curve (x boost),
@@ -173,6 +225,8 @@ impl Vehicle {
             // Old engine braking (FH1_ENGINE_DRAG=0): 15% of peak torque scaled by rpm.
             engine_torque = -0.15 * d.torque_scale * (self.rpm / d.redline_rpm);
         }
+        // The turbo's next power target (car+0xC60 = T_e x omega of this tick).
+        s.engine_power = engine_torque.max(0.0) * s.engine_omega / 745.7;
         // Manual gearbox (Shifting assist Manual / Manual with clutch): the driver's requests, taken when no shift is in
         // progress; with the clutch variant only while the pedal is down. Reverse sits below 1st and is refused above
         // MaxForwardVelShiftReverseMPH (15 mph, PhysicsSettings.ini); a downshift that would put the engine past the rev
@@ -487,6 +541,16 @@ fn awd_radius() -> bool {
 const REV_CUT_TIME: f32 = 0.04;
 
 /// `FH1_ENGINE_DRAG=0`: the old engine model (torque 0 at the limiter, stopgap engine braking), as before 2026-10-07.
+/// Boost pressure floor (psi, 82236BC8 = 14.7 / 4) and the pressure's follow rate (1/s, 82236910).
+const BOOST_PSI_LO: f32 = 3.675;
+const BOOST_PSI_RATE: f32 = 15.0;
+
+/// FH1_TURBO_GAME=0: the old boost (unboosted power target, MomentInertia / 30 s lag, drop-off on the whole torque).
+fn turbo_game() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_TURBO_GAME").map_or(true, |v| v != "0"))
+}
+
 fn engine_drag_mode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FH1_ENGINE_DRAG").map_or(true, |v| v != "0"))

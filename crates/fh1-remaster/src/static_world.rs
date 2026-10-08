@@ -312,7 +312,8 @@ pub fn plugin(app: &mut App) {
     if !on() {
         return;
     }
-    info!("static world: ON (P12 chunk 2: scenery drawn from the GPU arena, no culling yet, no scenery shadows)");
+    info!("static world: ON (P12: scenery drawn from the GPU arena, GPU-culled per view, shadows + car probe)");
+    draw::register_shaders(app);
     app.add_systems(Last, (free_geometry, log_stats)).add_systems(PostUpdate, sync_visibility.after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate));
     if let Some(ra) = app.get_sub_app_mut(RenderApp) {
         ra.init_resource::<Arena>().add_systems(Render, apply_ops.in_set(RenderSystems::PrepareResources));
