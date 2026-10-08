@@ -671,7 +671,8 @@ pub type MergeTask = bevy::tasks::Task<Vec<(MergeKey, Merged)>>;
 impl PropMerge {
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        crate::enabled() && *ON.get_or_init(|| std::env::var("FH1_BATCH").as_deref() != Ok("0"))
+        // The static world (P12) draws every placement itself: no merged chunks there.
+        crate::enabled() && !crate::static_world::on() && *ON.get_or_init(|| std::env::var("FH1_BATCH").as_deref() != Ok("0"))
     }
 
     /// A loaded template: its CPU parts when all of them have remaster materials, `None` = not mergeable.

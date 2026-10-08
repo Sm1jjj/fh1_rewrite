@@ -1,0 +1,510 @@
+//! P12 static world (docs/PERF.md "P12 static world"; opt-in `FH1_STATIC_WORLD=1`). Remaster scenery (zone models, tiles,
+//! props) as GPU-resident geometry + draw records instead of ECS meshes, so the per-frame CPU cost no longer scales with the
+//! ~40k scenery entities.
+//!
+//! CHUNK 1 (this file so far): the data side only, drawing still goes through the ECS meshes.
+//! - Geometry: every remaster scenery mesh is packed (vertex pulling, [`VERTEX_WORDS`] words / vertex: position, normal,
+//!   uv0, uv1, uv2, colour) when it is prepared, keyed by its `AssetId<Mesh>`, and freed when that asset goes.
+//! - Instances: a [`StaticInstance`] component on the scenery entity (the entity stays the streaming handle: tiles, LOD
+//!   levels, zone parking and smashing keep working unchanged); its `on_remove` hook frees the record. Zone fades write
+//!   the dither tag through [`set_tag`].
+//! - Main -> render: a global op queue (`Op`), drained each frame by the render world into the [`Arena`]: one vertex
+//!   buffer, one index buffer (first-fit ranges, grown x1.5 with a GPU copy) and a record buffer (one 96-byte
+//!   [`GpuRecord`] per instance slot). Uploads only what changed.
+//! Next chunks: material table + draw (2), GPU cull (3), shadows / probe (4), parity (5).
+
+use bevy::asset::UntypedAssetId;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
+
+use bevy::ecs::lifecycle::HookContext;
+use bevy::ecs::world::DeferredWorld;
+use bevy::mesh::VertexAttributeValues as V;
+use bevy::prelude::*;
+use bevy::render::render_resource::{Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::{Render, RenderApp, RenderSystems};
+
+/// `FH1_STATIC_WORLD=1` (remaster only).
+pub fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::enabled() && std::env::var("FH1_STATIC_WORLD").is_ok_and(|v| v == "1"))
+}
+
+/// Packed vertex: position (3), normal (3), uv0 (2), uv1 (2), uv2 (2) as f32, colour as unorm8x4 = 13 words.
+pub const VERTEX_WORDS: usize = 13;
+
+/// One draw record on the GPU (std430, 96 bytes). `world_from_local` rows (3 x vec4: affine transposed), world bounds with
+/// the LOD band (`lod` = start margin start / end, end margin start / end, m), the draw's ranges and keys.
+#[derive(Clone, Copy, Default, Debug)]
+#[repr(C)]
+pub struct GpuRecord {
+    pub rows: [[f32; 4]; 3],
+    pub aabb_min: [f32; 4],
+    pub aabb_max: [f32; 4],
+    pub lod: [f32; 4],
+    pub first_index: u32,
+    pub index_count: u32,
+    pub base_vertex: u32,
+    /// Material slot (chunk 2; 0 until then).
+    pub material: u32,
+    pub flags: u32,
+    /// Zone fade dither level (-16 gone .. 0 drawn .. 16), as the MeshTag path.
+    pub tag: i32,
+    pub _pad: [u32; 2],
+}
+
+const RECORD_BYTES: u64 = std::mem::size_of::<GpuRecord>() as u64;
+
+/// Record flags.
+pub const FLAG_CASTS: u32 = 1;
+/// Mirrored placement (negative determinant): culling flipped.
+pub const FLAG_MIRRORED: u32 = 2;
+/// The record is live (a freed slot has 0).
+pub const FLAG_LIVE: u32 = 4;
+
+/// What a scenery entity draws (main world): its slot in the record buffer.
+#[derive(Component, Debug)]
+#[component(on_remove = free_instance)]
+pub struct StaticInstance(pub u32);
+
+fn free_instance(world: DeferredWorld, ctx: HookContext) {
+    if let Some(i) = world.get::<StaticInstance>(ctx.entity) {
+        push(Op::RemoveInstance(i.0));
+    }
+}
+
+/// A new instance (main world API).
+pub struct InstanceDesc {
+    pub mesh: AssetId<Mesh>,
+    /// The entity's material (RemasterMaterial asset id, resolved to a table slot by the render world in chunk 2).
+    pub material: UntypedAssetId,
+    pub transform: Mat4,
+    /// Mesh-space bounds.
+    pub local_min: Vec3,
+    pub local_max: Vec3,
+    /// VisibilityRange margins (m): start margin, end margin. `None` = always in range.
+    pub range: Option<(std::ops::Range<f32>, std::ops::Range<f32>)>,
+    pub casts: bool,
+    pub tag: i32,
+}
+
+enum Op {
+    AddGeometry { mesh: AssetId<Mesh>, vertices: Vec<u32>, indices: Vec<u32> },
+    RemoveGeometry(AssetId<Mesh>),
+    AddInstance { slot: u32, mesh: AssetId<Mesh>, material: UntypedAssetId, record: GpuRecord },
+    RemoveInstance(u32),
+    SetTag(u32, i32),
+}
+
+/// Main-world bookkeeping: packed geometry ids and free instance slots.
+#[derive(Default)]
+struct MainState {
+    geometry: std::collections::HashSet<AssetId<Mesh>>,
+    next_slot: u32,
+    free_slots: Vec<u32>,
+    ops: Vec<Op>,
+    stats: Stats,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Stats {
+    pub geometries: u32,
+    pub instances: u32,
+    pub vertex_bytes: u64,
+    pub index_bytes: u64,
+}
+
+static STATE: Mutex<Option<MainState>> = Mutex::new(None);
+
+fn with<R>(f: impl FnOnce(&mut MainState) -> R) -> R {
+    let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(MainState::default))
+}
+
+fn push(op: Op) {
+    with(|s| {
+        if let Op::RemoveInstance(slot) = op {
+            s.free_slots.push(slot);
+            s.stats.instances = s.stats.instances.saturating_sub(1);
+        }
+        s.ops.push(op);
+    });
+}
+
+/// Main-world counters (perf CSV / logs).
+pub fn stats() -> Stats {
+    with(|s| s.stats)
+}
+
+/// A scenery mesh packed for the arena (vertex words + u32 indices).
+pub struct Packed {
+    vertices: Vec<u32>,
+    indices: Vec<u32>,
+}
+
+/// Packs `mesh` (a remaster scenery mesh, `scenery::prepare_mesh` layout) before it goes into `Assets<Mesh>` (its CPU
+/// data is dropped after upload). None when off or for another layout.
+pub fn pack_mesh(mesh: &Mesh) -> Option<Packed> {
+    if !on() {
+        return None;
+    }
+    pack(mesh).map(|(vertices, indices)| Packed { vertices, indices })
+}
+
+/// Registers packed geometry for mesh asset `id` (once; later calls for the same id are ignored).
+pub fn add_packed(id: AssetId<Mesh>, p: Packed) {
+    with(|s| {
+        if !s.geometry.insert(id) {
+            return;
+        }
+        s.stats.geometries += 1;
+        s.stats.vertex_bytes += p.vertices.len() as u64 * 4;
+        s.stats.index_bytes += p.indices.len() as u64 * 4;
+        s.ops.push(Op::AddGeometry { mesh: id, vertices: p.vertices, indices: p.indices });
+    });
+}
+
+/// Whether `id` has packed geometry.
+pub fn has_geometry(id: AssetId<Mesh>) -> bool {
+    on() && with(|s| s.geometry.contains(&id))
+}
+
+/// Adds an instance; returns the component for its entity (None when off or the mesh isn't packed).
+pub fn add_instance(d: InstanceDesc) -> Option<StaticInstance> {
+    if !on() || !has_geometry(d.mesh) {
+        return None;
+    }
+    let (wmin, wmax) = world_bounds(d.transform, d.local_min, d.local_max);
+    let t = d.transform.transpose();
+    let rows = [t.x_axis.to_array(), t.y_axis.to_array(), t.z_axis.to_array()];
+    let lod = d.range.map_or([-2.0, -1.0, 1.0e7, 2.0e7], |(s, e)| [s.start, s.end, e.start, e.end]);
+    let mirrored = d.transform.determinant() < 0.0;
+    let flags = FLAG_LIVE | if d.casts { FLAG_CASTS } else { 0 } | if mirrored { FLAG_MIRRORED } else { 0 };
+    let record = GpuRecord { rows, aabb_min: wmin.extend(0.0).to_array(), aabb_max: wmax.extend(0.0).to_array(), lod, flags, tag: d.tag, ..default() };
+    let slot = with(|s| {
+        let slot = s.free_slots.pop().unwrap_or_else(|| {
+            s.next_slot += 1;
+            s.next_slot - 1
+        });
+        s.stats.instances += 1;
+        s.ops.push(Op::AddInstance { slot, mesh: d.mesh, material: d.material, record });
+        slot
+    });
+    Some(StaticInstance(slot))
+}
+
+/// Zone fade dither level of an instance.
+pub fn set_tag(i: &StaticInstance, level: i32) {
+    if on() {
+        with(|s| s.ops.push(Op::SetTag(i.0, level)));
+    }
+}
+
+fn world_bounds(m: Mat4, lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
+    let (mut a, mut b) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for k in 0..8 {
+        let p = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+        let w = m.transform_point3(p);
+        a = a.min(w);
+        b = b.max(w);
+    }
+    (a, b)
+}
+
+/// The scenery layout -> packed words (+ u32 indices). None for other layouts / no indices.
+fn pack(mesh: &Mesh) -> Option<(Vec<u32>, Vec<u32>)> {
+    let n = mesh.count_vertices();
+    let f3 = |a: Option<&V>| match a {
+        Some(V::Float32x3(v)) if v.len() == n => Some(v.clone()),
+        _ => None,
+    };
+    let f2 = |a: Option<&V>| match a {
+        Some(V::Float32x2(v)) if v.len() == n => v.clone(),
+        _ => vec![[0.0; 2]; n],
+    };
+    let pos = f3(mesh.attribute(Mesh::ATTRIBUTE_POSITION))?;
+    let nrm = f3(mesh.attribute(Mesh::ATTRIBUTE_NORMAL)).unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; n]);
+    let uv0 = f2(mesh.attribute(Mesh::ATTRIBUTE_UV_0));
+    let uv1 = f2(mesh.attribute(Mesh::ATTRIBUTE_UV_1));
+    let uv2 = f2(mesh.attribute(fh1_render::material::ATTRIBUTE_UV2));
+    let col: Vec<[u8; 4]> = match mesh.attribute(fh1_render::material::ATTRIBUTE_COLOR) {
+        Some(V::Unorm8x4(v)) if v.len() == n => v.clone(),
+        _ => vec![[255; 4]; n],
+    };
+    let mut out = Vec::with_capacity(n * VERTEX_WORDS);
+    for i in 0..n {
+        for v in pos[i].iter().chain(&nrm[i]).chain(&uv0[i]).chain(&uv1[i]).chain(&uv2[i]) {
+            out.push(v.to_bits());
+        }
+        out.push(u32::from_le_bytes(col[i]));
+    }
+    let idx: Vec<u32> = match mesh.indices()? {
+        bevy::mesh::Indices::U16(i) => i.iter().map(|&x| x as u32).collect(),
+        bevy::mesh::Indices::U32(i) => i.clone(),
+    };
+    Some((out, idx))
+}
+
+/// Frees geometry when its mesh asset goes (main world).
+fn free_geometry(mut events: MessageReader<AssetEvent<Mesh>>) {
+    for e in events.read() {
+        if let AssetEvent::Removed { id } = e {
+            let gone = with(|s| {
+                let had = s.geometry.remove(id);
+                if had {
+                    s.stats.geometries = s.stats.geometries.saturating_sub(1);
+                }
+                had
+            });
+            if gone {
+                push(Op::RemoveGeometry(*id));
+            }
+        }
+    }
+}
+
+fn log_stats(time: Res<Time<Real>>, mut last: Local<f32>) {
+    let now = time.elapsed_secs();
+    if now - *last < 10.0 {
+        return;
+    }
+    *last = now;
+    let s = stats();
+    info!(
+        "static world: {} geometries ({:.1} MB vertices, {:.1} MB indices), {} instances",
+        s.geometries,
+        s.vertex_bytes as f64 / 1048576.0,
+        s.index_bytes as f64 / 1048576.0,
+        s.instances
+    );
+}
+
+pub fn plugin(app: &mut App) {
+    if !on() {
+        return;
+    }
+    info!("static world: ON (P12 chunk 1: data only, drawing still through the ECS meshes)");
+    app.add_systems(Last, (free_geometry, log_stats));
+    if let Some(ra) = app.get_sub_app_mut(RenderApp) {
+        ra.init_resource::<Arena>().add_systems(Render, apply_ops.in_set(RenderSystems::PrepareResources));
+    }
+}
+
+// ---------------------------------------------------------------- render world
+
+/// First-fit range allocator over u32 units (free ranges coalesced).
+#[derive(Default)]
+struct RangeAlloc {
+    cap: u32,
+    free: BTreeMap<u32, u32>,
+}
+
+impl RangeAlloc {
+    fn alloc(&mut self, n: u32) -> Option<u32> {
+        let (&start, &len) = self.free.iter().find(|(_, &len)| len >= n)?;
+        self.free.remove(&start);
+        if len > n {
+            self.free.insert(start + n, len - n);
+        }
+        Some(start)
+    }
+
+    fn release(&mut self, start: u32, n: u32) {
+        let (mut s, mut len) = (start, n);
+        if let Some((&ps, &pl)) = self.free.range(..start).next_back() {
+            if ps + pl == start {
+                self.free.remove(&ps);
+                s = ps;
+                len += pl;
+            }
+        }
+        if let Some(&nl) = self.free.get(&(start + n)) {
+            self.free.remove(&(start + n));
+            len += nl;
+        }
+        self.free.insert(s, len);
+    }
+
+    /// Grows to at least `need` more units at the end; returns the new capacity.
+    fn grow(&mut self, need: u32) -> u32 {
+        let new_cap = ((self.cap as f64 * 1.5) as u32).max(self.cap + need).max(1 << 20);
+        self.release(self.cap, new_cap - self.cap);
+        self.cap = new_cap;
+        new_cap
+    }
+}
+
+/// A growable GPU buffer of u32 words with a range allocator.
+struct WordBuffer {
+    label: &'static str,
+    usage: BufferUsages,
+    buffer: Option<Buffer>,
+    alloc: RangeAlloc,
+}
+
+impl WordBuffer {
+    fn new(label: &'static str, usage: BufferUsages) -> Self {
+        Self { label, usage, buffer: None, alloc: RangeAlloc::default() }
+    }
+
+    /// Allocates and uploads `data`; returns its first word.
+    fn put(&mut self, device: &RenderDevice, queue: &RenderQueue, data: &[u32]) -> u32 {
+        let n = data.len().max(1) as u32;
+        let start = match self.alloc.alloc(n) {
+            Some(s) => s,
+            None => {
+                let old_cap = self.alloc.cap;
+                let cap = self.alloc.grow(n);
+                let new = device.create_buffer(&BufferDescriptor {
+                    label: Some(self.label),
+                    size: cap as u64 * 4,
+                    usage: self.usage | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                if let (Some(old), true) = (&self.buffer, old_cap > 0) {
+                    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("static world grow") });
+                    enc.copy_buffer_to_buffer(old, 0, &new, 0, old_cap as u64 * 4);
+                    queue.submit([enc.finish()]);
+                }
+                self.buffer = Some(new);
+                self.alloc.alloc(n).expect("grown")
+            }
+        };
+        if let Some(b) = &self.buffer {
+            if !data.is_empty() {
+                queue.write_buffer(b, start as u64 * 4, bytemuck_words(data));
+            }
+        }
+        start
+    }
+}
+
+fn bytemuck_words(w: &[u32]) -> &[u8] {
+    // SAFETY: u32 has no padding; any byte view of it is valid.
+    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, std::mem::size_of_val(w)) }
+}
+
+/// Geometry ranges in the arena.
+#[derive(Clone, Copy)]
+struct GeoRange {
+    first_vertex: u32,
+    vertex_count: u32,
+    first_index: u32,
+    index_count: u32,
+}
+
+/// The render-world arena (chunk 1: buffers and records; drawn from chunk 2).
+#[derive(Resource)]
+pub struct Arena {
+    vertices: WordBuffer,
+    indices: WordBuffer,
+    geometry: HashMap<AssetId<Mesh>, GeoRange>,
+    /// CPU copy of every record slot (uploaded per changed slot) and the slots' meshes / materials.
+    records: Vec<GpuRecord>,
+    slot_mesh: Vec<Option<(AssetId<Mesh>, UntypedAssetId)>>,
+    record_buffer: Option<Buffer>,
+    record_cap: u32,
+}
+
+impl Default for Arena {
+    fn default() -> Self {
+        Self {
+            vertices: WordBuffer::new("static world vertices", BufferUsages::STORAGE),
+            indices: WordBuffer::new("static world indices", BufferUsages::INDEX),
+            geometry: HashMap::new(),
+            records: Vec::new(),
+            slot_mesh: Vec::new(),
+            record_buffer: None,
+            record_cap: 0,
+        }
+    }
+}
+
+impl Arena {
+    fn write_record(&mut self, device: &RenderDevice, queue: &RenderQueue, slot: u32) {
+        let need = slot + 1;
+        if need > self.record_cap || self.record_buffer.is_none() {
+            let cap = need.max(self.record_cap + self.record_cap / 2).max(16384);
+            let new = device.create_buffer(&BufferDescriptor {
+                label: Some("static world records"),
+                size: cap as u64 * RECORD_BYTES,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            // Re-upload every record (rare: growth).
+            self.record_buffer = Some(new);
+            self.record_cap = cap;
+            if let Some(b) = &self.record_buffer {
+                let bytes = records_bytes(&self.records);
+                if !bytes.is_empty() {
+                    queue.write_buffer(b, 0, bytes);
+                }
+            }
+            return;
+        }
+        if let (Some(b), Some(r)) = (&self.record_buffer, self.records.get(slot as usize)) {
+            queue.write_buffer(b, slot as u64 * RECORD_BYTES, records_bytes(std::slice::from_ref(r)));
+        }
+    }
+}
+
+fn records_bytes(r: &[GpuRecord]) -> &[u8] {
+    // SAFETY: GpuRecord is repr(C) of 4-byte fields, no padding beyond explicit fields.
+    unsafe { std::slice::from_raw_parts(r.as_ptr() as *const u8, std::mem::size_of_val(r)) }
+}
+
+/// Applies the main world's ops (render world, once per frame).
+fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<RenderQueue>) {
+    let ops = with(|s| std::mem::take(&mut s.ops));
+    if ops.is_empty() {
+        return;
+    }
+    let a = &mut *arena;
+    for op in ops {
+        match op {
+            Op::AddGeometry { mesh, vertices, indices } => {
+                let vc = (vertices.len() / VERTEX_WORDS) as u32;
+                let fv = a.vertices.put(&device, &queue, &vertices) / VERTEX_WORDS as u32;
+                let fi = a.indices.put(&device, &queue, &indices);
+                a.geometry.insert(mesh, GeoRange { first_vertex: fv, vertex_count: vc, first_index: fi, index_count: indices.len() as u32 });
+            }
+            Op::RemoveGeometry(mesh) => {
+                if let Some(g) = a.geometry.remove(&mesh) {
+                    a.vertices.alloc.release(g.first_vertex * VERTEX_WORDS as u32, (g.vertex_count * VERTEX_WORDS as u32).max(1));
+                    a.indices.alloc.release(g.first_index, g.index_count.max(1));
+                }
+            }
+            Op::AddInstance { slot, mesh, material, mut record } => {
+                let s = slot as usize;
+                if a.records.len() <= s {
+                    a.records.resize(s + 1, GpuRecord::default());
+                    a.slot_mesh.resize(s + 1, None);
+                }
+                if let Some(g) = a.geometry.get(&mesh) {
+                    record.first_index = g.first_index;
+                    record.index_count = g.index_count;
+                    record.base_vertex = g.first_vertex;
+                } else {
+                    record.flags &= !FLAG_LIVE;
+                }
+                a.records[s] = record;
+                a.slot_mesh[s] = Some((mesh, material));
+                a.write_record(&device, &queue, slot);
+            }
+            Op::RemoveInstance(slot) => {
+                if let Some(r) = a.records.get_mut(slot as usize) {
+                    *r = GpuRecord::default();
+                    a.slot_mesh[slot as usize] = None;
+                    a.write_record(&device, &queue, slot);
+                }
+            }
+            Op::SetTag(slot, level) => {
+                if let Some(r) = a.records.get_mut(slot as usize) {
+                    r.tag = level;
+                    a.write_record(&device, &queue, slot);
+                }
+            }
+        }
+    }
+}

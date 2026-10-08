@@ -614,6 +614,8 @@ fn spawn_zone_model(commands: &mut Commands, sc: &mut Scenery, cast: bool, fade_
         commands.entity(e).insert(p2::ZoneMesh);
         no_cpu_cull(commands, e);
         sc.static_bounds(commands, e, mesh);
+        let range = (fade_s > 0.0).then(zone_fade_range);
+        sc.static_instance(commands, e, mesh, material, Mat4::IDENTITY, range.as_ref(), cast, if fade_s > 0.0 { -16 } else { 0 });
         if !cast {
             commands.entity(e).insert(bevy::light::NotShadowCaster);
         }
@@ -1073,6 +1075,41 @@ fn static_aabb_on() -> bool {
 }
 
 impl Scenery {
+    /// P12 static world (FH1_STATIC_WORLD=1): mirrors a remaster scenery entity into the static world's draw records. The
+    /// entity stays the streaming handle; its `StaticInstance` frees the record when it is despawned.
+    #[allow(clippy::too_many_arguments)]
+    fn static_instance(
+        &self,
+        commands: &mut Commands,
+        e: Entity,
+        mesh: &Handle<Mesh>,
+        material: &BatchMaterial,
+        transform: Mat4,
+        range: Option<&bevy::camera::visibility::VisibilityRange>,
+        casts: bool,
+        tag: i32,
+    ) {
+        let BatchMaterial::Remaster(h) = material else { return };
+        if !fh1_remaster::static_world::on() {
+            return;
+        }
+        let Some(a) = self.aabbs.get(&mesh.id()) else { return };
+        let (c, he) = (Vec3::from(a.center), Vec3::from(a.half_extents));
+        let desc = fh1_remaster::static_world::InstanceDesc {
+            mesh: mesh.id(),
+            material: h.id().untyped(),
+            transform,
+            local_min: c - he,
+            local_max: c + he,
+            range: range.map(|r| (r.start_margin.clone(), r.end_margin.clone())),
+            casts,
+            tag,
+        };
+        if let Some(i) = fh1_remaster::static_world::add_instance(desc) {
+            commands.entity(e).insert(i);
+        }
+    }
+
     /// Inserts `mesh`'s precomputed bounds + `NoAutoAabb` on static scenery entity `e` (`static_aabb_on`).
     fn static_bounds(&self, commands: &mut Commands, e: Entity, mesh: &Handle<Mesh>) {
         if !static_aabb_on() {
@@ -1178,7 +1215,12 @@ impl Scenery {
                 use bevy::camera::primitives::MeshAabb;
                 let aabb = mesh.compute_aabb();
                 self.spend_mesh(&mesh);
+                // P12 static world (FH1_STATIC_WORLD=1): remaster scenery geometry packed into the GPU arena.
+                let packed = if matches!(m, BatchMaterial::Remaster(_)) { fh1_remaster::static_world::pack_mesh(&mesh) } else { None };
                 let h = meshes.add(mesh);
+                if let Some(p) = packed {
+                    fh1_remaster::static_world::add_packed(h.id(), p);
+                }
                 if let Some(a) = aabb {
                     self.aabbs.insert(h.id(), a);
                 }
@@ -1701,6 +1743,7 @@ fn spawn_level(
         };
         let id = material.spawn(commands, mesh.clone(), t, parent);
         sc.static_bounds(commands, id, mesh);
+        sc.static_instance(commands, id, mesh, &material, e.m, Some(&range), !e.small, 0);
         sc.p2.spawned += 1;
         STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         sc.budget = sc.budget.saturating_sub(1);
@@ -2021,6 +2064,7 @@ pub fn stream(
                 let e = material.spawn(&mut commands, mesh.clone(), Transform::IDENTITY, parent);
                 no_cpu_cull(&mut commands, e);
                 sc.static_bounds(&mut commands, e, &mesh);
+                sc.static_instance(&mut commands, e, &mesh, &material, Mat4::IDENTITY, None, true, 0);
             }
             sc.loaded.insert(k, parent);
         }

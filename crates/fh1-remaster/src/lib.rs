@@ -16,6 +16,7 @@ pub mod post;
 pub mod rtx;
 pub mod scenery;
 pub mod sky;
+pub mod static_world;
 pub mod views;
 pub mod wheel;
 
@@ -42,6 +43,7 @@ impl Plugin for RemasterPlugin {
             app.add_plugins(car::RemasterCarPlugin);
             app.add_plugins(car_probe::CarProbePlugin);
             scenery::plugin(app);
+            static_world::plugin(app);
             #[cfg(feature = "rtx")]
             app.add_plugins(rtx::RtxPlugin);
         }
