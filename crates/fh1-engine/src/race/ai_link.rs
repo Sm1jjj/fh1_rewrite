@@ -17,11 +17,30 @@ use super::{crossed, gate, total_gates, RaceDef, RacePhase, Racer};
 /// Barrier bits of the running race into the collision (`WorldGround::event_routes`, OR'd with free roam's).
 /// `FH1_RACE_BARRIERS=0` keeps free roam's collision during races.
 pub fn set_barriers(track: &crate::track::Track, bits: u16) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var("FH1_RACE_BARRIERS").map_or(true, |v| v != "0"));
     if let Some(w) = &track.world {
-        w.event_routes.store(if on { bits & 0x7FFF } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+        w.event_routes.store(if barriers_on() { bits & 0x7FFF } else { 0 }, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// `FH1_RACE_BARRIER_TRIS=0`: the old event walls (the setup's inferred route-mask bits `barrier_bits`, which switch on
+/// every triangle carrying the bit on the whole map: invisible walls where this race has no barrier) instead of the
+/// triangles under the race's own barrier objects (docs/RACES.md "Event walls").
+pub fn barrier_tris_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_RACE_BARRIER_TRIS").map_or(true, |v| v != "0"))
+}
+
+/// The running race's event-wall triangles into the collision (`WorldGround::set_event_tris`; empty = none). Honours
+/// `FH1_RACE_BARRIERS=0` like [`set_barriers`].
+pub fn set_barrier_tris(track: &crate::track::Track, tris: std::collections::HashSet<u32>) {
+    if let Some(w) = &track.world {
+        w.set_event_tris(if barriers_on() { tris } else { Default::default() });
+    }
+}
+
+fn barriers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_RACE_BARRIERS").map_or(true, |v| v != "0"))
 }
 
 /// `FH1_RACE_AI=0`: no opponents (solo races) even when R2's AI is present.

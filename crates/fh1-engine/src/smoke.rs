@@ -239,6 +239,28 @@ fn stretch_secs() -> f32 {
     *V.get_or_init(|| knob("FH1_SMOKE_STRETCH", 0.06).max(0.0))
 }
 
+/// Stricter start (2026-10-08, user: "squeal round a corner doesn't have to smoke; a split-second traction break throws a
+/// puff"): the slip must also be large for the car's speed (tread slip / max(speed, 5 m/s) above `FH1_SMOKE_SLIP_RATIO`,
+/// 0.22 ~ 13 deg, past the tyre's peak, i.e. sliding rather than squealing; full at +0.2), only that counts toward the
+/// sustain timer, and smoke ramps in over 0.3-0.7 s of it (was 0.15-0.45). `FH1_SMOKE_STRICT=0` = old.
+fn strict_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_SMOKE_STRICT").map_or(true, |v| v != "0"))
+}
+
+fn knob_slip_ratio() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| knob("FH1_SMOKE_SLIP_RATIO", 0.22).max(0.0))
+}
+
+/// Break-up (2026-10-08, user: "at speed when drifting you can see uniform shapes coming off the wheels"): uneven puff
+/// spacing, a slow per-wheel gust on rate and density, mixed puff sizes (wisps to clumps) and densities, emission points
+/// scattered over the tread, per-puff stretch. `FH1_SMOKE_BREAKUP=0` = old (even stream).
+fn breakup_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_SMOKE_BREAKUP").map_or(true, |v| v != "0"))
+}
+
 /// Tread slip (m/s) where smoke starts and the slip above that for full smoke.
 const SLIP_START: f32 = 1.5;
 const SLIP_FULL: f32 = 6.0;
@@ -314,11 +336,11 @@ fn emit(mut smoke: ResMut<Smoke>, track: Res<Track>, cars: Query<(Entity, Option
     let ai_too = std::env::var("FH1_AI_SMOKE").is_ok_and(|v| v == "1");
     for (e, car, ai) in &cars {
         let Some(v) = car.map(|c| &c.0).or(if ai_too { ai.map(|a| &a.0) } else { None }) else { continue };
-        emit_car(smoke, e, v, &weights, alpha, dt);
+        emit_car(smoke, e, v, &weights, alpha, dt, t);
     }
 }
 
-fn emit_car(smoke: &mut Smoke, e: Entity, v: &Vehicle, weights: &[f32], alpha: f32, dt: f32) {
+fn emit_car(smoke: &mut Smoke, e: Entity, v: &Vehicle, weights: &[f32], alpha: f32, dt: f32, t_now: f32) {
     let (pos, rot) = v.render_pose(alpha);
     let up = rot * Vec3::Y;
     for (wi, w) in v.wheels.iter().enumerate() {
@@ -341,18 +363,28 @@ fn emit_car(smoke: &mut Smoke, e: Entity, v: &Vehicle, weights: &[f32], alpha: f
         // Sustained slip (module doc): the start threshold rises with speed, and smoke ramps in only after the slip has
         // held for a moment.
         let start = if sustain_on() { SLIP_START + knob_speed_slip() * v.velocity.length() } else { SLIP_START };
+        let strict = strict_on() && !debug();
+        // Sliding, not squealing: slip relative to the car's speed (module doc / strict_on).
+        let ratio = slip / v.velocity.length().max(5.0);
+        let slide = if strict {
+            let x = ((ratio - knob_slip_ratio()) / 0.2).clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        } else {
+            1.0
+        };
         let mut gate = 1.0;
         if sustain_on() && !debug() {
             let t = smoke.sustain.entry((e, wi)).or_insert(0.0);
-            if slip > start {
+            if slip > start && (!strict || ratio > knob_slip_ratio()) {
                 *t = (*t + dt).min(1.0);
             } else {
                 *t = (*t - 3.0 * dt).max(0.0);
             }
-            let x = ((*t - 0.15) / 0.3).clamp(0.0, 1.0);
+            let (delay, ramp) = if strict { (0.3, 0.4) } else { (0.15, 0.3) };
+            let x = ((*t - delay) / ramp).clamp(0.0, 1.0);
             gate = x * x * (3.0 - 2.0 * x);
         }
-        let k = ((slip - start) / SLIP_FULL).clamp(0.0, 1.0) * weight.min(1.0) * gate;
+        let k = ((slip - start) / SLIP_FULL).clamp(0.0, 1.0) * weight.min(1.0) * gate * slide;
         if k <= 0.0 {
             smoke.carry.remove(&(e, wi));
             continue;
@@ -371,11 +403,25 @@ fn emit_car(smoke: &mut Smoke, e: Entity, v: &Vehicle, weights: &[f32], alpha: f
         } else {
             1.0
         };
-        *carry += slip.min(5.0) * dt * rate_k;
-        let n = (*carry / spacing).floor() as usize;
-        *carry -= n as f32 * spacing;
+        let breakup = breakup_on() && !debug();
+        // Per-wheel gust (break-up): two slow sines with a per-car / per-wheel phase, 0..1.
+        let gust = if breakup {
+            let ph = (e.to_bits() % 997) as f32 * 0.37 + wi as f32 * 1.7;
+            (0.5 + 0.3 * (t_now * 2.3 + ph).sin() + 0.2 * (t_now * 5.1 + ph * 1.9).sin()).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let gust_rate = if breakup { 0.45 + 1.1 * gust } else { 1.0 };
+        *carry += slip.min(5.0) * dt * rate_k * gust_rate;
+        let mut c = *carry;
         let side = if wi % 2 == 0 { -1.0 } else { 1.0 };
-        for i in 0..n.min(6) {
+        let mut emitted = 0usize;
+        while c >= spacing && emitted < 6 {
+            let i = emitted;
+            emitted += 1;
+            // Uneven gaps (break-up): 0.45-1.55 x the spacing, mean 1.
+            c -= spacing * if breakup { 0.45 + 1.1 * smoke.rand() } else { 1.0 };
+            let n = emitted + (c / spacing).max(0.0) as usize;
             if smoke.puffs.len() >= smoke.max {
                 // Full: recycle the oldest (most faded) puff.
                 if let Some((idx, _)) = smoke.puffs.iter().enumerate().max_by(|a, b| (a.1.age / a.1.life).total_cmp(&(b.1.age / b.1.life))) {
@@ -384,12 +430,24 @@ fn emit_car(smoke: &mut Smoke, e: Entity, v: &Vehicle, weights: &[f32], alpha: f
             }
             let f = (i as f32 + smoke.rand()) / n.max(1) as f32;
             // Spread along this frame's contact path; thrown back off the tread, mostly kept with the car.
-            let p0 = contact - v_point * dt * f + right * (side * 0.08) + up * 0.15;
-            let jitter = Vec3::new(smoke.rand_s(), smoke.rand() * 0.6, smoke.rand_s()) * 0.6;
+            let mut p0 = contact - v_point * dt * f + right * (side * 0.08) + up * 0.15;
+            if breakup {
+                // Anywhere over the tread / contact patch, not one point.
+                p0 += right * (smoke.rand_s() * 0.12) + fwd * (smoke.rand_s() * 0.18) + up * (smoke.rand() * 0.1);
+            }
+            let jitter = Vec3::new(smoke.rand_s(), smoke.rand() * 0.6, smoke.rand_s()) * if breakup { 0.9 } else { 0.6 };
             let still = burnout_fix() && speed < 5.0;
             let lift = if still { 1.8 } else { 1.0 };
             let vel = v_point * 0.35 - tread * 0.12 + up * 0.6 * lift + right * (side * 0.4 * lift) + jitter * lift;
-            let (size, life) = (smoke.size, smoke.life);
+            // Wisps to clumps (break-up): mostly 0.55-1.2x, now and then a 1.6x+ clump; mean ~1.
+            let (shape, dens) = if breakup {
+                let r = smoke.rand();
+                let clump = if smoke.rand() < 0.12 { 0.6 } else { 0.0 };
+                (0.55 + 0.9 * r * r + clump, (0.65 + 0.6 * smoke.rand()) * (0.75 + 0.5 * gust))
+            } else {
+                (1.0, 1.0)
+            };
+            let (size, life) = (smoke.size * shape, smoke.life);
             let puff = Puff {
                 pos: p0,
                 vel,
@@ -400,11 +458,17 @@ fn emit_car(smoke: &mut Smoke, e: Entity, v: &Vehicle, weights: &[f32], alpha: f
                 rot: smoke.rand() * std::f32::consts::TAU,
                 spin: smoke.rand_s() * 0.35,
                 seed: smoke.rand(),
-                density: (0.25 + 0.45 * k) * smoke.opacity,
+                density: (0.25 + 0.45 * k) * smoke.opacity * dens,
                 ground: contact.y,
                 lift,
             };
             smoke.puffs.push(puff);
+        }
+        if emitted == 6 {
+            c = c.min(spacing);
+        }
+        if let Some(cr) = smoke.carry.get_mut(&(e, wi)) {
+            *cr = c.max(0.0);
         }
     }
 }
@@ -672,7 +736,9 @@ fn draw(
             smoke.size_rot.push([size * 0.5, p.rot]);
             smoke.colour.push([p.seed, a, u, p.ground]);
             // xyz = motion relative to the camera x the stretch time (m of smear).
-            let smear = (p.vel - cam_vel) * stretch_secs();
+            // Per-puff stretch (break-up): 0.5-1.5x, so a fast trail isn't a row of identical ellipsoids.
+            let vary = if breakup_on() { 0.5 + (p.seed * 7.31).fract() } else { 1.0 };
+            let smear = (p.vel - cam_vel) * stretch_secs() * vary;
             smoke.extra.push([smear.x, smear.y, smear.z, 0.0]);
         }
     }

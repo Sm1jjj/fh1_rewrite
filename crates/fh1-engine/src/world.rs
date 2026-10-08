@@ -30,6 +30,10 @@ pub struct WorldGround {
     pub routes: u16,
     /// A running race's own barrier bits (race.rs sets them at the start, clears them at the end); OR'd into `routes`.
     pub event_routes: std::sync::atomic::AtomicU16,
+    /// A running race's event-wall triangles, by index (race.rs: the event triangles standing where the race's barrier
+    /// objects are); active whatever their route bits. Empty outside races and with `FH1_RACE_BARRIER_TRIS=0`.
+    event_tris: std::sync::RwLock<std::collections::HashSet<u32>>,
+    event_tris_on: std::sync::atomic::AtomicBool,
     /// Tyre terms per surface id (surfaceTypes.xml `<Friction>`), built once.
     tyre: Vec<TyreSurface>,
 }
@@ -39,7 +43,15 @@ impl WorldGround {
         let world = World::load(dir)?;
         let invisible = world.surfaces.iter().position(|s| s.name == "Invisible").map(|i| i as u8);
         let tyre = world.surfaces.iter().map(|s| TyreSurface::from_params(|k| s.param(k))).collect();
-        Ok(Self { world, invisible, routes: FREE_ROAM, event_routes: std::sync::atomic::AtomicU16::new(0), tyre })
+        Ok(Self {
+            world,
+            invisible,
+            routes: FREE_ROAM,
+            event_routes: std::sync::atomic::AtomicU16::new(0),
+            event_tris: Default::default(),
+            event_tris_on: std::sync::atomic::AtomicBool::new(false),
+            tyre,
+        })
     }
 
     fn to_world(v: Vec3) -> [f32; 3] {
@@ -52,7 +64,78 @@ impl WorldGround {
 
     /// Whether a triangle exists for the active routes.
     pub fn active(&self, tri: u32) -> bool {
-        self.world.tris[tri as usize].routes & (self.routes | self.event_routes.load(std::sync::atomic::Ordering::Relaxed)) != 0
+        let routes = self.world.tris[tri as usize].routes;
+        routes & (self.routes | self.event_routes.load(std::sync::atomic::Ordering::Relaxed)) != 0 || (routes & 0x7FFF != 0 && self.event_tri_active(tri))
+    }
+
+    fn event_tri_active(&self, tri: u32) -> bool {
+        self.event_tris_on.load(std::sync::atomic::Ordering::Relaxed) && self.event_tris.read().is_ok_and(|s| s.contains(&tri))
+    }
+
+    /// Makes exactly these event triangles (route bits 0-14) solid for the running race (empty = none).
+    pub fn set_event_tris(&self, tris: std::collections::HashSet<u32>) {
+        self.event_tris_on.store(!tris.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut s) = self.event_tris.write() {
+            *s = tris;
+        }
+    }
+
+    /// Drops the wall triangles whose footprint cuts the engine-space `path` within their height: the game's races are
+    /// drivable along their racing line, so such a wall (e.g. the end of a diagonal closure that runs on across the road)
+    /// isn't part of the event's closure (offline: 10 wall triangles cut the racing line in 6 routes, all of them within
+    /// reach of the event's barrier objects).
+    pub fn drop_crossing_tris(&self, tris: &mut std::collections::HashSet<u32>, path: &[Vec3]) {
+        let segs: Vec<([f32; 3], [f32; 3])> = path.windows(2).map(|s| (Self::to_world(s[0]), Self::to_world(s[1]))).collect();
+        let cross2 = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+        tris.retain(|&t| {
+            let p = self.world.tri_points(t);
+            let (u, v) = ([p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]], [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]]);
+            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+            if (n[1] / len).abs() >= 0.5 {
+                return true; // ground
+            }
+            // The wall's footprint: its longest edge in x / z.
+            let xz = |i: usize| [p[i][0], p[i][2]];
+            let (a, b) = [(0, 1), (1, 2), (0, 2)]
+                .into_iter()
+                .map(|(i, j)| (xz(i), xz(j)))
+                .max_by(|x, y| {
+                    let (lx, ly) = ((x.0[0] - x.1[0]).hypot(x.0[1] - x.1[1]), (y.0[0] - y.1[0]).hypot(y.0[1] - y.1[1]));
+                    lx.total_cmp(&ly)
+                })
+                .unwrap();
+            let (ylo, yhi) = (p[0][1].min(p[1][1]).min(p[2][1]), p[0][1].max(p[1][1]).max(p[2][1]));
+            let (x0, x1, z0, z1) = (a[0].min(b[0]) - 1.0, a[0].max(b[0]) + 1.0, a[1].min(b[1]) - 1.0, a[1].max(b[1]) + 1.0);
+            !segs.iter().any(|(q, q2)| {
+                if q[0].max(q2[0]) < x0 || q[0].min(q2[0]) > x1 || q[2].max(q2[2]) < z0 || q[2].min(q2[2]) > z1 {
+                    return false;
+                }
+                let y = (q[1] + q2[1]) * 0.5;
+                if y < ylo - 4.5 || y > yhi + 0.5 {
+                    return false;
+                }
+                let (d1, d2) = ([b[0] - a[0], b[1] - a[1]], [q2[0] - q[0], q2[2] - q[2]]);
+                let den = cross2(d1, d2);
+                if den.abs() < 1e-9 {
+                    return false;
+                }
+                let qp = [q[0] - a[0], q[2] - a[1]];
+                let (t, u) = (cross2(qp, d2) / den, cross2(qp, d1) / den);
+                (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)
+            })
+        });
+    }
+
+    /// Event triangles (route bits 0-14, not free roam's) within `radius` of any of the engine-space `probes`.
+    pub fn event_tris_near(&self, probes: impl IntoIterator<Item = Vec3>, radius: f32) -> std::collections::HashSet<u32> {
+        let mut out = std::collections::HashSet::new();
+        let mut hits = Vec::new();
+        for p in probes {
+            self.world.sphere_contacts(Self::to_world(p), radius, &mut hits);
+            out.extend(hits.iter().map(|c| c.tri).filter(|&t| self.world.tris[t as usize].routes & 0x7FFF != 0));
+        }
+        out
     }
 
     pub fn surface_name(&self, id: u8) -> &str {
@@ -93,6 +176,13 @@ impl Ground for WorldGround {
     fn sphere(&self, center: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
         let mut raw = Vec::new();
         self.world.sphere_contacts(Self::to_world(center), radius, &mut raw);
+        out.clear();
+        out.extend(raw.iter().filter(|c| self.active(c.tri)).map(|c| SphereContact { point: Self::from_world(c.point), normal: Self::from_world(c.normal), depth: c.depth, surface: c.surface }));
+    }
+
+    fn sphere_sweep(&self, from: Vec3, to: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
+        let mut raw = Vec::new();
+        self.world.sphere_sweep(Self::to_world(from), Self::to_world(to), radius, &mut raw);
         out.clear();
         out.extend(raw.iter().filter(|c| self.active(c.tri)).map(|c| SphereContact { point: Self::from_world(c.point), normal: Self::from_world(c.normal), depth: c.depth, surface: c.surface }));
     }

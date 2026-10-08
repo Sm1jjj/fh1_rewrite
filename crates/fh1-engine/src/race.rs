@@ -99,6 +99,8 @@ pub struct Events {
     pub scoring: Vec<u32>,
     /// Event-object template -> template-space bounds (their race colliders).
     pub object_bounds: std::collections::HashMap<u16, (Vec3, Vec3)>,
+    /// Event-object templates that are barriers (first submodel name contains "Barrier"): the event walls stand under them.
+    pub barrier_templates: std::collections::HashSet<u16>,
     /// Career tables (wristbands, hubs, classes, drivers, cars, popularity ladder).
     pub career: crate::progression::data::CareerData,
 }
@@ -201,9 +203,16 @@ impl Events {
             .flatten()
             .filter_map(|(k, v)| Some((k.parse().ok()?, (v3(&v["lo"])?, v3(&v["hi"])?))))
             .collect();
+        let barrier_templates = j["object_templates"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| v["name"].as_str().is_some_and(|n| n.to_ascii_uppercase().contains("BARRIER")))
+            .filter_map(|(k, _)| k.parse().ok())
+            .collect();
         let career = crate::progression::data::CareerData::from_json(&j["progression"], assets);
         info!("race: {} events installed (career tables: {})", races.len(), if career.installed { "events-2" } else { "built-in" });
-        Self { races, scoring, object_bounds, career }
+        Self { races, scoring, object_bounds, barrier_templates, career }
     }
 }
 
@@ -271,6 +280,8 @@ pub struct RaceState {
     /// Event-object colliders: waiting for the prop colliders to load, and the ids added (removed after the race).
     collision_pending: Vec<(u16, Mat4, Vec3, Vec3)>,
     collision_ids: Vec<u32>,
+    /// Colliders of finished races still to remove (race_objects; a new race may start before they are gone).
+    collision_stale: Vec<u32>,
     /// Pending reset to the last gate (applied next frame, after free roam's upright reset).
     reset_next: bool,
     /// Message for the HUD (e.g. "Reset to track"), with time left.
@@ -302,6 +313,7 @@ impl Default for RaceState {
             objects: None,
             collision_pending: Vec::new(),
             collision_ids: Vec::new(),
+            collision_stale: Vec::new(),
             reset_next: false,
             flash: None,
             results_page: 0,
@@ -348,6 +360,15 @@ const STUCK_MPH: f32 = 5.0;
 const STUCK_S: f32 = 3.0;
 /// Event objects are shown within this distance of the player.
 const OBJECT_DRAW: f32 = 350.0;
+/// Event-wall triangles within this distance of a barrier object's centre are solid during its race.
+const BARRIER_WALL_R: f32 = 2.5;
+
+/// `FH1_RACE_GHOST_SOLIDS=1`: the old event-object colliders, a box for every object with known bounds even when its
+/// template isn't installed (no mesh: an invisible wall).
+fn ghost_solids() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_RACE_GHOST_SOLIDS").is_ok_and(|v| v == "1"))
+}
 
 pub fn races_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -461,8 +482,11 @@ fn start_race(
             last_pos: None,
         });
     }
-    // The event's barrier bits (collision) and its event-only objects.
-    ai_link::set_barriers(track, def.barrier_bits);
+    // The event's walls (collision) and its event-only objects. The event walls are the event triangles under the race's
+    // barrier objects (`FH1_RACE_BARRIER_TRIS=0`: the setup's inferred route bits, which also switch on walls elsewhere).
+    let tris_on = ai_link::barrier_tris_on();
+    ai_link::set_barriers(track, if tris_on { 0 } else { def.barrier_bits });
+    let mut shown: Vec<(u16, Mat4)> = Vec::new();
     if let Some(sc) = scenery {
         let root = commands.spawn((Transform::IDENTITY, Visibility::Inherited, crate::ui::world_load::WorldEntity)).id();
         let mut list = Vec::new();
@@ -471,6 +495,7 @@ fn start_race(
             let parent = commands.spawn((Transform::IDENTITY, Visibility::Hidden, ChildOf(root))).id();
             if sc.spawn_template(commands, *t, Transform::from_matrix(*m), parent) {
                 list.push((parent, m.w_axis.truncate(), false));
+                shown.push((*t, *m));
             } else {
                 missing += 1;
                 commands.entity(parent).despawn();
@@ -478,9 +503,10 @@ fn start_race(
         }
         info!("race: {} event objects ({missing} templates not installed), barrier bits {:#06x}", list.len(), def.barrier_bits);
         // Solid colliders for them (concrete / metal barriers, signs); cone-sized objects stay ghosts (solid cones
-        // would stop the car dead).
-        rs.collision_pending = def
-            .objects
+        // would stop the car dead). Only objects that are drawn: a template the scenery group didn't install has no mesh,
+        // and its box was an invisible wall (FH1_RACE_GHOST_SOLIDS=1: old, boxes for every object).
+        let solids: &[(u16, Mat4)] = if ghost_solids() { &def.objects } else { &shown };
+        rs.collision_pending = solids
             .iter()
             .filter_map(|(t, m)| {
                 let (lo, hi) = *events.object_bounds.get(t)?;
@@ -489,6 +515,27 @@ fn start_race(
             })
             .collect();
         rs.objects = Some((root, list));
+    }
+    if tris_on {
+        // Event walls only where this race shows a barrier: the barrier objects' event triangles (route bits 0-14), within
+        // BARRIER_WALL_R of the object's centre (every barrier object of every race stands within 2.1 m of an event wall,
+        // 99th percentile; the walls without a barrier of this race nearby belong to other events).
+        if let Some(w) = &track.world {
+            let probes = shown.iter().filter(|(t, _)| events.barrier_templates.contains(t)).map(|(t, m)| {
+                let c = events.object_bounds.get(t).map_or(Vec3::ZERO, |(lo, hi)| (*lo + *hi) * 0.5);
+                m.transform_point3(c)
+            });
+            let mut tris = w.event_tris_near(probes, BARRIER_WALL_R);
+            let all = tris.len();
+            w.drop_crossing_tris(&mut tris, &def.path);
+            info!(
+                "race: {} event wall triangles under {} barrier objects ({} cut the road path: dropped)",
+                tris.len(),
+                shown.iter().filter(|(t, _)| events.barrier_templates.contains(t)).count(),
+                all - tris.len()
+            );
+            ai_link::set_barrier_tris(track, tris);
+        }
     }
     rs.race = Some(i);
     rs.phase = RacePhase::Grid { left_s: if crate::ui::loading::enabled() { GRID_SETTLE_LOADER_S } else { GRID_SETTLE_S } };
@@ -516,13 +563,15 @@ fn end_race(events: &Events, rs: &mut RaceState, cars: &mut Query<&mut Car>, tra
         }
     }
     ai_link::set_barriers(track, 0);
+    ai_link::set_barrier_tris(track, Default::default());
     ai.despawn_all();
     if let Some((root, _)) = rs.objects.take() {
         commands.entity(root).despawn();
     }
     let list = (rs.list_open, rs.list_cursor);
-    let ids = std::mem::take(&mut rs.collision_ids);
-    *rs = RaceState { list_open: list.0, list_cursor: list.1, collision_ids: ids, ..default() };
+    let mut stale = std::mem::take(&mut rs.collision_stale);
+    stale.extend(std::mem::take(&mut rs.collision_ids));
+    *rs = RaceState { list_open: list.0, list_cursor: list.1, collision_stale: stale, ..default() };
 }
 
 /// Input and the race state machine.
@@ -827,10 +876,11 @@ pub fn race_update(
 pub fn race_objects(mut rs: ResMut<RaceState>, cars: Query<&Car>, mut tick: Local<f32>, time: Res<Time>, mut commands: Commands, props: Option<ResMut<crate::smash::PropCollision>>) {
     // Colliders: added once the prop colliders are loaded; removed after the race (end_race leaves the ids).
     if let Some(mut props) = props {
-        if rs.race.is_none() && !rs.collision_ids.is_empty() {
-            let ids = std::mem::take(&mut rs.collision_ids);
+        if !rs.collision_stale.is_empty() {
+            let ids = std::mem::take(&mut rs.collision_stale);
             props.remove(&ids);
-        } else if rs.race.is_some() && !rs.collision_pending.is_empty() && props.ready() {
+        }
+        if rs.race.is_some() && !rs.collision_pending.is_empty() && props.ready() {
             let objs = std::mem::take(&mut rs.collision_pending);
             let ids = props.add_solid_boxes(&objs);
             info!("race: {} event-object colliders", ids.len());

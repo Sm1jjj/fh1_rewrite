@@ -164,6 +164,99 @@ fn path_len(path: &[[f32; 3]]) -> f32 {
     path.windows(2).map(|s| dist2([s[0][0], s[0][2]], [s[1][0], s[1][2]])).sum()
 }
 
+/// `FH1_RACE_ROUTES=0`: the old route rules (circuit = NumLaps > 1, A* road path, gate facing from the neighbouring
+/// gates) instead of the racing-line ones (docs/RACES.md "Routes and circuits").
+fn routes_fix_on() -> bool {
+    std::env::var("FH1_RACE_ROUTES").map_or(true, |v| v != "0")
+}
+
+/// The game's Colorado racing lines (`media/aiopenworld.zip` `colorado/Ribbon_00/route_NNN.owt`, fh1setup ailines.rs and
+/// docs/AI.md): track id -> (closed loop, centre line in engine space, z negated). One line per route file; the closed
+/// flag is the game's own circuit / sprint marker (all 46 agree with gamedb Tracks.RibbonConfiguration 0 = circuit).
+fn owt_lines(disc: &Path) -> HashMap<i64, (bool, Vec<[f32; 3]>)> {
+    let mut out = HashMap::new();
+    let Ok(mut ar) = Archive::open(disc.join("media/aiopenworld.zip")) else { return out };
+    for e in ar.entries.clone() {
+        let name = e.name.replace('\\', "/").to_ascii_lowercase();
+        let Some(rest) = name.strip_prefix("colorado/") else { continue };
+        let Some(id) = rest.rsplit('/').next().and_then(|f| f.strip_prefix("route_")).and_then(|f| f.strip_suffix(".owt")).and_then(|f| f.parse::<i64>().ok()) else { continue };
+        let Ok(b) = ar.read(&e) else { continue };
+        if b.len() < 32 || !b.starts_with(b"OWTM") {
+            continue;
+        }
+        let word = |o: usize| u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let (n, closed) = (word(16) as usize, word(20) == 1);
+        if n < 2 || b.len() < 32 + 48 * n {
+            continue;
+        }
+        let pts = (0..n)
+            .map(|i| {
+                let o = 32 + 48 * i;
+                [f32::from_bits(word(o)), f32::from_bits(word(o + 4)), -f32::from_bits(word(o + 8))]
+            })
+            .collect();
+        out.insert(id, (closed, pts));
+    }
+    out
+}
+
+/// The path keeping a point at least `step` m (x/z) after the last kept one (and its end).
+fn thin(pts: &[[f32; 3]], step: f32) -> Vec<[f32; 3]> {
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(pts.len() / 2 + 2);
+    for (i, p) in pts.iter().enumerate() {
+        if i + 1 == pts.len() || out.last().is_none_or(|l| dist2([l[0], l[2]], [p[0], p[2]]) >= step) {
+            out.push(*p);
+        }
+    }
+    out
+}
+
+/// A closed path (last point = first) re-started at arc length `s0`: the racing line's own start is arbitrary, and the gates
+/// are searched for in increasing arc length from the route's first point.
+fn rotate_loop(path: &[[f32; 3]], s0: f32) -> Vec<[f32; 3]> {
+    let start = point_at(path, s0);
+    let (mut out, mut head, mut run) = (vec![start], Vec::new(), 0.0);
+    for seg in path.windows(2) {
+        run += dist2([seg[0][0], seg[0][2]], [seg[1][0], seg[1][2]]);
+        if run > s0 + 1e-3 {
+            out.push(seg[1]);
+        } else {
+            head.push(seg[1]);
+        }
+    }
+    out.extend(head);
+    out.push(start);
+    out
+}
+
+/// Point at arc length `s` along the path (clamped to its ends).
+fn point_at(path: &[[f32; 3]], s: f32) -> [f32; 3] {
+    let mut run = 0.0;
+    for seg in path.windows(2) {
+        let l = dist2([seg[0][0], seg[0][2]], [seg[1][0], seg[1][2]]);
+        if l > 1e-6 && run + l >= s {
+            let t = ((s - run) / l).clamp(0.0, 1.0);
+            return std::array::from_fn(|k| seg[0][k] + (seg[1][k] - seg[0][k]) * t);
+        }
+        run += l;
+    }
+    path[path.len() - 1]
+}
+
+/// Unit travel direction (x, z) of the path at arc length `s`: the chord from `half` m before to `half` m after
+/// (wrapping around on closed paths).
+fn path_tangent(path: &[[f32; 3]], s: f32, half: f32, wrap: bool) -> Option<[f32; 2]> {
+    let l = path_len(path);
+    if l < 1.0 {
+        return None;
+    }
+    let at = |x: f32| point_at(path, if wrap { x.rem_euclid(l) } else { x.clamp(0.0, l) });
+    let (a, b) = (at(s - half), at(s + half));
+    let d = [b[0] - a[0], b[2] - a[2]];
+    let n = (d[0] * d[0] + d[1] * d[1]).sqrt();
+    (n > 0.5).then(|| [d[0] / n, d[1] / n])
+}
+
 /// Event barrier bits (INFERRED, docs/RACES.md): route-mask bits 0-14 whose walls stand along the race path
 /// (>= `NEAR_MIN` triangles within 40 m) without any standing on it (within 5 m of the centre line).
 struct Barriers {
@@ -313,6 +406,13 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
     let (world, _) = fh1_world::World::from_disc(disc, "colorado")?;
     let barriers = Barriers::new(&world);
 
+    // Racing lines and ribbon types (docs/RACES.md "Routes and circuits"): which routes are circuits, and the road path.
+    let owt = if routes_fix_on() { owt_lines(disc) } else { HashMap::new() };
+    let ribbon_cfg: HashMap<i64, i64> = db
+        .prepare("SELECT id, RibbonConfiguration FROM Tracks")?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(-1))))?
+        .collect::<Result<_, _>>()?;
+
     let scoring: Vec<i64> = db.prepare("SELECT Credits FROM EventScoring WHERE ScoringID = 1 ORDER BY place")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
     let cars: HashMap<i64, String> = db.prepare("SELECT Id, MediaName FROM Data_Car")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut stmt = db.prepare(
@@ -409,19 +509,45 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
             continue;
         };
         let laps = laps.max(1) as u32;
-        // Laps repeat only when there's more than one; a one-lap "circuit" runs grid -> finish like a point-to-point.
-        let circuit = laps > 1;
+        // Laps repeat only on a closed ribbon (the game's racing line flag; gamedb Tracks.RibbonConfiguration 0) with more
+        // than one lap: NumLaps is also set on point-to-point routes (FR25 / FR17 / FR66 / FR24 / FR21 / FR01), where the
+        // old "laps > 1 = circuit" closed the open route with a return leg. A one-lap "circuit" runs grid -> finish like a
+        // point-to-point.
+        let line = if routes_fix_on() { owt.get(&track_id) } else { None };
+        let closed = match (line, ribbon_cfg.get(&track_id)) {
+            (Some((c, _)), _) => *c,
+            (None, Some(cfg)) => *cfg == 0,
+            (None, None) => true,
+        };
+        let circuit = laps > 1 && (closed || !routes_fix_on());
+        let laps = if circuit || !routes_fix_on() { laps } else { 1 };
         // Route points: the checkpoints for street races (the game's own sequence), the waypoints for festival races.
         let mut route: Vec<Xf> = if cps.is_empty() { wps.clone() } else { std::iter::once(wps[0]).chain(cps.iter().copied()).collect() };
-        if circuit && dist2(route[0].p2(), route[route.len() - 1].p2()) > 30.0 {
-            route.push(route[0]); // close the loop
-        }
-        let mut path = route_path(&graph, &route);
-        if !circuit && project(&path, finish.p2(), 0.0).is_none_or(|x| x.0 > 30.0) {
-            // The finish lies beyond the last route point: drive on to it.
-            route.push(finish);
-            path = route_path(&graph, &route);
-        }
+        // Road path: the game's racing line centre where the route has one (46 routes), else A* on the nav graph between
+        // the route points.
+        let mut path = if let Some((_, pts)) = line {
+            let mut p = thin(pts, 5.0);
+            if circuit {
+                p.push(p[0]); // close the loop
+                // Start the loop at the route's first point so the waypoints come in increasing arc length (the game's
+                // line and the waypoints run in the same direction on all 40 routes with both).
+                if let Some((_, s0)) = project(&p, route[0].p2(), 0.0) {
+                    p = rotate_loop(&p, s0);
+                }
+            }
+            p
+        } else {
+            if circuit && dist2(route[0].p2(), route[route.len() - 1].p2()) > 30.0 {
+                route.push(route[0]); // close the loop
+            }
+            let mut p = route_path(&graph, &route);
+            if !circuit && project(&p, finish.p2(), 0.0).is_none_or(|x| x.0 > 30.0) {
+                // The finish lies beyond the last route point: drive on to it.
+                route.push(finish);
+                p = route_path(&graph, &route);
+            }
+            p
+        };
         let total_len = path_len(&path);
         // Gate candidates in race order with their position along the path (searched forward from the last one).
         let candidates: Vec<Xf> = if cps.is_empty() { wps[1..].to_vec() } else { cps.clone() };
@@ -435,23 +561,25 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
                 }
             }
         }
-        // The finish (lap line): its last position along the path.
-        let s_fin = project_last(&path, finish.p2()).map_or(total_len, |x| x.1);
+        // The finish (lap line): its last position along the path (the nearest one on a racing-line loop, which passes it once).
+        let fin_proj = if line.is_some() && circuit { project(&path, finish.p2(), 0.0) } else { project_last(&path, finish.p2()) };
+        let s_fin = fin_proj.map_or(total_len, |x| x.1);
         let half = |c: &Xf, default: f32| if c.width > 0.0 { (c.width * 0.5).max(15.0) } else { default };
         let mut start_gate = 0u32;
-        let mut seq: Vec<Xf> = if circuit {
+        // The gates with their arc length along the path.
+        let mut seq: Vec<(Xf, f32)> = if circuit {
             // Lap = finish -> finish around the loop; the grid sits part-way in, so lap 1 skips the gates behind it.
             let l = total_len.max(1.0);
             let rel = |s: f32| (s - s_fin).rem_euclid(l);
-            let mut v: Vec<(Xf, f32)> = placed.iter().map(|(c, s)| (*c, rel(*s))).filter(|(_, r)| *r > 30.0 && *r < l - 30.0).collect();
+            let mut v: Vec<(Xf, f32, f32)> = placed.iter().map(|(c, s)| (*c, rel(*s), *s)).filter(|(_, r, _)| *r > 30.0 && *r < l - 30.0).collect();
             v.sort_by(|a, b| a.1.total_cmp(&b.1));
             let r_grid = project(&path, grid[0].p2(), 0.0).map_or(0.0, |x| rel(x.1));
-            start_gate = v.iter().filter(|(_, r)| *r < r_grid).count() as u32;
-            v.into_iter().map(|x| x.0).collect()
+            start_gate = v.iter().filter(|(_, r, _)| *r < r_grid).count() as u32;
+            v.into_iter().map(|x| (x.0, x.2)).collect()
         } else {
-            placed.iter().filter(|(_, s)| *s < s_fin - 30.0).map(|x| x.0).collect()
+            placed.iter().filter(|(_, s)| *s < s_fin - 30.0).copied().collect()
         };
-        seq.push(finish);
+        seq.push((finish, s_fin));
         if !circuit {
             // Run-out past the finish isn't part of the race.
             path = truncate(&path, s_fin + 50.0);
@@ -460,24 +588,33 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
         if let Some(l) = length.filter(|l| *l > 0.0) {
             ratios.push(len / l as f32);
         }
-        // Gate forward = from the previous gate to the next one (the files' facings don't follow the race direction:
-        // waypoints point backwards 1 in 4). Circuits wrap.
+        // Gate forward (FH1_RACE_ROUTES=0 and where the path has no tangent) = from the previous gate to the next one (the
+        // files' facings don't follow the race direction: waypoints point backwards 1 in 4). Circuits wrap.
         let n = seq.len();
         let at = |k: isize| -> [f32; 2] {
             if k < 0 {
-                if circuit { seq[n - 1].p2() } else { grid[0].p2() }
+                if circuit { seq[n - 1].0.p2() } else { grid[0].p2() }
             } else if k as usize >= n {
-                if circuit { seq[0].p2() } else { seq[n - 1].p2() }
+                if circuit { seq[0].0.p2() } else { seq[n - 1].0.p2() }
             } else {
-                seq[k as usize].p2()
+                seq[k as usize].0.p2()
             }
         };
         let gates: Vec<([f32; 3], [f32; 2], f32)> = seq
             .iter()
             .enumerate()
-            .map(|(k, c)| {
+            .map(|(k, (c, s))| {
                 let (a, b) = (at(k as isize - 1), at(k as isize + 1));
-                let d = [b[0] - a[0], b[1] - a[1]];
+                let mut d = [b[0] - a[0], b[1] - a[1]];
+                // The direction of travel at the gate = the road path's tangent there. The neighbour-to-neighbour chord
+                // above points up to 150 degrees off the road at hairpins and between sparse waypoints (and the files'
+                // facings are unreliable), which made gates face backwards: markers leading the wrong way and crossings
+                // that never counted.
+                if routes_fix_on() {
+                    if let Some(t) = path_tangent(&path, *s, 10.0, circuit) {
+                        d = t;
+                    }
+                }
                 let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-3);
                 let w = if k + 1 == n { half(c, 25.0) } else if cps.is_empty() { 30.0 } else { half(c, 25.0) };
                 (c.pos, [d[0] / l, d[1] / l], w)
@@ -503,6 +640,8 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
             "mode": mode,
             "laps": laps,
             "circuit": circuit,
+            "ribbon_closed": closed,
+            "route_src": if line.is_some() { "racing_line" } else { "astar" },
             "drivers": drivers,
             "credits": prize,
             "target_class": class,
@@ -542,6 +681,11 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
         "[events] {} races ({} skipped), path / gamedb length median {median:.2}, {with_bits} with barrier bits, {with_objects} with event objects",
         races.len(),
         skipped.len()
+    );
+    println!(
+        "[events] routes: {} circuits, {} on the game's racing line (FH1_RACE_ROUTES=0 = old rules)",
+        races.iter().filter(|r| r["circuit"].as_bool() == Some(true)).count(),
+        races.iter().filter(|r| r["route_src"] == "racing_line").count()
     );
     for s in &skipped {
         println!("[events] skipped {s}");

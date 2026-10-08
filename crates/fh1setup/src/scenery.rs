@@ -258,11 +258,34 @@ pub fn build_track(src: &TrackSrc, out: &Path) -> Result<()> {
     }
     // Smashables (docs/SMASH.md): whole-object template -> its shard templates (written as templates too).
     let smash = smash_table(&mut ar, &by_name, &objs, &collobj_map, src)?;
+    // Event-only objects (the races' barriers, cones and sponsor boards; fh1setup events.rs lists their placements, the engine
+    // places them at race start through `Scenery::spawn_template`): their templates are written too, though nothing is placed
+    // here. Without them the O_FEST_EquipSign boards (12,597 objects over 61 races) were never drawn. FH1_EVENT_TEMPLATES=0 =
+    // the free-roam templates only (old).
+    let event_templates: HashSet<u16> = if fm4 || std::env::var("FH1_EVENT_TEMPLATES").as_deref() == Ok("0") {
+        HashSet::new()
+    } else {
+        let mut set = HashSet::new();
+        for o in &objs {
+            let t = o.kind.split('.').next().unwrap_or(&o.kind);
+            let Some(&(n, _)) = collobj_map.get(t) else { continue };
+            let Some(c) = props::object_condition(&conds, n, o.position) else { continue };
+            if c.free_roam {
+                continue;
+            }
+            set.extend(props::collobj_placements(std::slice::from_ref(o), &collobj_map).iter().map(|p| p.model_number));
+        }
+        for g in props::track_event_groups(&mut ar, &pvs_bytes)? {
+            set.extend(g.placements.iter().map(|p| p.model_number));
+        }
+        set
+    };
     let templates: HashSet<u16> = placements
         .iter()
         .map(|p| p.model_number)
         .chain(distances.values().flat_map(|d| [d.lod1_model, d.lod2_model]).flatten())
         .chain(smash.values().flat_map(|(_, shards)| shards.iter().copied()))
+        .chain(event_templates.iter().copied())
         .collect();
     // Template -> its first submodel name and bounds (for the collision table).
     let mut template_names: HashMap<u16, String> = HashMap::new();

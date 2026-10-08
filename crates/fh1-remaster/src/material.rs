@@ -73,6 +73,11 @@ pub const FLAG_CLOTH: u16 = 128;
 pub const FLAG_LM_BAKED: u16 = 256;
 pub const FLAG_ROAD: u16 = 512;
 pub const FLAG_TREE: u16 = 1024;
+/// vblnd decal families of the FH1 rules (setup remaster-5): the alpha follows the game's PS (see the shader); bit 12 = alpha
+/// from vertex alpha (`.5 - vc.a`) instead of vertex red, bit 13 = `sat(w)` instead of `1 - sat(w)`.
+pub const FLAG_VB_DECAL: u16 = 2048;
+pub const FLAG_VB_DECAL_A: u16 = 4096;
+pub const FLAG_VB_DECAL_DIRECT: u16 = 8192;
 /// Uniform-only flag (not in the setup table): a decal drawn as an alpha-tested Mask ([`decal_mask_on`]).
 pub const FLAG_DECAL_MASK: u16 = 0x8000;
 
@@ -416,12 +421,23 @@ fn wgsl() -> String {
         );
     }
     decl_bindless += "}\n";
-    // Road / ground minimum roughness (`FH1_RM_ROAD_ROUGHNESS`, default 0.75 since 2026-10-07, was 0.6), baked into the shader source.
-    let road = std::env::var("FH1_RM_ROAD_ROUGHNESS").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.75).clamp(0.0, 1.0);
+    // Road / ground minimum roughness (`FH1_RM_ROAD_ROUGHNESS`, default 0.82 since 2026-10-08, was 0.75, before that 0.6), baked into the shader source.
+    let road = std::env::var("FH1_RM_ROAD_ROUGHNESS").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.82).clamp(0.0, 1.0);
+    // Off-road ground (2026-10-08): roughness floor `FH1_RM_GROUND_ROUGHNESS` (0 = old), reflectance cap
+    // `FH1_RM_GROUND_REFLECTANCE` (1 = old), env-map specular scale on ground + road `FH1_RM_GROUND_SPEC` (1 = old).
+    let genv = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d).clamp(0.0, 1.0);
+    let ground = genv("FH1_RM_GROUND_ROUGHNESS", 0.9);
+    let ground_refl = genv("FH1_RM_GROUND_REFLECTANCE", 0.35);
+    let ground_spec = genv("FH1_RM_GROUND_SPEC", 0.45);
     // Water (`FH1_RM_WATER=flat` debug colour, `FH1_RM_WATER_BUMP`, `FH1_RM_WATER_OPACITY` scale, `FH1_RM_WATER_MIN_ALPHA`).
     let wenv = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
     let flat = std::env::var("FH1_RM_WATER").is_ok_and(|v| v == "flat");
     WGSL.replace("RM_ROAD_ROUGHNESS", &format!("{road:.3}"))
+        .replace("RM_GROUND_ROUGHNESS", &format!("{ground:.3}"))
+        .replace("RM_GROUND_REFLECTANCE", &format!("{ground_refl:.3}"))
+        .replace("RM_GROUND_SPEC", &format!("{ground_spec:.3}"))
+        .replace("RM_VBLEND_NOISE", if std::env::var("FH1_RM_VBLEND_NOISE").is_ok_and(|v| v == "0") { "0.0" } else { "1.0" })
+        .replace("RM_VBLEND_DECAL", if std::env::var("FH1_RM_VBLEND_DECAL").is_ok_and(|v| v == "0") { "0.0" } else { "1.0" })
         .replace("RM_WATER_FLAT", if flat { "1.0" } else { "0.0" })
         .replace("RM_WATER_BUMP", &format!("{:.3}", wenv("FH1_RM_WATER_BUMP", 0.35)))
         .replace("RM_WATER_OPACITY", &format!("{:.3}", wenv("FH1_RM_WATER_OPACITY", 1.0).clamp(0.0, 1.0)))
@@ -704,6 +720,9 @@ const FLAG_REFLECTIVE: u32 = 32u;
 const FLAG_LM_BAKED: u32 = 256u;
 const FLAG_ROAD: u32 = 512u;
 const FLAG_TREE: u32 = 1024u;
+const FLAG_VB_DECAL: u32 = 2048u;
+const FLAG_VB_DECAL_A: u32 = 4096u;
+const FLAG_VB_DECAL_DIRECT: u32 = 8192u;
 const FLAG_DECAL_MASK: u32 = 0x8000u;
 
 fn has(p: SceneryParams, role: u32) -> bool {
@@ -822,7 +841,9 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
             noise = sample_weight(slot, uw, dxw, dyw);
         }
         let c4 = p.p[1];
-        var wb = saturate((vc.r - 0.5) * c4.x + 0.5);
+        // vblnd: the mask / ovly variants break the vertex-colour edge with the noise texture like road (VERIFIED
+        // h_vblnd_norm1_mask_ao_lm PS: sat(0.5 + c4.x (vc.r - .5) + c4.y (noise.r - .5))); c4.y is 0 where there is no noise.
+        var wb = saturate((vc.r - 0.5) * c4.x + (noise.r - 0.5) * c4.y * RM_VBLEND_NOISE + 0.5);
         var wc = 0.0;
         if layering == LAYER_ROAD {
             wb = saturate((vc.r - 0.5) * c4.x + (noise.r - 0.5) * c4.y + 0.5);
@@ -860,8 +881,23 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
             // Road `_blend` (VERIFIED h_road_diff3_noise_blend_ao_lm): opacity = 1 - sat(vertex colour b).
             alpha = 1.0 - saturate(vc.b);
         } else if (flags & FLAG_LM_BAKED) == 0u {
-            // vblnd decals: texture alpha x vertex alpha (INFERRED, as the faithful fallback). Not FM4 (unknown there).
-            alpha = alpha * vc.a;
+            if RM_VBLEND_DECAL > 0.5 && (flags & FLAG_VB_DECAL) != 0u {
+                // vblnd decals (VERIFIED from the Default PS of h_vblnd_opac, _decal_lm, _decal_mask_bias_lm,
+                // _norm_mask_opac_bias_lm): texture alpha x f(w), w = 0.5 + c4.x t + c4.y (noise.r - .5) (noise only on the mask
+                // variants), t = vc.r - .5 (opac / mask_opac) or .5 - vc.a (decal / decal_mask_bias); f = 1 - sat(w), except
+                // decal / decal2 where f = sat(w). Old rule (texture alpha x vertex alpha): the env switch off.
+                let c4 = p.p[1];
+                var nz = 0.5;
+                if has(p, 3u) {
+                    nz = sample_weight(slot, uw, dxw, dyw).r;
+                }
+                let t = select(vc.r - 0.5, 0.5 - vc.a, (flags & FLAG_VB_DECAL_A) != 0u);
+                let w = saturate(0.5 + c4.x * t + c4.y * (nz - 0.5));
+                alpha = alpha * select(1.0 - w, w, (flags & FLAG_VB_DECAL_DIRECT) != 0u);
+            } else {
+                // Old rule (INFERRED, as the faithful fallback). Not FM4 (unknown there).
+                alpha = alpha * vc.a;
+            }
         }
     }
 
@@ -913,6 +949,13 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
         pbr.material.perceptual_roughness = max(pbr.material.perceptual_roughness, road_min_roughness());
         pbr.material.reflectance = min(pbr.material.reflectance, vec3<f32>(0.4));
     }
+    // Off-road ground (h_blnd splat terrain, h_vblnd grass / dirt / gravel; user 2026-10-08: "ground still way too
+    // shiny"): GGX at the game-derived ~0.76 still gives a broad wet sheen; dirt / grass sit near 0.9+, F0 ~0.02.
+    let is_ground = (layering == LAYER_SPLAT || layering == LAYER_VBLEND) && (flags & FLAG_ROAD) == 0u;
+    if is_ground {
+        pbr.material.perceptual_roughness = max(pbr.material.perceptual_roughness, RM_GROUND_ROUGHNESS);
+        pbr.material.reflectance = min(pbr.material.reflectance, vec3<f32>(RM_GROUND_REFLECTANCE));
+    }
     // Reflective (glass, metal) but never road / ground: this clamp ran after the road one and made some road
     // surfaces mirror-like again (user 2026-10-07: "some road surfaces are still very shiny").
     let is_road = layering == LAYER_ROAD || layering == LAYER_VBLEND || (flags & FLAG_ROAD) != 0u;
@@ -925,6 +968,11 @@ fn fragment(in: Out, @builtin(front_facing) is_front: bool) -> FragmentOutput {
         let ao = sample_ao(slot, uao, dxo, dyo).g * 0.95 + 0.05;
         pbr.diffuse_occlusion = vec3<f32>(ao);
         pbr.specular_occlusion = ao;
+    }
+    // Ground / road sky reflection damping (env-map specular only; diffuse untouched): the grazing-angle sky sheen
+    // that makes rough ground read wet under PBR (`FH1_RM_GROUND_SPEC`, 1 = old).
+    if is_ground || is_road {
+        pbr.specular_occlusion = pbr.specular_occlusion * RM_GROUND_SPEC;
     }
 
     // Night: baked lightmap (x albedo) and emissive maps.

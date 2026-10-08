@@ -260,7 +260,7 @@ fn body_paint(car_dir: &Path, choice: Option<u32>) -> Option<(u32, bool)> {
 /// The paint's own finish: `fx/ColorShaderSettings<seq>.xml` (the last file of the game's chain) with a body FresnelScalar
 /// below 0.2 is a matte paint (e.g. FOR_FocusRS500 colour 1, LAM_Reventon_08, LAM_SestoElemento_11; faithful applies the
 /// same file). FH1_RM_MATTE=0 = always glossy.
-fn matte_finish(car_dir: &Path, choice: Option<u32>) -> bool {
+pub fn matte_finish(car_dir: &Path, choice: Option<u32>) -> bool {
     if std::env::var("FH1_RM_MATTE").is_ok_and(|v| v == "0") {
         return false;
     }

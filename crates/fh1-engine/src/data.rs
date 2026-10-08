@@ -921,7 +921,7 @@ impl CarData {
             collision_spheres: collision_spheres(&p["maxdata"]["Collision"]["CollSpheres"], {
                 let tr = [tyre("FrontTireWidthMM", "FrontTireAspect", "FrontWheelDiameterIN")?, tyre("RearTireWidthMM", "RearTireAspect", "RearWheelDiameterIN")?];
                 0.5 * ((hubs[0][1] - tr[0]) + (hubs[2][1] - tr[1]))
-            }),
+            }, bbox),
             car_spheres: car_spheres(&p["maxdata"]["Collision"]["CollSpheres"], bbox),
             camera: p["camera"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? as f32))).collect()).unwrap_or_default(),
             bbox,
@@ -1009,21 +1009,70 @@ fn car_spheres(v: &Value, bbox: [bevy::math::Vec3; 2]) -> Vec<(bevy::math::Vec3,
 }
 
 /// World-contact spheres from MAXData (gamedb space, front = +Z; the model's front is -Z, so flip Z).
-fn collision_spheres(v: &Value, ground_y: f32) -> Vec<(bevy::math::Vec3, f32)> {
+///
+/// 44 cars (most of the traffic cars and several player cars: BMW M6, Camaro ZL1, Audi R8, Reventon, CCX-R...) have only
+/// four Flags 3 (= 1|2) placeholder spheres and NIS_Leaf no MAXData at all, so the `== 1` filter left them with no
+/// world contact whatsoever: they drove straight through every wall, tree and prop (2026-10-08, "we fly straight
+/// through barriers, random whether you do"). Such a car gets contact points at its bounding box's extremities in the
+/// pattern of the other cars' Flags 1 points (OUR rule). `FH1_BODY_CONTACT_FALLBACK=0` = the old (none).
+fn collision_spheres(v: &Value, ground_y: f32, bbox: [bevy::math::Vec3; 2]) -> Vec<(bevy::math::Vec3, f32)> {
     let num = |o: &Value, k: &str, d: f64| o[k].as_f64().unwrap_or(d) as f32;
     let (pos_scale, rad_scale) = (num(v, "PosScale", 1.0), num(v, "RadiusScale", 1.0));
     let offset = bevy::math::Vec3::new(num(v, "PosOffsetX", 0.0), num(v, "PosOffsetY", 0.0), -num(v, "PosOffsetZ", 0.0));
-    let Some(obj) = v.as_object() else { return Vec::new() };
-    obj.iter()
-        // Flags 1 = small contact points on the body's extremities (corners, roof, scrape points);
-        // flags 2 = large spheres that dip below the body (car-vs-car broad shapes, presumably).
-        .filter(|(k, s)| k.starts_with("Sphere") && s["Flags"].as_f64() == Some(1.0))
-        .map(|(_, s)| {
-            let c = bevy::math::Vec3::new(num(s, "PosX", 0.0), num(s, "PosY", 0.0), -num(s, "PosZ", 0.0));
-            (offset + c * pos_scale, num(s, "Radius", 0.3) * rad_scale)
+    let flagged: Vec<(bevy::math::Vec3, f32)> = v
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                // Flags 1 = small contact points on the body's extremities (corners, roof, scrape points);
+                // flags 2 = large spheres that dip below the body (car-vs-car broad shapes, presumably).
+                .filter(|(k, s)| k.starts_with("Sphere") && s["Flags"].as_f64() == Some(1.0))
+                .map(|(_, s)| {
+                    let c = bevy::math::Vec3::new(num(s, "PosX", 0.0), num(s, "PosY", 0.0), -num(s, "PosZ", 0.0));
+                    (offset + c * pos_scale, num(s, "Radius", 0.3) * rad_scale)
+                })
+                // FER_F142_10 / FER_458Spider_12 carry contact points below the ground at stock ride height (PosY -0.171):
+                // kept, they pin the car (top speed 0.002 m/s). The game drives these cars, so it can't be colliding them.
+                .filter(|(c, r)| c.y - r >= ground_y)
+                .collect()
         })
-        // FER_F142_10 / FER_458Spider_12 carry contact points below the ground at stock ride height (PosY -0.171):
-        // kept, they pin the car (top speed 0.002 m/s). The game drives these cars, so it can't be colliding them.
-        .filter(|(c, r)| c.y - r >= ground_y)
-        .collect()
+        .unwrap_or_default();
+    if flagged.is_empty() && std::env::var("FH1_BODY_CONTACT_FALLBACK").map_or(true, |v| v != "0") {
+        return bbox_contact_points(bbox, ground_y);
+    }
+    flagged
+}
+
+/// Fourteen 5 cm contact points on a body box (model space): the four bottom and four hood-height corners, both
+/// flanks at the middle, the nose and tail at hood height, and two roof points. Corners are inset a little (bodies
+/// are rounded). Nothing for a degenerate box.
+fn bbox_contact_points(bbox: [bevy::math::Vec3; 2], ground_y: f32) -> Vec<(bevy::math::Vec3, f32)> {
+    const R: f32 = 0.05;
+    let [a, b] = bbox;
+    let size = b - a;
+    if size.x < 0.5 || size.y < 0.3 || size.z < 1.0 {
+        return Vec::new();
+    }
+    let hx = 0.5 * size.x * 0.93;
+    let cx = 0.5 * (a.x + b.x);
+    let (zf, zr, zm) = (a.z + 0.02 * size.z, b.z - 0.02 * size.z, 0.5 * (a.z + b.z));
+    let low = (a.y + 0.1).max(ground_y + R + 0.01);
+    let mid = a.y + 0.45 * size.y;
+    let roof = a.y + 0.9 * size.y;
+    let p = |x: f32, y: f32, z: f32| (bevy::math::Vec3::new(x, y, z), R);
+    let mut out = Vec::with_capacity(16);
+    for z in [zf, zr] {
+        for x in [cx - hx, cx + hx] {
+            out.push(p(x, low, z));
+            out.push(p(x, mid, z));
+        }
+    }
+    for x in [cx - hx, cx + hx] {
+        out.push(p(x, low, zm));
+        out.push(p(x, mid, zm));
+    }
+    out.push(p(cx, mid, zf));
+    out.push(p(cx, mid, zr));
+    out.push(p(cx - 0.5 * hx, roof, zm));
+    out.push(p(cx + 0.5 * hx, roof, zm));
+    out
 }

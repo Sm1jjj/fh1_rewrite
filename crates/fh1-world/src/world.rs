@@ -232,6 +232,53 @@ impl World {
         });
     }
 
+    /// [`World::sphere_contacts`] for a sphere that moved from `from` to `to` during one physics step (swept test).
+    /// The discrete test only sees a thin wall while the sphere is within `radius` of its plane at a step's end; a
+    /// small sphere moving faster than `2 * radius` per step (the car's 0.05 m contact points above ~50 mph) can step
+    /// over the sheet and then gets pushed out the far side. A triangle whose plane the segment crosses, with the
+    /// crossing point within `radius` of the triangle, is a contact on the side the sphere came from, with the depth
+    /// that puts the sphere back at `radius` from the plane. Other triangles: the usual overlap at `to`.
+    pub fn sphere_sweep(&self, from: [f32; 3], to: [f32; 3], radius: f32, out: &mut Vec<Contact>) {
+        out.clear();
+        let motion = sub(to, from);
+        self.for_tris_in(
+            [from[0].min(to[0]) - radius, from[2].min(to[2]) - radius],
+            [from[0].max(to[0]) + radius, from[2].max(to[2]) + radius],
+            |ti| {
+                if out.iter().any(|c| c.tri == ti) {
+                    return;
+                }
+                let [a, b, c] = self.tri_points(ti);
+                let surface = self.tris[ti as usize].surface;
+                let face = cross(sub(b, a), sub(c, a));
+                let len = dot(face, face).sqrt();
+                if len > 1e-9 {
+                    let n = scale(face, 1.0 / len);
+                    let (d0, d1) = (dot(sub(from, a), n), dot(sub(to, a), n));
+                    if (d0 > 0.0 && d1 < 0.0) || (d0 < 0.0 && d1 > 0.0) {
+                        let p = add(from, scale(motion, d0 / (d0 - d1)));
+                        let q = closest_on_tri(p, a, b, c);
+                        let e = sub(p, q);
+                        if dot(e, e) <= radius * radius {
+                            let side = if d0 > 0.0 { 1.0 } else { -1.0 };
+                            out.push(Contact { point: q, normal: scale(n, side), depth: radius - d1 * side, surface, tri: ti });
+                            return;
+                        }
+                    }
+                }
+                let q = closest_on_tri(to, a, b, c);
+                let d = sub(to, q);
+                let dist2 = dot(d, d);
+                if dist2 >= radius * radius {
+                    return;
+                }
+                let dist = dist2.sqrt();
+                let normal = if dist > 1e-6 { scale(d, 1.0 / dist) } else { normalize(face) };
+                out.push(Contact { point: q, normal, depth: radius - dist, surface, tri: ti });
+            },
+        );
+    }
+
     pub fn tri_points(&self, ti: u32) -> [[f32; 3]; 3] {
         self.tris[ti as usize].v.map(|i| self.verts[i as usize])
     }

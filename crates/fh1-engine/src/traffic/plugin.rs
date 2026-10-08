@@ -6,7 +6,7 @@
 //! player / other cars (vehicle/contact.rs); further out it slides along its lane (far mode: no physics, one ground ray
 //! every few ticks), so dozens of cars cost little. Traffic cars carry `AiCar` + `TrafficCar` (no `AiBrain` / `AiRacer`).
 //!
-//! Flags: FH1_TRAFFIC=0 off, FH1_TRAFFIC_DENSITY=<x> density scale, FH1_TRAFFIC_MAX=<n> road cars cap (default 28),
+//! Flags: FH1_TRAFFIC=0 off, FH1_TRAFFIC_DENSITY=<x> density scale, FH1_TRAFFIC_MAX=<n> road cars cap (default 16),
 //! FH1_TRAFFIC_FESTIVAL=0 no festival drivers, FH1_TRAFFIC_RACE=1 keep traffic in races (the game's `race` settings),
 //! FH1_TRAFFIC_NEAR=<m> full-sim radius (default 110), FH1_TRAFFIC_DRAW=<m> draw distance (default 350),
 //! FH1_TRAFFIC_FRESH=<s> seconds between new body builds (default 4), FH1_TRAFFIC_DEBUG=1 logs.
@@ -381,8 +381,9 @@ fn traffic_spawn(
             want_fest += density_value(d, clock) * 0.01 * fh1_engine::traffic::network::SAMPLE_STEP;
         }
     }
-    // 28 since 2026-10-07 (was 16; user: "we can have more of them"); the body pool holds 48.
-    let cap_road = env_f32("FH1_TRAFFIC_MAX", 28.0);
+    // 16 again since 2026-10-08 (user: back to the stock amount; 28 from 2026-10-07, FH1_TRAFFIC_MAX=28 = that); the
+    // game's densities (FH1_TRAFFIC_DENSITY 1) set the count below the cap. The body pool holds 48.
+    let cap_road = env_f32("FH1_TRAFFIC_MAX", 16.0);
     let want_road = (want_road * scale).min(cap_road * scale.max(1.0)).round() as usize;
     let want_fest = if festival_on { (want_fest * scale).min(8.0 * scale.max(1.0)).round() as usize } else { 0 };
 
@@ -681,7 +682,7 @@ fn spawn_car(
         let paints = std::fs::read(dir.join("physics.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v["colors"].as_array().map(|a| dull_paints(a)))
+            .and_then(|v| v["colors"].as_array().map(|a| traffic_paints(a, &dir)))
             .unwrap_or_default();
         let scene = asset_server.load(GltfAssetLabel::Scene(0).from_asset(format!("cars/{name}/model.gltf")));
         st.models.insert(name.to_owned(), Model { data, scene, paints, last_used: clock });
@@ -704,7 +705,9 @@ fn spawn_car(
     driver.speed = cruise * 0.8;
     v.velocity = tangent * driver.speed;
     let simulated = ground.distance(player) < near_radius();
-    if !simulated {
+    // place() drops the car from 0.3 m (a player reset): a traffic car spawned in view fell and bounced on its springs.
+    // At rest instead: ride height on the springs' static length (Vehicle::new). FH1_TRAFFIC_PLACE_REST=0 = old.
+    if !simulated || flag("FH1_TRAFFIC_PLACE_REST", true) {
         v.position = ground + Vec3::Y * ride_h;
         v.prev_position = v.position;
     }
@@ -852,7 +855,14 @@ fn step_traffic(
             let (pos, t) = sim.driver.ahead(net, 0.0);
             let ground = track.ground.ray(pos + Vec3::Y * 4.0, Vec3::NEG_Y, 12.0).map_or(Vec3::new(pos.x, sim.ground_y, pos.z), |h| h.point);
             let speed = sim.driver.speed;
+            // The far pose already sits at rest height, aligned to the road's slope: keep it, so the car doesn't drop
+            // 0.3 m flat and bounce on its springs in plain view (~110 m). FH1_TRAFFIC_PLACE_REST=0 = old.
+            let keep = (v.position, v.rotation);
             v.place(ground, (-t.x).atan2(-t.z));
+            if flag("FH1_TRAFFIC_PLACE_REST", true) {
+                (v.position, v.rotation) = keep;
+                (v.prev_position, v.prev_rotation) = keep;
+            }
             v.velocity = t * speed;
             for i in 0..4 {
                 v.wheels[i].omega = speed / v.data.tyre_radius[i / 2].max(0.2);
@@ -1089,6 +1099,31 @@ fn sync_traffic_visuals(
         wt.translation = w.hub + Vec3::Y * (v.wheel_drop(w.index) + crate::tyre_vis_lift(v.wheels[w.index].tyre_deflection));
         wt.rotation = Quat::from_rotation_y(v.wheels[w.index].steer) * Quat::from_rotation_x(-v.wheels[w.index].angle);
         wt.scale = w.scale;
+    }
+}
+
+/// Traffic colours (user 2026-10-08: the greys / whites / matte paints looked dull and out of place next to the player's
+/// car): every factory colour (Combo_Colors) of the car except matte finishes (fh1-remaster `matte_finish`: the colour's
+/// own ColorShaderSettings<seq>.xml); a car with only matte colours keeps them. `FH1_TRAFFIC_DULL_PAINTS=1` = the
+/// 2026-10-07 everyday-colours rule below.
+fn traffic_paints(colors: &[serde_json::Value], dir: &std::path::Path) -> Vec<u32> {
+    if std::env::var("FH1_TRAFFIC_DULL_PAINTS").is_ok_and(|v| v == "1") {
+        return dull_paints(colors);
+    }
+    let all: Vec<u32> = colors.iter().filter_map(|c| c["Sequence"].as_u64().map(|s| s as u32)).collect();
+    // One directory listing: only colours that carry their own settings file can be matte.
+    let own: std::collections::HashSet<String> = std::fs::read_dir(dir.join("fx"))
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_ascii_lowercase()).filter(|n| n.starts_with("colorshadersettings")).collect())
+        .unwrap_or_default();
+    let glossy: Vec<u32> = all
+        .iter()
+        .copied()
+        .filter(|seq| !own.contains(&format!("colorshadersettings{seq}.xml")) || !fh1_remaster::car::matte_finish(dir, Some(*seq)))
+        .collect();
+    if glossy.is_empty() {
+        all
+    } else {
+        glossy
     }
 }
 

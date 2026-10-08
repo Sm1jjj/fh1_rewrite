@@ -525,9 +525,38 @@ impl Ground for PropGround<'_> {
         let Some(cols) = props.colliders.as_ref() else { return };
         let started = std::time::Instant::now();
         let _timer = Timer(&props.query_ns, &props.queries, started);
-        for i in props.near(center, radius) {
+        self.prop_contacts(props, cols, center, center, radius, out);
+    }
+
+    /// The track's swept test, plus the props at a few points along the path when the sphere moved far (a thin box
+    /// can't be stepped over below ~240 m/s at 480 Hz, so this is only a guard for very fast cars).
+    fn sphere_sweep(&self, from: Vec3, to: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
+        self.world.sphere_sweep(from, to, radius, out);
+        let Some(props) = self.props else { return };
+        let Some(cols) = props.colliders.as_ref() else { return };
+        let started = std::time::Instant::now();
+        let _timer = Timer(&props.query_ns, &props.queries, started);
+        let moved = from.distance(to);
+        let inner = if moved > 0.25 { ((moved / 0.2).ceil() as usize - 1).min(6) } else { 0 };
+        for k in 1..=inner {
+            let at = from.lerp(to, k as f32 / (inner + 1) as f32);
+            self.prop_contacts(props, cols, at, to, radius, out);
+        }
+        self.prop_contacts(props, cols, to, to, radius, out);
+    }
+}
+
+impl PropGround<'_> {
+    /// Prop contacts of the sphere at `at`, expressed for the sphere's end position `end` (the depth that pushes the
+    /// sphere at `end` out to where it touches the shape; contacts that `end` has already moved clear of are dropped).
+    fn prop_contacts(&self, props: &PropCollision, cols: &Colliders, at: Vec3, end: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
+        for i in props.near(at, radius) {
             let c = &cols.list[i as usize];
-            let Some((point, normal, depth)) = sphere_vs_all(&c.shapes, center, radius) else { continue };
+            let Some((point, normal, depth)) = sphere_vs_all(&c.shapes, at, radius) else { continue };
+            let depth = depth - (end - at).dot(normal);
+            if depth <= 0.0 {
+                continue;
+            }
             if c.mass.is_some() {
                 if self.hits.borrow().contains(&i) {
                     continue;

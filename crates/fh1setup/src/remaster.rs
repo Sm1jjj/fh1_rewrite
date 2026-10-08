@@ -87,6 +87,11 @@ pub const FLAG_ROAD: u16 = 512;
 /// Tree / foliage cards (`tree_*`, `diff_treebend*`, `treecard_*`): the game lights them per instance without vertex
 /// normals; the remaster gives them a spherical foliage normal from the tree origin (no back-face flip).
 pub const FLAG_TREE: u16 = 1024;
+/// `h_vblnd_*` decals of the FH1 rules: the shader derives the alpha from the game's PS (remaster-5). Bit 12: alpha from the
+/// vertex alpha (`.5 - vc.a`) instead of vertex red (`vc.r - .5`); bit 13: `sat(w)` instead of `1 - sat(w)`.
+pub const FLAG_VB_DECAL: u16 = 2048;
+pub const FLAG_VB_DECAL_A: u16 = 4096;
+pub const FLAG_VB_DECAL_DIRECT: u16 = 8192;
 
 /// One family's sampler register -> role.
 fn sampler_role(name: &str) -> Option<usize> {
@@ -283,6 +288,17 @@ fn record(shader: &str, ps: &[[f32; 4]], textures: &[Value], fam: Option<&Family
         r.params[1] = c(4);
         r.params[2] = [one(c(5)[0]), one(c(5)[1]), one(c(5)[2]), 0.5];
         r.params[3][0] = c(3)[3];
+        if !road && r.class == Class::Decal {
+            // Decal alpha per family (VERIFIED from the Default PS, re/out/headlight/track): `_decal` / `_decal2` / `_decal_mask_bias`
+            // read the vertex ALPHA (.5 - a); `_opac*` read vertex red (r - .5). Only `_decal_lm` / `_decal2_lm` use sat(w) as is.
+            r.flags |= FLAG_VB_DECAL;
+            if shader.contains("_decal") {
+                r.flags |= FLAG_VB_DECAL_A;
+                if !shader.contains("_mask") {
+                    r.flags |= FLAG_VB_DECAL_DIRECT;
+                }
+            }
+        }
     } else if shader.starts_with("anim_flag") || shader.starts_with("lake_") {
         // Flag / lake constants drive their vertex animation and scrolling normals, not the UVs.
     } else {

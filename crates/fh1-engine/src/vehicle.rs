@@ -58,6 +58,11 @@ pub trait Ground {
     fn ray(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<GroundHit>;
     /// Every overlap of the sphere with world geometry (written to out, cleared first).
     fn sphere(&self, center: Vec3, radius: f32, out: &mut Vec<SphereContact>);
+    /// [`Ground::sphere`] for a sphere that moved from `from` to `to` during the step: contacts it passed through
+    /// (thin walls it stepped over) count too, with normals on the side it came from. Default: the overlap at `to`.
+    fn sphere_sweep(&self, _from: Vec3, to: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
+        self.sphere(to, radius, out);
+    }
 }
 
 /// Infinite plane at y = 0 (test track, parity runs).
@@ -326,6 +331,7 @@ impl Vehicle {
     }
 
     pub fn step(&mut self, input: Controls, dt: f32, ground: &dyn Ground) {
+        let start_pose = (self.position, self.rotation);
         let up = self.rotation * Vec3::Y;
         let down = -up;
         let mut force = Vec3::NEG_Y * self.data.mass * GRAVITY;
@@ -530,7 +536,7 @@ impl Vehicle {
         let spin = Quat::from_xyzw(self.angular_velocity.x, self.angular_velocity.y, self.angular_velocity.z, 0.0) * self.rotation;
         self.rotation = (self.rotation + spin * (0.5 * dt)).normalize();
 
-        self.collide_body(ground);
+        self.collide_body(ground, start_pose);
     }
 
     /// Static-friction hold (82D2E4A8, VERIFIED from code; added after the tyre forces and FrictionTorqueMod): with all
@@ -665,15 +671,29 @@ impl Vehicle {
 
     /// Resolve the car's collision spheres (MAXData) against the world: push out of overlaps and
     /// apply a contact impulse with a little bounce and friction.
-    fn collide_body(&mut self, ground: &dyn Ground) {
+    ///
+    /// Swept (2026-10-08, "we fly straight through barriers"): the contact points are 0.05 m spheres and the walls are
+    /// zero-thickness triangle sheets, so above ~50 mph a point stepped over a wall between two substeps (480 Hz).
+    /// A sphere that moved more than its radius during the step (`start_pose` = position / rotation before it) is
+    /// tested along its path as well ([`Ground::sphere_sweep`]). `FH1_BODY_SWEEP=0` = the old discrete test.
+    fn collide_body(&mut self, ground: &dyn Ground, start_pose: (Vec3, Quat)) {
         const RESTITUTION: f32 = 0.15;
         const FRICTION: f32 = 0.35;
+        static SWEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sweep = *SWEEP.get_or_init(|| std::env::var("FH1_BODY_SWEEP").map_or(true, |v| v != "0"));
         let mut contacts = Vec::new();
         let inv_mass = 1.0 / self.data.mass;
         let spheres = self.data.collision_spheres.clone();
         for (si, (centre, radius)) in spheres.into_iter().enumerate() {
             let c = self.position + self.rotation * (centre - self.cg_model);
-            ground.sphere(c, radius, &mut contacts);
+            let from = start_pose.0 + start_pose.1 * (centre - self.cg_model);
+            let moved = c.distance(from);
+            // Teleports (place / rewind) happen between steps, never inside one: a long path is a bug elsewhere.
+            if sweep && moved > radius && moved < 5.0 {
+                ground.sphere_sweep(from, c, radius, &mut contacts);
+            } else {
+                ground.sphere(c, radius, &mut contacts);
+            }
             // Deepest contact only, so overlapping triangles don't push several times.
             let Some(ct) = contacts.iter().copied().max_by(|a, b| a.depth.total_cmp(&b.depth)) else { continue };
             self.body_contacts += 1;
