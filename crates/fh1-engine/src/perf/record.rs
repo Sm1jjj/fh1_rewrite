@@ -84,6 +84,7 @@ pub fn plugin(app: &mut App) {
     let stalls = rec.csv.with_file_name(rec.csv.file_stem().map_or_else(|| "stalls".into(), |s| format!("{}_stalls.txt", s.to_string_lossy())));
     super::watchdog::plugin(app, stalls);
     super::draws::plugin(app);
+    super::meshes::plugin(app);
     super::watchdog::set_span_totals(true);
     app.insert_resource(rec).add_systems(Last, record);
 }
@@ -92,7 +93,7 @@ const HEADER: &str = "kind,t_s,utc,map,car,renderer,state,x,y,z,speed_kmh,fps,fr
 rt_extract,rt_prepare_assets,rt_specialize,rt_queue,rt_prepare,rt_render,rt_total,main_wait,main_to_preupdate,main_to_update,\
 main_to_postupdate,main_to_last,main_busy,cpu_process,cpu_system,ram_process_mb,ram_system_mb,gpu_util,vram_mb,vram_total_mb,gpu_temp,\
 entities,meshes,meshes_visible,zones_loaded,zones_pending,prop_tiles,prop_pending,prop_placing,zone_loads,prop_tile_loads,\
-scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms,hitch_spans";
+scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred,sched_gap_ms,hitch_spans,mesh_uploads,mesh_upload_mb";
 
 /// One (map, car, renderer) stretch of play.
 #[derive(Default)]
@@ -126,6 +127,10 @@ pub struct Recorder {
     systems: PathBuf,
     span_totals: HashMap<String, (f64, u32)>,
     span_frames: u64,
+    /// Mesh uploads (perf/meshes.rs): this second's count and bytes, and the previous frame's census (the render world
+    /// runs a frame behind, so a hitch reports the bigger of the two).
+    uploads_sec: (u32, u64),
+    uploads_prev: super::meshes::Uploads,
 }
 
 impl Recorder {
@@ -166,6 +171,8 @@ impl Recorder {
             systems,
             span_totals: HashMap::new(),
             span_frames: 0,
+            uploads_sec: (0, 0),
+            uploads_prev: Default::default(),
         })
     }
 
@@ -287,8 +294,12 @@ fn record(
     let key = (map.clone(), car_name.clone(), r.renderer);
     let streamed: [u32; 3] = std::array::from_fn(|k| STREAMED[k].load(Ordering::Relaxed));
     let gauges = scenery.as_ref().map(|s| s.stream_gauges()).unwrap_or_default();
-    // This frame's slowest spans (read every frame: it resets them).
+    // This frame's slowest spans and mesh uploads (read every frame: that resets them).
     let frame_spans = super::watchdog::take_frame_spans(5);
+    let uploads = super::meshes::take();
+    r.uploads_sec.0 += uploads.count;
+    r.uploads_sec.1 += uploads.bytes;
+
     if counting {
         let seg = r.segment(key.clone());
         seg.frames.push(ms);
@@ -300,9 +311,10 @@ fn record(
             parts.sort_by(|a, b| b.0.total_cmp(&a.0));
             let ds: Vec<u32> = (0..3).map(|k| streamed[k] - r.streamed_prev[k]).collect();
             let (pos, kmh) = car.map_or((Vec3::ZERO, 0.0), |c| (c.0.position, c.0.velocity.length() * 3.6));
+            let upload_text = if uploads.bytes >= r.uploads_prev.bytes { uploads.describe() } else { r.uploads_prev.describe() };
             let spans = frame_spans.iter().map(|(n, ms)| format!("{} {ms:.1}", short_span(n))).collect::<Vec<_>>().join(", ");
             let attr = format!(
-                "top: {}; systems: {spans}; streaming this second: {} zone loads, {} prop tiles, {} spawned",
+                "top: {}; systems: {spans}; {upload_text}; streaming this second: {} zone loads, {} prop tiles, {} spawned",
                 parts.iter().take(3).map(|(v, n)| format!("{n} {v:.0}")).collect::<Vec<_>>().join(", "),
                 ds[0],
                 ds[1],
@@ -319,10 +331,12 @@ fn record(
             row.main(&main);
             row.gauges(&gauges, &ds);
             row.set("hitch_ms", ms, 1);
-            row.text("hitch_spans", csv_field(&frame_spans.iter().map(|(n, ms)| format!("{} {ms:.1}", short_span(n))).collect::<Vec<_>>().join("; ")));
+            let spans_text = frame_spans.iter().map(|(n, ms)| format!("{} {ms:.1}", short_span(n))).collect::<Vec<_>>().join("; ");
+            row.text("hitch_spans", csv_field(&format!("{spans_text}; {upload_text}")));
             r.buf += &row.line();
         }
     }
+    r.uploads_prev = uploads;
     let quitting = exit.read().next().is_some();
     if r.t - r.sec_start >= 1.0 || quitting {
         let n = r.frames.len();
@@ -393,6 +407,9 @@ fn record(
                 row.text(c, n.to_string());
             }
             row.text("sched_gap_ms", super::watchdog::take_sched_gap_ms().to_string());
+            row.text("mesh_uploads", r.uploads_sec.0.to_string());
+            row.set("mesh_upload_mb", r.uploads_sec.1 as f32 / (1024.0 * 1024.0), 1);
+            r.uploads_sec = (0, 0);
             row.text("prop_levels_deferred", scenery.as_ref().map_or(0, |s| s.deferred_prop_levels()).to_string());
             // Last frame's render-phase draw counts (perf/draws.rs).
             for (name, c) in super::draws::NAMES.iter().zip(&super::draws::COUNTS) {

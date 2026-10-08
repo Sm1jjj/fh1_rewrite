@@ -10,6 +10,7 @@
 //! Frame pacing (default on, FH1_FRAMEPACE=0 = off) and its 30 s pacing log: [`pacing`]; wheel interpolation: [`interp`].
 
 mod draws;
+mod meshes;
 mod exec;
 mod hitch;
 mod p6;

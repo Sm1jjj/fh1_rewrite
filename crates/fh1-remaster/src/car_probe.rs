@@ -77,6 +77,15 @@
 //!   sum(intensity x weight) / sum(weight) is then the same on every frame whatever the timing. A new bake replaces the
 //!   idle slot's maps at intensity 0 (invisible in any frame). FH1_RM_CAR_PROBE_FADE=0 = instant swap.
 //!
+//! - **Even cadence** (2026-10-08 pm, P8-B; FH1_RM_PROBE_EVEN=0 = the bursts above): the user felt micro-stutter, a camera
+//!   log showed alternating 13-23 ms frames ~every 0.12 s. With spread 2 a whole-world face came every other frame and a
+//!   bake every 0.25 s at speed. Now the face camera stays awake and renders ONE face EVERY frame, round-robin
+//!   (+X -X +Y -Y +Z -Z), into a rolling cube, so each frame carries the same small extra view instead of alternating
+//!   heavy / light frames. A bake is only the filter + crossfade of that cube (no capture phase); bakes keep the speed-based
+//!   interval (GraphicsQuality / FH1_RM_CAR_PROBE_EVERY*). Faces cull at FH1_RM_CAR_PROBE_FAR (150 m in this mode; 300 in
+//!   the old one), the down face at 8 m; small scenery stays on the main-only layer. The face exposure follows the
+//!   lighting's EV each frame it changes by > 0.05.
+//!
 //! Anchor: the player car's `fh1_render::reflect::EnvCubeAnchor` (main.rs). Default on (FH1_RM_CAR_PROBE=0 = off, the camera's
 //! atmosphere env only); FH1_RM_CAR_PROBE_RES=n face size (256 since 2026-10-08, was 128). The face camera gets no sun cascades: light.rs empties every
 //! non-main view's entry (it must stay present, see `main_view_cascades_only`).
@@ -199,6 +208,10 @@ struct ProbeState {
     /// Face camera target and the current face size (resized by the quality preset).
     target: Handle<Image>,
     size: u32,
+    /// Even cadence: next face to render, faces rendered since the last bake, exposure the faces render at.
+    next_face: u8,
+    faces_since_bake: u32,
+    face_ev: Option<f32>,
 }
 
 /// Crossfade time (s); 0 = instant swap (before 2026-10-08).
@@ -213,6 +226,12 @@ fn fade_secs() -> f32 {
 /// 2 since 2026-10-08 with the crossfade (staleness no longer shows as a pop; half the per-frame load).
 fn sleep_on() -> bool {
     std::env::var("FH1_RM_CAR_PROBE_SLEEP").map_or(true, |v| v != "0")
+}
+
+/// FH1_RM_PROBE_EVEN=0 = the old capture bursts (module doc "Even cadence").
+fn even_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_RM_PROBE_EVEN").map_or(true, |v| v != "0"))
 }
 
 fn face_spread() -> u32 {
@@ -407,10 +426,14 @@ fn drive(
         }
     }
     let ev100 = lighting.as_ref().map_or(9.7, |l| l.ev100);
+    let even = even_on();
     match state.phase {
         Phase::Idle => {
-            f.set_if_neq(CarProbeFace(NO_FACE));
-            layers.set_if_neq(idle.clone());
+            // Even cadence: the face block after the match owns the face / layers (no per-frame flip-flop).
+            if !even {
+                f.set_if_neq(CarProbeFace(NO_FACE));
+                layers.set_if_neq(idle.clone());
+            }
             let due = state.last_bake.is_none_or(|(t, p)| {
                 let age = now - t;
                 age >= every
@@ -442,7 +465,14 @@ fn drive(
                     state.active = None;
                     state.fade = None;
                 }
-            } else if due && state.fade.is_none() && lighting.as_ref().is_some_and(|l| l.sun_dir != Vec3::ZERO) {
+            } else if even && due && state.fade.is_none() && state.faces_since_bake >= 6 {
+                // Even cadence: the rolling cube is current (all six faces since the last bake): filter it now.
+                state.ev100 = ev100;
+                state.last_bake = Some((now, car_pos));
+                state.faces_since_bake = 0;
+                state.gap = 0;
+                state.phase = Phase::Capture(6);
+            } else if !even && due && state.fade.is_none() && lighting.as_ref().is_some_and(|l| l.sun_dir != Vec3::ZERO) {
                 state.centre = car_pos + Vec3::Y * 0.8;
                 state.ev100 = ev100;
                 state.last_bake = Some((now, car_pos));
@@ -484,9 +514,11 @@ fn drive(
         }
         Phase::Capture(_) => {
             // All six faces rendered (the last one in the previous frame): filter.
-            f.set_if_neq(CarProbeFace(NO_FACE));
-            layers.set_if_neq(idle.clone());
-            if sleep && cam.is_active {
+            if !even {
+                f.set_if_neq(CarProbeFace(NO_FACE));
+                layers.set_if_neq(idle.clone());
+            }
+            if sleep && !even && cam.is_active {
                 cam.is_active = false;
             }
             let intensity = 1.2 * 2f32.powf(state.ev100);
@@ -544,6 +576,45 @@ fn drive(
                 state.phase = Phase::Idle;
             }
         }
+    }
+
+    // ---- even cadence: one face every frame (module doc) ----
+    if even {
+        let lit = lighting.as_ref().is_some_and(|l| l.sun_dir != Vec3::ZERO && !(l.sun_dir.y <= 0.0 && l.night < 0.5));
+        if !lit {
+            f.set_if_neq(CarProbeFace(NO_FACE));
+            layers.set_if_neq(idle.clone());
+            if sleep && cam.is_active {
+                cam.is_active = false;
+            }
+            state.faces_since_bake = 0;
+            return;
+        }
+        if !cam.is_active {
+            // Wake: this frame on the idle layer so visibility catches up before the first face (module doc).
+            cam.is_active = true;
+            f.set_if_neq(CarProbeFace(NO_FACE));
+            layers.set_if_neq(idle.clone());
+            return;
+        }
+        if state.face_ev.is_none_or(|e| (e - ev100).abs() > 0.05) {
+            state.face_ev = Some(ev100);
+            commands.entity(face_e).insert(bevy::camera::Exposure { ev100 });
+        }
+        let k = state.next_face % 6;
+        state.next_face = (k + 1) % 6;
+        state.faces_since_bake += 1;
+        let (fwd, up) = face_basis(k);
+        if let Projection::Perspective(p) = &mut *proj {
+            let far = if k == 3 { env_f32("FH1_RM_CAR_PROBE_DOWN_FAR", 8.0) } else { env_f32("FH1_RM_CAR_PROBE_FAR", 150.0) };
+            if p.far != far {
+                p.far = far;
+            }
+        }
+        *ft = Transform::from_translation(car_pos + Vec3::Y * 0.8).looking_to(fwd, up);
+        *fg = GlobalTransform::from(*ft);
+        f.set_if_neq(CarProbeFace(k));
+        layers.set_if_neq(bevy::camera::visibility::RenderLayers::layer(0));
     }
 }
 
