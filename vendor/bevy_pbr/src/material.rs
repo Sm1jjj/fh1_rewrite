@@ -846,6 +846,7 @@ pub fn check_entities_needing_specialization<M>(
         ),
     >,
     mut par_local: Local<Parallel<Vec<Entity>>>,
+    all: Query<(), With<MeshMaterial3d<M>>>,
     mut entities_needing_specialization: ResMut<EntitiesNeedingSpecialization<M>>,
     mut removed_mesh_3d_components: RemovedComponents<Mesh3d>,
     mut removed_mesh_material_3d_components: RemovedComponents<MeshMaterial3d<M>>,
@@ -856,10 +857,16 @@ pub fn check_entities_needing_specialization<M>(
     entities_needing_specialization.removed.clear();
 
     // Gather all entities that need their specializations regenerated.
-    needs_specialization
-        .par_iter()
-        .for_each(|entity| par_local.borrow_local_mut().push(entity));
-    par_local.drain_into(&mut entities_needing_specialization.changed);
+    // FH1 patch: a serial walk below 4096 entities (the task-pool scope cost ~0.15 ms per material type per frame,
+    // mostly waiting on busy workers, for a handful of tick checks). `FH1_SPEC_PAR=1` = always parallel (upstream).
+    if fh1_spec_par() || all.iter().len() > 4096 {
+        needs_specialization
+            .par_iter()
+            .for_each(|entity| par_local.borrow_local_mut().push(entity));
+        par_local.drain_into(&mut entities_needing_specialization.changed);
+    } else {
+        entities_needing_specialization.changed.extend(needs_specialization.iter());
+    }
 
     // All entities that removed their `Mesh3d` or `MeshMaterial3d` components
     // need to have their specializations removed as well.
@@ -875,6 +882,12 @@ pub fn check_entities_needing_specialization<M>(
     {
         entities_needing_specialization.removed.push(entity);
     }
+}
+
+/// FH1 patch: `FH1_SPEC_PAR=1` = upstream's always-parallel gather in `check_entities_needing_specialization`.
+fn fh1_spec_par() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_SPEC_PAR").is_ok_and(|v| v == "1"))
 }
 
 pub(crate) struct SpecializationWorkItem {

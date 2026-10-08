@@ -24,3 +24,9 @@ Rebase them when Bevy is upgraded (or drop them if upstream gains shadow caching
    (by render layers) raced with the car probe face switching layers in the same frame. Now a view without an entry
    despawns its directional shadow views and is skipped. light.rs since prunes only non-Camera3d views (never looked up
    here), so this is a safety net.
+
+3. **Serial specialization gather** (dc, 2026-10-08, main-thread job). `check_entities_needing_specialization<M>`
+   (`src/material.rs`) gathered changed entities with `par_iter` for every material type every frame: ~0.13-0.18 ms
+   each x 10 material types in the user's log 20261008_154403, mostly task-pool scope cost for a handful of tick checks.
+   Now a serial walk when the material has <= 4096 entities (`Query<(), With<MeshMaterial3d<M>>>::iter().len()`, cheap).
+   `FH1_SPEC_PAR=1` = always parallel (upstream).

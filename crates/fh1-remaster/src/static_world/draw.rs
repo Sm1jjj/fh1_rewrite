@@ -7,6 +7,10 @@
 //! band from the LOD eye, frustum vs world AABB, per-kind rules) and writes its `DrawIndexedIndirect` args into the view's
 //! own region with instance_count 1 or 0; each bin is then one `multi_draw_indexed_indirect`. Per-frame CPU work is
 //! O(views x bins), independent of the record count.
+//! Hi-Z (chunk 5, 47; static_world/hiz.rs, `FH1_STATIC_WORLD_HIZ=0` = off): the main camera culls twice. Phase 1 draws
+//! what was visible last frame, the main depth is reduced into a min-depth pyramid, phase 2 tests every frustum / LOD-
+//! passing candidate's projected box against it, stores the visibility bit and draws the newly visible ones (own args
+//! region / draw counts). Only with a single-sample main depth that has TEXTURE_BINDING (light.rs `hiz_depth_usage`).
 //! Compaction (chunk 5, default when the GPU has MULTI_DRAW_INDIRECT_COUNT; `FH1_STATIC_WORLD_COMPACT=0` = off): visible
 //! candidates are appended per (view, bin) with an atomic counter and each bin is drawn with
 //! `multi_draw_indexed_indirect_count`, so culled entries cost nothing (no zero-instance draws for the command processor).
@@ -86,10 +90,12 @@ pub(super) fn register_shaders(app: &mut App) {
     let mut shaders = app.world_mut().resource_mut::<Assets<Shader>>();
     let _ = shaders.insert(&CULL_SHADER, Shader::from_wgsl(CULL_WGSL, "fh1_remaster/static_world_cull.wgsl"));
     let _ = shaders.insert(&SHADOW_SHADER, Shader::from_wgsl(shadow_wgsl(), "fh1_remaster/static_world_shadow.wgsl"));
+    super::hiz::register_shaders(&mut shaders);
 }
 
 pub(super) fn plugin(ra: &mut SubApp) {
     ra.init_resource::<SpecializedRenderPipelines<SwPipeline>>()
+        .init_resource::<super::hiz::Hiz>()
         .init_resource::<SpecializedRenderPipelines<ShadowPipeline>>()
         .init_resource::<DrawLists>()
         .init_resource::<ViewUniforms>()
@@ -97,7 +103,11 @@ pub(super) fn plugin(ra: &mut SubApp) {
         .add_systems(Render, (init_pipelines, specialize_views).chain().in_set(RenderSystems::Queue))
         .add_systems(Render, (prepare_views, prepare_bind_groups).chain().in_set(RenderSystems::PrepareBindGroups))
         .add_systems(Core3d, draw_static_shadows.after(bevy::pbr::per_view_shadow_pass::<true>).before(Core3dSystems::MainPass))
-        .add_systems(Core3d, draw_static_world.after(main_opaque_pass_3d).in_set(Core3dSystems::MainPass));
+        .add_systems(
+            Core3d,
+            // Before Bevy's transparent pass too (decals / water / glass over the static ground; dc).
+            draw_static_world.after(main_opaque_pass_3d).before(bevy::core_pipeline::core_3d::main_transparent_pass_3d).in_set(Core3dSystems::MainPass),
+        );
 }
 
 // ---------------------------------------------------------------- pipelines
@@ -276,9 +286,13 @@ fn init_pipelines(
                 storage_buffer_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, None),
+                // Hi-Z: visibility bits, pyramid.
+                storage_buffer_sized(false, None),
+                bevy::render::render_resource::binding_types::texture_2d(bevy::render::render_resource::TextureSampleType::Float { filterable: false }),
             ),
         ),
     );
+    commands.insert_resource(super::hiz::HizPipelines::new(&cache));
     let compact = compact_wanted() && device.features().contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT);
     let id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("static world cull".into()),
@@ -406,6 +420,8 @@ pub(super) struct DrawLists {
     bin_first: Option<Buffer>,
     counts: Option<Buffer>,
     bins_cap: u32,
+    /// Bumped on every candidate list rebuild (Hi-Z: the visibility bits reset).
+    generation: u64,
     arena_bind_group: Option<(u32, BindGroup)>,
     shadow_pipelines: HashMap<Variant, CachedRenderPipelineId>,
 }
@@ -446,6 +462,7 @@ fn build_lists(mut arena: ResMut<Arena>, mut lists: ResMut<DrawLists>, device: R
     }
     lists.bins = bins;
     lists.count = slots.len() as u32;
+    lists.generation += 1;
     if slots.is_empty() {
         return;
     }
@@ -526,11 +543,17 @@ pub(super) struct ViewUniform {
     params: Vec4,
     /// x kind (0 main, 1 shadow, 2 probe), y args base (entries), z candidate count, w draw-count base (compaction).
     info: UVec4,
+    /// Hi-Z: x phase (0 single cull, 1 last frame's visible, 2 occlusion test), y pyramid mip levels.
+    extra: UVec4,
 }
 
 const KIND_MAIN: u32 = 0;
 const KIND_SHADOW: u32 = 1;
 const KIND_PROBE: u32 = 2;
+
+/// The main view's phase-2 cull (Hi-Z): its own uniform, args region and draw counts.
+#[derive(Component, Clone, Copy)]
+pub(super) struct SwCullViewHiz(SwCullView);
 
 /// A view's cull uniform offset and args region (this frame).
 #[derive(Component, Clone, Copy)]
@@ -590,12 +613,15 @@ fn prepare_views(
     skip: Option<Res<DirectionalShadowSkipThisFrame>>,
     cameras: Query<(Entity, &ExtractedView, &ExtractedCamera, Option<&CarProbeFace>, Option<&ViewLightEntities>), With<ViewTarget>>,
     lights: Query<(&ExtractedView, Option<&LightEntity>), With<ShadowView>>,
-    stale: Query<Entity, With<SwCullView>>,
+    stale: Query<Entity, Or<(With<SwCullView>, With<SwCullViewHiz>)>>,
+    depths: Query<&ViewDepthTexture>,
+    (mut hiz, hiz_pipes, cache): (ResMut<super::hiz::Hiz>, Option<Res<super::hiz::HizPipelines>>, Res<PipelineCache>),
 ) {
     // Views not drawn this frame (a cached cascade, an idle probe face) must not keep last frame's slot.
     for e in &stale {
-        commands.entity(e).remove::<SwCullView>();
+        commands.entity(e).remove::<(SwCullView, SwCullViewHiz)>();
     }
+    hiz.active = false;
     let u = &mut *uniforms;
     u.buffer.clear();
     CANDIDATES.store(lists.count, std::sync::atomic::Ordering::Relaxed);
@@ -605,15 +631,15 @@ fn prepare_views(
     }
     let (count, region, bins_cap) = (lists.count, lists.region, lists.bins_cap);
     let mut slot = 0u32;
-    let mut push = |commands: &mut Commands, e: Entity, vu: ViewUniform, buffer: &mut DynamicUniformBuffer<ViewUniform>| {
+    let mut push = |vu: ViewUniform, buffer: &mut DynamicUniformBuffer<ViewUniform>| -> Option<SwCullView> {
         if slot >= MAX_VIEWS {
-            return;
+            return None;
         }
         let base = slot * region;
         let counts = slot * bins_cap;
         let offset = buffer.push(&ViewUniform { info: UVec4::new(vu.info.x, base, count, counts), ..vu });
-        commands.entity(e).insert(SwCullView { offset, base, counts });
         slot += 1;
+        Some(SwCullView { offset, base, counts })
     };
     let skip_mask = skip.map_or(0, |s| s.0);
     for (e, view, camera, face, view_lights) in &cameras {
@@ -625,8 +651,28 @@ fn prepare_views(
         let cfw = clip_from_world(view);
         let eye = view.world_from_view.translation();
         let (p, n) = planes(&cfw, true);
+        // Hi-Z for the main view: a single-sample depth that can be sampled, compiled pipelines.
+        let hiz_now = main
+            && super::hiz::hiz_on()
+            && hiz_pipes.as_ref().is_some_and(|p| p.ready(&cache))
+            && depths.get(e).is_ok_and(|d| d.texture.sample_count() == 1 && d.texture.usage().contains(bevy::render::render_resource::TextureUsages::TEXTURE_BINDING));
+        if hiz_now {
+            if let Ok(d) = depths.get(e) {
+                let sz = d.texture.size();
+                hiz.ensure_pyramid(&device, UVec2::new(sz.width, sz.height));
+            }
+            hiz.active = true;
+        }
+        let mips = hiz.mips();
         let vu = if main {
-            ViewUniform { clip_from_world: cfw, planes: p, eye: eye.extend(1.0), params: Vec4::new(0.0, 0.0, 0.0, n as f32), info: UVec4::new(KIND_MAIN, 0, 0, 0) }
+            ViewUniform {
+                clip_from_world: cfw,
+                planes: p,
+                eye: eye.extend(1.0),
+                params: Vec4::new(0.0, 0.0, 0.0, n as f32),
+                info: UVec4::new(KIND_MAIN, 0, 0, 0),
+                extra: UVec4::new(if hiz_now { 1 } else { 0 }, mips, 0, 0),
+            }
         } else {
             // 47's probe rules: radius >= probe_min_radius, within the face's far plane (80 m, down face 8 m).
             let far = if face == Some(3) { 8.0 } else { 80.0 };
@@ -636,9 +682,17 @@ fn prepare_views(
                 eye: eye.extend(1.0),
                 params: Vec4::new(crate::car_probe::probe_min_radius(), far, 0.0, n as f32),
                 info: UVec4::new(KIND_PROBE, 0, 0, 0),
+                extra: UVec4::ZERO,
             }
         };
-        push(&mut commands, e, vu, &mut u.buffer);
+        if let Some(cv) = push(vu, &mut u.buffer) {
+            commands.entity(e).insert(cv);
+        }
+        if hiz_now {
+            if let Some(cv) = push(ViewUniform { extra: UVec4::new(2, mips, 0, 0), ..vu }, &mut u.buffer) {
+                commands.entity(e).insert(SwCullViewHiz(cv));
+            }
+        }
         // The main camera's directional cascades.
         if main && shadows_on() {
             for &le in view_lights.map_or(&[][..], |l| l.lights.as_slice()) {
@@ -655,8 +709,11 @@ fn prepare_views(
                     eye: eye.extend(1.0),
                     params: Vec4::new(0.0, 0.0, small_dist(), n as f32),
                     info: UVec4::new(KIND_SHADOW, 0, 0, 0),
+                    extra: UVec4::ZERO,
                 };
-                push(&mut commands, le, vu, &mut u.buffer);
+                if let Some(cv) = push(vu, &mut u.buffer) {
+                    commands.entity(le).insert(cv);
+                }
             }
         }
     }
@@ -667,6 +724,7 @@ fn prepare_views(
 /// Bind groups: the arena (draws), the cull inputs / outputs, the shadow view uniform.
 #[allow(clippy::too_many_arguments)]
 fn prepare_bind_groups(
+    (mut hiz, queue): (ResMut<super::hiz::Hiz>, Res<RenderQueue>),
     arena: Res<Arena>,
     mut lists: ResMut<DrawLists>,
     mut uniforms: ResMut<ViewUniforms>,
@@ -692,11 +750,24 @@ fn prepare_bind_groups(
         (arena.record_buffer.as_ref(), lists.candidates.as_ref(), lists.args.as_ref(), lists.bin_first.as_ref(), lists.counts.as_ref())
     {
         let layout = cache.get_bind_group_layout(&cull.layout);
-        u.cull_bind_group = Some(device.create_bind_group(
-            "static world cull",
-            &layout,
-            &BindGroupEntries::sequential((view_binding.clone(), r.as_entire_binding(), c.as_entire_binding(), a.as_entire_binding(), bf.as_entire_binding(), n.as_entire_binding())),
-        ));
+        hiz.ensure_bits(&device, &queue, lists.count, lists.generation);
+        let pyramid = hiz.bind_view(&device);
+        if let Some(bits) = hiz.bits.as_ref() {
+            u.cull_bind_group = Some(device.create_bind_group(
+                "static world cull",
+                &layout,
+                &BindGroupEntries::sequential((
+                    view_binding.clone(),
+                    r.as_entire_binding(),
+                    c.as_entire_binding(),
+                    a.as_entire_binding(),
+                    bf.as_entire_binding(),
+                    n.as_entire_binding(),
+                    bits.as_entire_binding(),
+                    &pyramid,
+                )),
+            ));
+        }
     }
     let layout = cache.get_bind_group_layout(&shadow.view_layout);
     u.shadow_view_bind_group = Some(device.create_bind_group("static world shadow view", &layout, &BindGroupEntries::single(view_binding)));
@@ -720,60 +791,73 @@ fn dispatch_cull(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipe
 
 #[allow(clippy::too_many_arguments)]
 fn draw_static_world(
-    view: ViewQuery<(&ExtractedCamera, &ViewTarget, &ViewDepthTexture, &MeshViewBindGroup, Option<&SwViewPipelines>, Option<&SwCullView>)>,
+    view: ViewQuery<(&ExtractedCamera, &ViewTarget, &ViewDepthTexture, &MeshViewBindGroup, Option<&SwViewPipelines>, Option<&SwCullView>, Option<&SwCullViewHiz>)>,
     arena: Res<Arena>,
     lists: Res<DrawLists>,
     uniforms: Res<ViewUniforms>,
     cull: Option<Res<CullPipeline>>,
     cache: Res<PipelineCache>,
     allocators: Res<MaterialBindGroupAllocators>,
+    (hiz, hiz_pipes, device): (Res<super::hiz::Hiz>, Option<Res<super::hiz::HizPipelines>>, Res<RenderDevice>),
     mut ctx: RenderContext,
 ) {
-    let (camera, target, depth, view_bg, pipelines, cull_view) = view.into_inner();
+    let (camera, target, depth, view_bg, pipelines, cull_view, hiz_view) = view.into_inner();
     let (Some(pipelines), Some((_, arena_bg)), Some(args), Some(ib)) = (pipelines, lists.arena_bind_group.as_ref(), lists.args.as_ref(), arena.index_buffer()) else { return };
     if lists.bins.is_empty() {
         return;
     }
-    // Culled: this view's region (+ its draw counts when compacted); unculled (FH1_STATIC_WORLD_CULL=0): region 0, main
-    // camera only.
-    let counts = cull.as_ref().filter(|c| c.compact && cull_on()).and(lists.counts.as_ref()).zip(cull_view.map(|v| v.counts));
-    let base = if cull_on() {
-        let (Some(cv), Some(cull)) = (cull_view, cull.as_ref()) else { return };
-        if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
-            return;
-        }
-        cv.base
-    } else {
-        if !is_main(camera) {
-            return;
-        }
-        0
-    };
     let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
-    let color = [Some(target.get_color_attachment())];
-    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
-        label: Some("static_world"),
-        color_attachments: &color,
-        depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
-    if let Some(viewport) = camera.viewport.as_ref() {
-        pass.set_camera_viewport(viewport);
+    let compact = cull.as_ref().is_some_and(|c| c.compact) && cull_on();
+    // One lit pass over every bin from `base` (+ draw counts when compacted).
+    let draw = |ctx: &mut RenderContext, base: u32, counts: Option<u32>| {
+        let counts = counts.and_then(|c| lists.counts.as_ref().map(|b| (b, c)));
+        let color = [Some(target.get_color_attachment())];
+        let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("static_world"),
+            color_attachments: &color,
+            depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if let Some(viewport) = camera.viewport.as_ref() {
+            pass.set_camera_viewport(viewport);
+        }
+        pass.set_bind_group(0, &view_bg.main, &view_bg.main_offsets);
+        pass.set_bind_group(1, &view_bg.binding_array, &[]);
+        pass.set_bind_group(2, arena_bg, &[]);
+        pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+        for bin in &lists.bins {
+            let Some(id) = pipelines.0.get(&bin.variant) else { continue };
+            let Some(p) = cache.get_render_pipeline(*id) else { continue };
+            let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
+            let Some(material_bg) = slab.bind_group() else { continue };
+            pass.set_render_pipeline(p);
+            pass.set_bind_group(3, material_bg, &[]);
+            draw_bin(&mut pass, args, counts, base, bin, &lists);
+        }
+    };
+    // Unculled (FH1_STATIC_WORLD_CULL=0): region 0, main camera only.
+    if !cull_on() {
+        if is_main(camera) {
+            draw(&mut ctx, 0, None);
+        }
+        return;
     }
-    pass.set_bind_group(0, &view_bg.main, &view_bg.main_offsets);
-    pass.set_bind_group(1, &view_bg.binding_array, &[]);
-    pass.set_bind_group(2, arena_bg, &[]);
-    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-    for bin in &lists.bins {
-        let Some(id) = pipelines.0.get(&bin.variant) else { continue };
-        let Some(p) = cache.get_render_pipeline(*id) else { continue };
-        let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
-        let Some(material_bg) = slab.bind_group() else { continue };
-        pass.set_render_pipeline(p);
-        pass.set_bind_group(3, material_bg, &[]);
-        draw_bin(&mut pass, args, counts, base, bin, &lists);
+    // Culled: this view's region (+ its draw counts when compacted).
+    let (Some(cv), Some(cull)) = (cull_view, cull.as_ref()) else { return };
+    if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
+        return;
+    }
+    draw(&mut ctx, cv.base, compact.then_some(cv.counts));
+    // Hi-Z phase 2 (main view): pyramid from the depth so far, occlusion-tested cull, the newly visible.
+    if let (Some(SwCullViewHiz(cv2)), Some(pipes)) = (hiz_view, hiz_pipes.as_ref()) {
+        if hiz.active {
+            hiz.build(&mut ctx, &cache, pipes, &device, depth.view());
+            if dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv2, lists.count) {
+                draw(&mut ctx, cv2.base, compact.then_some(cv2.counts));
+            }
+        }
     }
 }
 
@@ -865,6 +949,7 @@ struct SwView {
     eye: vec4<f32>,
     params: vec4<f32>,
     info: vec4<u32>,
+    extra: vec4<u32>,
 }
 "#;
 
@@ -889,6 +974,7 @@ struct SwView {
     eye: vec4<f32>,
     params: vec4<f32>,
     info: vec4<u32>,
+    extra: vec4<u32>,
 }
 struct Args {
     index_count: u32,
@@ -903,6 +989,46 @@ struct Args {
 @group(0) @binding(3) var<storage, read_write> args: array<Args>;
 @group(0) @binding(4) var<storage, read> bin_first: array<u32>;
 @group(0) @binding(5) var<storage, read_write> counts: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> vis_bits: array<u32>;
+@group(0) @binding(7) var hiz: texture_2d<f32>;
+
+// Hi-Z (static_world/hiz.rs): is the box (centre c, half extents e) behind the pyramid's farthest depth over its screen
+// footprint? Reverse-Z: nearer = larger. A corner behind the eye, or a footprint wider than 2x2 texels at the chosen
+// level, counts as visible.
+fn occluded(c: vec3<f32>, e: vec3<f32>) -> bool {
+    var lo = vec2<f32>(1.0e9);
+    var hi = vec2<f32>(-1.0e9);
+    var zmax = 0.0;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let s = vec3<f32>(select(-1.0, 1.0, (k & 1u) != 0u), select(-1.0, 1.0, (k & 2u) != 0u), select(-1.0, 1.0, (k & 4u) != 0u));
+        let clip = view.clip_from_world * vec4<f32>(c + e * s, 1.0);
+        if clip.w <= 1.0e-4 {
+            return false;
+        }
+        let ndc = clip.xyz / clip.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        lo = min(lo, uv);
+        hi = max(hi, uv);
+        zmax = max(zmax, ndc.z);
+    }
+    lo = clamp(lo, vec2<f32>(0.0), vec2<f32>(1.0));
+    hi = clamp(hi, vec2<f32>(0.0), vec2<f32>(1.0));
+    let levels = max(view.extra.y, 1u);
+    let size = vec2<f32>(textureDimensions(hiz, 0));
+    let ext = (hi - lo) * size;
+    let level = u32(clamp(ceil(log2(max(max(ext.x, ext.y), 1.0))), 0.0, f32(levels - 1u)));
+    let ls = vec2<i32>(textureDimensions(hiz, level));
+    let a = clamp(vec2<i32>(lo * vec2<f32>(ls)), vec2<i32>(0), ls - vec2<i32>(1));
+    let b = clamp(vec2<i32>(hi * vec2<f32>(ls)), vec2<i32>(0), ls - vec2<i32>(1));
+    if b.x - a.x > 1 || b.y - a.y > 1 {
+        return false;
+    }
+    let d = min(
+        min(textureLoad(hiz, a, level).r, textureLoad(hiz, vec2<i32>(b.x, a.y), level).r),
+        min(textureLoad(hiz, vec2<i32>(a.x, b.y), level).r, textureLoad(hiz, b, level).r),
+    );
+    return zmax < d;
+}
 
 const FLAG_CASTS: u32 = 1u;
 const FLAG_LIVE: u32 = 4u;
@@ -951,6 +1077,21 @@ fn cull(@builtin(global_invocation_id) id: vec3<u32>) {
         if dot(p.xyz, c) + dot(abs(p.xyz), e) + p.w < 0.0 {
             visible = false;
         }
+    }
+    // Hi-Z phases (main view): 1 = only what was visible last frame; 2 = occlusion test of everything that passes, the
+    // bit for next frame, and draw only the newly visible (phase 1 drew the rest).
+    let phase = view.extra.x;
+    if phase == 1u && vis_bits[i] == 0u {
+        visible = false;
+    }
+    if phase == 2u {
+        let before = vis_bits[i];
+        var now = visible;
+        if now && occluded(c, e) {
+            now = false;
+        }
+        vis_bits[i] = select(0u, 1u, now);
+        visible = now && before == 0u;
     }
     var a: Args;
     a.index_count = r.index_count;

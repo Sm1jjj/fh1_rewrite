@@ -33,6 +33,8 @@ use bevy::render::{Render, RenderApp, RenderSystems};
 
 pub mod bake;
 mod draw;
+/// Hi-Z occlusion for the main view (chunk 5, 47).
+mod hiz;
 
 /// What a geometry in the arena is keyed by: a scenery mesh asset (the live path), or a baked bundle geometry ([`bake`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -44,8 +46,15 @@ pub enum GeoKey {
 /// `FH1_STATIC_WORLD=1` (remaster only).
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Bake mode (bake.rs, FH1_BAKE_CELLS) records what the static world receives, so it needs it on.
-    *ON.get_or_init(|| crate::enabled() && (std::env::var("FH1_STATIC_WORLD").is_ok_and(|v| v == "1") || bake::baking()))
+    // Bake mode (bake.rs, FH1_BAKE_CELLS) records what the static world receives, so it needs it on. Never under RTX:
+    // rtx.rs traces Mesh3d entities, so static scenery would vanish from the ray-traced scene (dc's review).
+    *ON.get_or_init(|| {
+        #[cfg(feature = "rtx")]
+        let rtx = crate::rtx::on();
+        #[cfg(not(feature = "rtx"))]
+        let rtx = false;
+        crate::enabled() && !rtx && (std::env::var("FH1_STATIC_WORLD").is_ok_and(|v| v == "1") || bake::baking())
+    })
 }
 
 /// Packed vertex: position (3), normal (3), uv0 (2), uv1 (2), uv2 (2) as f32, colour as unorm8x4 = 13 words.

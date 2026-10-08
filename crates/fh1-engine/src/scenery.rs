@@ -20,7 +20,10 @@ use fh1_render::{FxGlobals, FxLibrary, FxMaterial};
 
 use crate::Car;
 
+mod bake;
 mod p2;
+
+use fh1_remaster::static_world::bake as baked;
 pub use p2::{P2Plugin, PropMesh, ZoneMesh};
 
 /// Load tiles whose centre is within this distance of the car; unload past it plus a margin.
@@ -98,6 +101,8 @@ pub struct Scenery {
     /// New-mesh byte budget left this frame ([`mesh_add_bytes`]); negative = debt from a big item, paid by the next
     /// frames.
     mesh_budget: i64,
+    /// P12 bake path (scenery/bake.rs): where the baked bundles are and the stamp they must carry; None = not used.
+    bake: Option<bake::BakeCtx>,
 }
 
 /// Entities streaming may spawn per frame, and despawn per frame (P5b). A whole prop tile (hundreds of placements x LODs
@@ -227,6 +232,8 @@ struct ZoneLoaded {
     level: i32,
     /// The model's meshes and materials, parked on unload (`Zones::park`).
     parts: Vec<(Handle<Mesh>, BatchMaterial)>,
+    /// P12 bake: the model came from its baked bundle (records only; shown / faded through this handle).
+    baked: Option<baked::BundleHandle>,
 }
 
 /// Unloaded zone models kept ready to respawn (2026-10-08 perf: a revisit re-read, re-parsed and re-uploaded every model;
@@ -265,6 +272,9 @@ struct Zones {
     shown_lods: HashMap<usize, u32>,
     loaded: HashMap<u16, ZoneLoaded>,
     pending: HashMap<u16, Task<Option<TileData>>>,
+    /// P12 bake: bundle reads in flight, and models without a valid bundle (they load live).
+    baked_pending: HashMap<u16, Task<Option<baked::Bundle<baked::MatKey>>>>,
+    live_only: std::collections::HashSet<u16>,
     /// Zone fades (P3) start once the first zone is on screen (the start-up set appears at once).
     fade_ready: bool,
     /// Pop-in (P2): zones near the car and ahead of it, nearest first, whose models load (hidden) before the car
@@ -350,6 +360,8 @@ impl Zones {
             shown_lods: HashMap::new(),
             loaded: HashMap::new(),
             pending: HashMap::new(),
+            baked_pending: HashMap::new(),
+            live_only: Default::default(),
             fade_ready: false,
             preload: Vec::new(),
             extra: std::collections::HashSet::new(),
@@ -599,6 +611,11 @@ fn start_zone_model(commands: &mut Commands, sc: &mut Scenery, z: &mut Zones, n:
         z.loaded.insert(n, spawn_zone_model(commands, sc, cast, fade_s, parts));
         return;
     }
+    // P12 bake: its bundle first (one file read, no meshes); a missing / stale one falls back to the live load.
+    if let Some(ctx) = sc.bake.as_ref().filter(|_| !z.live_only.contains(&n)) {
+        z.baked_pending.insert(n, bake::read_task(ctx, &bake::zone_name(n)));
+        return;
+    }
     let task = sc.load_task(&z.models[&n].file);
     z.pending.insert(n, task);
 }
@@ -632,7 +649,7 @@ fn spawn_zone_model(commands: &mut Commands, sc: &mut Scenery, cast: bool, fade_
         }
         children.push(e);
     }
-    ZoneLoaded { parent, children, statics, visible: false, alpha: 0.0, level: -16, parts }
+    ZoneLoaded { parent, children, statics, visible: false, alpha: 0.0, level: -16, parts, baked: None }
 }
 
 fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Time, meshes: &mut Assets<Mesh>, materials: &mut Assets<StandardMaterial>, fx: &mut FxParams) {
@@ -674,6 +691,27 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
             }
         }
     }
+    // P12 bake: finished bundle reads become loaded models at once (no meshes to build); without a valid bundle the
+    // model loads live.
+    let done: Vec<u16> = z.baked_pending.iter().filter(|(_, t)| t.is_finished()).map(|(&n, _)| n).collect();
+    for n in done {
+        let task = z.baked_pending.remove(&n).unwrap();
+        match block_on(future::poll_once(task)).flatten() {
+            Some(b) => {
+                sc.p2.zone_loads += 1;
+                STREAMED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let l = bake::spawn_zone(commands, b, &sc.dir, fx, fade_s);
+                z.loaded.insert(n, l);
+            }
+            None => {
+                z.live_only.insert(n);
+                if let Some(m) = z.models.get(&n) {
+                    let task = sc.load_task(&m.file);
+                    z.pending.insert(n, task);
+                }
+            }
+        }
+    }
     // Finish loads: a few per frame (mesh + material creation for a whole zone in one frame hitched 100+ ms).
     // P9: the current zone's models first, then nearest first (the new-mesh budget may let only a few through).
     let mut ready: Vec<(u16, bool, f32)> = z
@@ -710,7 +748,7 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
             Some(data) => {
                 sc.p2.zone_loads += 1;
                 STREAMED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                sc.prepare(data, meshes, materials, fx)
+                sc.prepare(data, meshes, materials, fx, false)
             }
             None => Vec::new(),
         };
@@ -722,7 +760,7 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
         let mut wanted: Vec<(u16, f32)> = z.lists[cur]
             .iter()
             .copied()
-            .filter(|n| !z.loaded.contains_key(n) && !z.pending.contains_key(n))
+            .filter(|n| !z.loaded.contains_key(n) && !z.pending.contains_key(n) && !z.baked_pending.contains_key(n))
             .filter_map(|n| {
                 let g = &z.groups[z.models.get(&n)?.group];
                 Some((n, Vec2::new((g.0[0] - here.x).max(here.x - g.1[0]).max(0.0), (g.0[1] - here.y).max(here.y - g.1[1]).max(0.0)).length()))
@@ -744,7 +782,9 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
         if (preload || !z.extra.is_empty()) && !current_wants && z.shown == Some(cur) && z.pending.len() < ZONE_MAX_PENDING {
             let mut room = (ZONE_MAX_PENDING - z.pending.len()).min(STARTS_PER_FRAME);
             let mut starts: Vec<u16> = Vec::new();
-            let want = |n: u16, starts: &Vec<u16>| z.models.contains_key(&n) && !z.loaded.contains_key(&n) && !z.pending.contains_key(&n) && !starts.contains(&n);
+            let want = |n: u16, starts: &Vec<u16>| {
+                z.models.contains_key(&n) && !z.loaded.contains_key(&n) && !z.pending.contains_key(&n) && !z.baked_pending.contains_key(&n) && !starts.contains(&n)
+            };
             'zones: for &zi in z.preload.iter().filter(|_| preload) {
                 for &n in &z.lists[zi] {
                     if room == 0 {
@@ -791,6 +831,9 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
             if complete && !preload {
                 for n in gone {
                     if let Some(l) = z.loaded.remove(&n) {
+                        if let Some(b) = &l.baked {
+                            baked::set_hidden(b, true);
+                        }
                         sc.retire(commands, l.parent, l.children.len() + 1, budget_on);
                         z.park(n, l.parts);
                     }
@@ -811,11 +854,16 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
         let gone: Vec<u16> = z.loaded.keys().copied().filter(|n| !keep.contains(n)).collect();
         for n in gone {
             if let Some(l) = z.loaded.remove(&n) {
+                // Baked records hide at once; the parent's despawn (retire) unloads the bundle.
+                if let Some(b) = &l.baked {
+                    baked::set_hidden(b, true);
+                }
                 sc.retire(commands, l.parent, l.children.len() + 1, budget_on);
                 z.park(n, l.parts);
             }
         }
         z.pending.retain(|n, _| keep.contains(n));
+        z.baked_pending.retain(|n, _| keep.contains(n));
     }
     // Visibility: the shown zone's models (the current one while the first zone loads), LOD by distance.
     if let Some(list) = z.shown.or(z.current) {
@@ -841,11 +889,17 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
             if on && !l.visible {
                 l.visible = true;
                 commands.entity(l.parent).insert(Visibility::Inherited);
+                if let Some(b) = &l.baked {
+                    baked::set_hidden(b, false);
+                }
             }
             l.alpha = if on { (l.alpha + step).min(1.0) } else { (l.alpha - step).max(0.0) };
             if !on && l.alpha <= 0.0 {
                 l.visible = false;
                 commands.entity(l.parent).insert(Visibility::Hidden);
+                if let Some(b) = &l.baked {
+                    baked::set_hidden(b, true);
+                }
                 continue;
             }
             if fade_s > 0.0 {
@@ -858,6 +912,9 @@ fn stream_zones(commands: &mut Commands, sc: &mut Scenery, here: Vec2, time: &Ti
                     }
                     for &slot in &l.statics {
                         fh1_remaster::static_world::set_tag(slot, if level == 0 { 0 } else { level });
+                    }
+                    if let Some(b) = &l.baked {
+                        baked::set_tag(b, level);
                     }
                 }
             }
@@ -904,6 +961,10 @@ impl Scenery {
             })
             .collect();
         let fx = SceneryMaterials::load(&dir, track_shaders);
+        let bake = bake::ctx(&dir, colorado);
+        if let Some(b) = &bake {
+            info!("scenery: baked bundles from {} (missing / stale ones stream live)", b.dir.display());
+        }
         if fx.is_none() {
             warn!("scenery: game shaders not installed; using the simple material path");
         }
@@ -952,6 +1013,7 @@ impl Scenery {
             retire: Default::default(),
             aabbs: HashMap::new(),
             mesh_budget: 0,
+            bake,
         })
     }
 
@@ -1075,6 +1137,20 @@ fn merge_parts(parts: Vec<(Mesh, BatchMaterial)>) -> Vec<(Mesh, BatchMaterial)> 
     out
 }
 
+/// One degenerate triangle in the remaster scenery layout (`prepare_mesh`): the asset behind a static-world part's handle.
+/// Not empty: an empty mesh makes Bevy's allocator log "Use-after-free ... unallocated key".
+fn static_placeholder() -> Mesh {
+    use bevy::mesh::VertexAttributeValues as V;
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; 3])
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; 3])
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; 3])
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, vec![[0.0f32; 2]; 3])
+        .with_inserted_attribute(fh1_render::material::ATTRIBUTE_UV2, vec![[0.0f32; 2]; 3])
+        .with_inserted_attribute(fh1_render::material::ATTRIBUTE_COLOR, V::Unorm8x4(vec![[255u8; 4]; 3]))
+        .with_inserted_indices(Indices::U32(vec![0, 1, 2]))
+}
+
 /// P8 (2026-10-08): static scenery entities get their mesh's bounds (computed once per mesh in `prepare`) plus
 /// `NoAutoAabb`, so Bevy's calculate_bounds no longer computes one per spawned entity nor scans them every frame for
 /// changed mesh assets (particles / skid marks / smoke modify meshes every frame). `FH1_STATIC_AABB=0` = Bevy computes
@@ -1142,13 +1218,16 @@ impl Scenery {
         BatchMaterial::Raw(raw.clone())
     }
 
-    /// Meshes + materials for a loaded tile / template.
+    /// Meshes + materials for a loaded tile / template. `keep_mesh` = keep the real mesh asset of parts the static world
+    /// draws (prop templates: smash.rs `spawn_template` draws them); else such a part gets a one-triangle placeholder
+    /// asset (its handle keeps the static key and lifetime), so Bevy doesn't upload every scenery mesh a second time.
     fn prepare(
         &mut self,
         data: TileData,
         meshes: &mut Assets<Mesh>,
         materials: &mut Assets<StandardMaterial>,
         fx: &mut FxParams,
+        keep_mesh: bool,
     ) -> Vec<(Handle<Mesh>, BatchMaterial)> {
         let mut out: Vec<(Mesh, BatchMaterial)> = Vec::new();
         // P12 static world: per remaster material, the record flags of the parts that may go static (opaque / cutout /
@@ -1242,11 +1321,17 @@ impl Scenery {
             .map(|(mesh, m)| {
                 use bevy::camera::primitives::MeshAabb;
                 let aabb = mesh.compute_aabb();
-                self.spend_mesh(&mesh);
                 // P12 static world (FH1_STATIC_WORLD=1): remaster scenery geometry packed into the GPU arena.
                 let flags = static_flags.get(&m.id()).copied();
                 let packed = flags.and_then(|f| fh1_remaster::static_world::pack_mesh(&mesh).map(|p| (p, f)));
-                let h = meshes.add(mesh);
+                // Packed parts nobody draws as a Mesh3d: a placeholder asset instead of a second upload (dc's review).
+                // FH1_STATIC_KEEP_MESHES=1 = the real meshes (old).
+                let h = if packed.is_some() && !keep_mesh && !std::env::var("FH1_STATIC_KEEP_MESHES").is_ok_and(|v| v == "1") {
+                    meshes.add(static_placeholder())
+                } else {
+                    self.spend_mesh(&mesh);
+                    meshes.add(mesh)
+                };
                 if let Some((p, f)) = packed {
                     fh1_remaster::static_world::add_packed(h.id(), p, f);
                 }
@@ -1284,8 +1369,13 @@ struct Props {
     /// Loaded tiles: parent entity and the ring it was spawned for (0 = all placements, 1 / 2 = only the chain parts
     /// ending past `ring_min_end`).
     loaded: HashMap<(i32, i32), (Entity, u8)>,
-    /// Loads in flight: task and ring.
-    pending: HashMap<(i32, i32), (Task<Option<Vec<(u16, Mat4, Vec3, u32, [u32; 2])>>>, u8)>,
+    /// Loads in flight: task and ring (the placements, and the tile's baked bundle when there is a valid one).
+    pending: HashMap<(i32, i32), (Task<Option<PropLoad>>, u8)>,
+    /// P12 bake: the smashable templates (they stay live), whether the templates bundle loaded (tile bundles need its
+    /// geometry), and the loaded tiles' bundles (hidden at once when the tile goes; the parent's despawn unloads them).
+    smashable: Option<std::collections::HashSet<u16>>,
+    baked_templates: Option<bool>,
+    baked: HashMap<(i32, i32), baked::BundleHandle>,
     logged: bool,
     /// LOD0 template -> [(template, from m, to m)] per LOD, from the game's LOD tables (index.json `props.lods`).
     lods: HashMap<u16, Vec<(u16, f32, f32)>>,
@@ -1310,6 +1400,9 @@ struct Props {
     eye: Vec3,
     speed: f32,
 }
+
+/// A prop tile read: its placements and its baked bundle (P12 bake).
+type PropLoad = (Vec<(u16, Mat4, Vec3, u32, [u32; 2])>, Option<baked::Bundle<baked::MatKey>>);
 
 /// Remaster: props whose placed bounding radius is under this (m) don't cast sun shadows. Bevy's cascades have no
 /// per-cascade caster culling, so every small prop in range was drawn into all three (W4, c3's CSM numbers).
@@ -1367,6 +1460,9 @@ struct PlaceJob {
     chunks: std::collections::VecDeque<(fh1_remaster::batch::MergeKey, fh1_remaster::batch::Merged)>,
     /// P8 lever 1: every placement LOD level of the tile, spawned or not (empty with `FH1_PROP_LEVEL_STREAM=0`).
     levels: Vec<LevelEntry>,
+    /// P12 bake: placements drawn from the tile's bundle (skipped here), and the bundle (shown once the tile is complete).
+    skip: std::collections::HashSet<u32>,
+    baked: Option<baked::BundleHandle>,
 }
 
 /// Scale on the game's prop LOD / fade distances (pop-in, P2: LODs switch further out, where the change is
@@ -1532,7 +1628,7 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
                     let parts = sc.template_parts(&data, fx);
                     sc.props.merge.add_template(n, parts);
                 }
-                let prepared = sc.prepare(data, meshes, materials, fx);
+                let prepared = sc.prepare(data, meshes, materials, fx, true);
                 sc.props.templates.get_or_insert_with(HashMap::new).insert(n, prepared);
             }
         } else {
@@ -1544,6 +1640,18 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
     }
     if !sc.props.logged {
         sc.props.logged = true;
+        // P12 bake: the templates' baked geometry (tile bundles reference it); without it no tile bundle is used.
+        if let Some(ctx) = sc.bake.as_ref() {
+            let ok = match bake::read_now(ctx, "templates") {
+                Some(b) => {
+                    bake::spawn_bundle(commands, b, &sc.dir, fx, |_| true);
+                    true
+                }
+                None => false,
+            };
+            info!("props: baked templates {}", if ok { "loaded" } else { "missing or stale: prop tiles stream live" });
+            sc.props.baked_templates = Some(ok);
+        }
         let t = sc.props.templates.as_ref().map_or(0, |t| t.len());
         info!("props: {t} templates ready, {} placement tiles", sc.props.files.len());
     }
@@ -1561,13 +1669,25 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
     };
     for k in ready {
         let (task, ring) = sc.props.pending.remove(&k).unwrap();
-        let Some(list) = block_on(future::poll_once(task)).flatten() else { continue };
+        let Some((list, bundle)) = block_on(future::poll_once(task)).flatten() else { continue };
         if sc.props.loaded.is_empty() && sc.props.placing.is_empty() {
             let p = list.first().map(|(n, m, ..)| (*n, m.w_axis));
             info!("props: first tile {k:?}: {} placements, e.g. {p:?}", list.len());
         }
         let parent = commands.spawn((Transform::IDENTITY, Visibility::Hidden, crate::ui::world_load::WorldEntity)).id();
-        let merge = merging.then(|| {
+        // P12 bake: the baked placements come as one bundle (records hidden until the tile is complete; this ring's parts
+        // only); place_props skips them, the merge is off for the tile.
+        let (baked_h, skip) = match bundle {
+            Some(b) => {
+                let skip: std::collections::HashSet<u32> = b.extra.iter().copied().collect();
+                let min_end = ring_min_end(ring);
+                let (e, h) = bake::spawn_bundle(commands, b, &sc.dir, fx, |i| i.range.is_none_or(|r| r[3] > min_end));
+                commands.entity(e).insert(ChildOf(parent));
+                (Some(h), skip)
+            }
+            None => (None, Default::default()),
+        };
+        let merge = (merging && baked_h.is_none()).then(|| {
             let placements = list.iter().map(|&(model, transform, _, tint, _)| fh1_remaster::batch::Placement { model, transform, tint }).collect();
             // Staying entities: broken placements, and (P8) placements with their own night lightmaps (per-placement
             // material variants).
@@ -1583,7 +1703,21 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
                 .collect();
             sc.props.merge.start(placements, &sc.props.lods, PROP_DEFAULT_FADE * prop_lod_scale(), min_end, broken, last_end)
         });
-        sc.props.placing.push_back(PlaceJob { k, ring, list, next: 0, parent, spawned: 0, placed: Vec::new(), merged: merge.is_some(), merge, levels: Vec::new(), chunks: Default::default() });
+        sc.props.placing.push_back(PlaceJob {
+            k,
+            ring,
+            list,
+            next: 0,
+            parent,
+            spawned: 0,
+            placed: Vec::new(),
+            merged: merge.is_some(),
+            merge,
+            levels: Vec::new(),
+            chunks: Default::default(),
+            skip,
+            baked: baked_h,
+        });
     }
     // Level changes of placed tiles first: a late one shows as a missing LOD, a late tile only as later detail.
     update_prop_levels(commands, sc, fx);
@@ -1649,8 +1783,17 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
         // A tile changing ring replaces its previous load (now that the new one is complete: no blink).
         if let Some((e, _)) = sc.props.loaded.remove(&k) {
             let n = sc.props.tile_entities.remove(&k).unwrap_or(1) + sc.props.levels.remove(&k).map_or(0, |l| l.live);
+            if let Some(h) = sc.props.baked.remove(&k) {
+                baked::set_hidden(&h, true);
+            }
             sc.retire(commands, e, n, budget_on);
             sc.props.placed.retain(|p, _| (p.0, p.1) != k);
+        }
+        if let Some(h) = job.baked.take() {
+            if !sc.p2.hide_props() {
+                baked::set_hidden(&h, false);
+            }
+            sc.props.baked.insert(k, h);
         }
         // Entities of the level entries are counted in the entries' `live` (they despawn individually).
         let mut level_live = 0;
@@ -1676,6 +1819,9 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
     for k in gone {
         if let Some((e, _)) = sc.props.loaded.remove(&k) {
             let n = sc.props.tile_entities.remove(&k).unwrap_or(1) + sc.props.levels.remove(&k).map_or(0, |l| l.live);
+            if let Some(h) = sc.props.baked.remove(&k) {
+                baked::set_hidden(&h, true);
+            }
             sc.retire(commands, e, n, budget_on);
             sc.props.placed.retain(|p, _| (p.0, p.1) != k);
         }
@@ -1817,7 +1963,7 @@ fn place_props(commands: &mut Commands, sc: &mut Scenery, job: &mut PlaceJob, fx
         job.next += 1;
         let (n, m, normal, tint, lightmaps) = job.list[i];
         let key = (k.0, k.1, i as u32);
-        if sc.props.broken.contains(&key) {
+        if sc.props.broken.contains(&key) || job.skip.contains(&(i as u32)) {
             continue;
         }
         if job.merged && !has_own_lightmap(&lightmaps) && sc.props.merge.merges(n, sc.props.lods.get(&n)) {
@@ -1928,7 +2074,18 @@ fn stream_prop_loads(sc: &mut Scenery, here: Vec2, reach: [f32; 3]) {
     wanted.sort_by(|a, b| (a.2, a.1).partial_cmp(&(b.2, b.1)).unwrap_or(std::cmp::Ordering::Equal));
     for (k, _, ring) in wanted.into_iter().take(STARTS_PER_FRAME) {
         let path = sc.dir.join(&sc.props.files[&k]);
-        sc.props.pending.insert(k, (AsyncComputeTaskPool::get().spawn(async move { read_placements(&path) }), ring));
+        // P12 bake: the tile's bundle in the same read task (only once the templates' bundle loaded).
+        let bundle = sc
+            .bake
+            .as_ref()
+            .filter(|_| sc.props.baked_templates == Some(true))
+            .map(|c| (c.dir.join(baked::file_name(&bake::tile_name(k))), c.stamp.clone()));
+        let task = AsyncComputeTaskPool::get().spawn(async move {
+            let list = read_placements(&path)?;
+            let b = bundle.and_then(|(p, stamp)| baked::read(&p, &stamp));
+            Some((list, b))
+        });
+        sc.props.pending.insert(k, (task, ring));
     }
 }
 
@@ -1991,9 +2148,15 @@ pub fn stream(
     mut p2q: p2::P2Params,
     mut budget_mode: Local<Option<bool>>,
     mut warm: Local<Option<WarmQueue>>,
+    (mut bake_state, mut exit): (Local<bake::DriveState>, MessageWriter<AppExit>),
 ) {
     let _watch = crate::perf::watch("stream");
     let (Some(mut sc), Ok(car)) = (scenery, cars.single()) else { return };
+    // P12 bake mode (FH1_BAKE_CELLS): the bake driver loads everything itself (scenery/bake.rs), then exits.
+    if baked::baking() {
+        bake::drive(&mut commands, &mut sc, &mut meshes, &mut materials, &mut fx, &mut bake_state, time.delta_secs(), &mut exit);
+        return;
+    }
     // L1: at startup, wait (at most a few seconds) until the loading cover's UI pipeline has compiled; the tile reads
     // fill the async compute pool that Bevy compiles pipelines on. FH1_LOADING=0 = no wait.
     if crate::ui::loading::hold_streaming() {
@@ -2095,7 +2258,7 @@ pub fn stream(
         let task = sc.pending.remove(&k).unwrap();
         if let Some(data) = block_on(future::poll_once(task)).flatten() {
             let parent = commands.spawn((Transform::IDENTITY, Visibility::default(), crate::ui::world_load::WorldEntity)).id();
-            for (mesh, material) in sc.prepare(data, &mut meshes, &mut materials, &mut fx) {
+            for (mesh, material) in sc.prepare(data, &mut meshes, &mut materials, &mut fx, false) {
                 if sc.static_spawn(&mut commands, parent, &mesh, &material, Mat4::IDENTITY, None, true, 0).is_some() {
                     continue;
                 }
@@ -2264,6 +2427,7 @@ impl Scenery {
 
     /// Remaster merge (W4): the smashable prop templates (smash.rs, once its colliders are loaded; empty without them).
     pub fn set_smashable(&mut self, templates: std::collections::HashSet<u16>) {
+        self.props.smashable = Some(templates.clone());
         self.props.merge.set_smashable(templates);
     }
 

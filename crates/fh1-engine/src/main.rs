@@ -75,6 +75,9 @@ fn game_window() -> Window {
     if matches!(mode, WindowMode::Windowed) {
         window.resolution = (1280, 720).into();
     }
+    if fh1_remaster::static_world::bake::baking() {
+        window.visible = false;
+    }
     window
 }
 
