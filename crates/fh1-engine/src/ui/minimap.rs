@@ -312,6 +312,9 @@ fn resize_target(windows: Query<&Window, With<bevy::window::PrimaryWindow>>, tar
         if let Some(mut i) = images.get_mut(&target.0) {
             i.resize(bevy::render::render_resource::Extent3d { width: px, height: px, depth_or_array_layers: 1 });
             i.data = None;
+            // Re-rendered anyway: Bevy's copy of the old contents needs COPY_SRC, which a render target lacks (the
+            // 2026-10-08 validation-error crash on load).
+            i.copy_on_resize = false;
             pace.dirty = true;
             info!("minimap: target {px}x{px}");
         }

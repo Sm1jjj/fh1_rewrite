@@ -314,6 +314,7 @@ fn sync_render_scale(
         if let Some(mut i) = images.get_mut(&handle) {
             i.resize(Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 });
             i.data = None;
+            i.copy_on_resize = false;
         }
     }
     // Logical size = the window's, so anything sizing UI from the main camera keeps its numbers.
