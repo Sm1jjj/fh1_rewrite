@@ -39,7 +39,13 @@ if (-not $NoBuild) {
     $keyFile = Join-Path $Dist "xex_key.txt"
     if (-not (Test-Path $keyFile)) { throw "dist\xex_key.txt missing (32 hex digits; never committed)" }
     $env:FH1_XEX_KEY_EMBED = (Get-Content $keyFile -Raw).Trim()
-    & powershell -NoProfile -ExecutionPolicy Bypass -File tools\cargo-locked.ps1 build --release -p fh1setup --features fh2,fm4 -p fh1-launcher -p fh1-engine
+    $cargoArgs = @("build", "--release", "-p", "fh1setup", "--features", "fh2,fm4", "-p", "fh1-launcher", "-p", "fh1-engine")
+    # The maintainers' machine serialises builds through a local lock script; elsewhere plain cargo.
+    if (Test-Path tools\cargo-locked.ps1) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File tools\cargo-locked.ps1 @cargoArgs
+    } else {
+        & cargo @cargoArgs
+    }
     $code = $LASTEXITCODE
     Remove-Item Env:FH1_XEX_KEY_EMBED
     if ($code -ne 0) { throw "build failed ($code)" }
@@ -74,7 +80,7 @@ $crt = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Re
 if (-not $crt) { throw "VC++ redist folder not found (Visual Studio Build Tools)" }
 Copy-Item (Join-Path $crt.FullName "msvcp140.dll"), (Join-Path $crt.FullName "vcruntime140.dll"), (Join-Path $crt.FullName "vcruntime140_1.dll") $Bin
 
-Copy-Item LICENSE-MIT, LICENSE-APACHE $Lic
+Copy-Item LICENSE (Join-Path $Lic "FH1-Rewrite-GPL-3.0.txt")
 @"
 FH1 Rewrite $Version (Windows x64)
 ==================================

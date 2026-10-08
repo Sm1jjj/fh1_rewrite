@@ -6,7 +6,7 @@
   <a href="https://github.com/Sm1jjj/fh1_rewrite/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/Sm1jjj/fh1_rewrite?label=download&style=for-the-badge&color=ff7a3c"></a>
   <img alt="Windows x64" src="https://img.shields.io/badge/windows-x64-1b1446?style=for-the-badge">
   <img alt="Rust + Bevy" src="https://img.shields.io/badge/rust-bevy%200.19-1b1446?style=for-the-badge">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-1b1446?style=for-the-badge">
+  <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-1b1446?style=for-the-badge">
 </p>
 
 # FH1 Rewrite
@@ -112,10 +112,19 @@ research against the original game. Every format, number and behaviour is checke
 original running game before it is called verified. AI did the typing; the goal is still to understand how Forza
 Horizon actually works, and parity is measured rather than assumed.
 
+## Contributing
+
+Contributions are welcome: open an issue or a pull request. By contributing you agree that your work is licensed under
+the GPL-3.0 like the rest of the project.
+
 ## License
 
-The code in this repository is dual-licensed under MIT or Apache-2.0, at your option. Vendored third-party code keeps
-its own licenses.
+Copyright (c) 2026 Sm1jjj and the FH1 Rewrite contributors.
+
+FH1 Rewrite is licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`). You may use,
+study, modify and share it, but if you distribute it or anything built from it, you must release your full source
+under the same licence and keep the copyright notices. It may not be taken closed-source. Vendored third-party code
+keeps its own licence.
 
 This is an unofficial fan project, not affiliated with or endorsed by Microsoft, Xbox Game Studios, Turn 10 Studios
 or Playground Games. Forza Horizon and all game content, names and trademarks belong to their owners. This repository

@@ -42,3 +42,10 @@ keys.txt
 /MODDING_PLAN.md
 /docs/
 /assets/branding/hero-shot.png
+# Research and dev-only tooling stays local (2026-10-08)
+/re/
+/tools/*.py
+/tools/fm4/
+/tools/cargo-locked.*
+/tools/lock-holder.ps1
+/launch.bat
