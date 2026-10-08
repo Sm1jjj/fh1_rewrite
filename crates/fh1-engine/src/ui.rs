@@ -22,6 +22,7 @@ pub mod customize;
 pub mod customize_upgrades;
 pub mod garage;
 pub mod graphics;
+pub mod thumbs;
 pub mod hud;
 // L1: launch screen + loading covers.
 pub mod laptimer;
@@ -82,6 +83,8 @@ impl Plugin for UiPlugin {
             .add_plugins(graphics::GraphicsPlugin)
             // Garage: My cars / Autoshow on the credits ledger (P10).
             .add_plugins(garage::GaragePlugin)
+            // Rendered car photos for cars without the game's own (ui/thumbs.rs).
+            .add_plugins(thumbs::ThumbPlugin)
             // Garage > Customize (ui/customize.rs; garage.json beside settings.json).
             .add_plugins(customize::CustomizePlugin { path: self.settings_path.with_file_name("garage.json") })
             // L1: launch screen and loading covers (FH1_LAUNCH_SCREEN=0 / FH1_LOADING=0).
@@ -1542,7 +1545,7 @@ fn draw_menu(
     mut root: Query<&mut Visibility, With<MenuRoot>>,
     panel: Query<Entity, With<MenuPanel>>,
     fh1: Option<Res<Fh1Pause>>,
-    (profile, asset_server): (Option<Res<crate::progression::Profile>>, Res<AssetServer>),
+    (profile, asset_server, mut studio, images): (Option<Res<crate::progression::Profile>>, Res<AssetServer>, Option<ResMut<thumbs::ThumbStudio>>, Res<Assets<Image>>),
 ) {
     if !menu.dirty && !(menu.open && settings.is_changed()) {
         return;
@@ -1595,11 +1598,16 @@ fn draw_menu(
                 let Some(b) = menu.cars.as_ref() else { return };
                 let selected = b.selected();
                 let view = b.view();
+                // The game's own photo for FH1 cars, else one rendered by the thumbnail studio (imported cars).
+                let photo = match selected {
+                    Some(e) if e.id.is_some() => Some(asset_server.load(format!("ui/textures/thumbnails/thumbnail_{}.png", e.id.unwrap_or(0)))),
+                    Some(e) => studio.as_deref_mut().zip(garage.cars.get(e.index)).and_then(|(s, car)| s.photo(car, &images)),
+                    None => None,
+                };
                 c.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), width: Val::Px(384.0), ..default() }).with_children(|d| {
-                    // The game's own photo (ui group thumbnails/thumbnail_<Data_Car.Id>.png, FH1 cars).
-                    if let Some(id) = selected.and_then(|e| e.id) {
+                    if let Some(image) = photo {
                         d.spawn((
-                            ImageNode { image: asset_server.load(format!("ui/textures/thumbnails/thumbnail_{id}.png")), image_mode: NodeImageMode::Stretch, ..default() },
+                            ImageNode { image, image_mode: NodeImageMode::Stretch, ..default() },
                             Node { width: Val::Px(384.0), height: Val::Px(144.0), margin: UiRect::bottom(Val::Px(8.0)), ..default() },
                         ));
                     }
