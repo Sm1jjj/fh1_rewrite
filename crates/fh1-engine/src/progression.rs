@@ -565,9 +565,12 @@ fn tick_banners(time: Res<Time>, mut banners: ResMut<Banners>) {
 }
 
 /// Pay popularity milestones once (FameRankChallenge amounts). Called by skill.rs after a chain is banked.
-pub fn pay_rank_milestones(profile: &mut Profile, rank: u32, banners: &mut Banners) {
+pub fn pay_rank_milestones(profile: &mut Profile, c: &data::CareerData, rank: u32, banners: &mut Banners) {
     let mut paid = 0;
-    for (r, cr) in RANK_PAYOUTS {
+    // The disc's FameRankChallenge ranks (events-5) when installed, else the built-in copy (same values).
+    let from_disc: Vec<(u32, i64)> = c.sponsors.iter().flat_map(|s| s.ranks.iter()).filter_map(|r| Some((r.level?, r.credits))).collect();
+    let table: &[(u32, i64)] = if from_disc.is_empty() { &RANK_PAYOUTS } else { &from_disc };
+    for &(r, cr) in table {
         if rank <= r && profile.data.rank_paid > r {
             paid += cr;
             banners.push(format!("POPULARITY #{r}  +{} CR", fmt_num(cr)));

@@ -510,7 +510,7 @@ fn apply_actions(mut actions: MessageReader<ui::GameAction>, mut garage: ResMut<
 }
 
 #[allow(clippy::too_many_arguments)]
-fn switch_car(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>, track: Res<Track>, mut spawn: ResMut<SpawnIndex>, mut cars: Query<&mut Car>, commands: Commands, asset_server: Res<AssetServer>, existing: Query<Entity, With<Car>>, time: Res<Time<Real>>, mut pending: Local<Option<f32>>, looks: Res<ui::customize::CarLooks>, mut pending_car: ResMut<PendingCar>) {
+fn switch_car(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>, track: Res<Track>, mut spawn: ResMut<SpawnIndex>, mut cars: Query<&mut Car>, commands: Commands, asset_server: Res<AssetServer>, existing: Query<Entity, With<Car>>, time: Res<Time<Real>>, mut pending: Local<Option<f32>>, looks: Res<ui::customize::CarLooks>, mut pending_car: ResMut<PendingCar>, profile: Option<Res<progression::Profile>>) {
     // G: next start location (D-pad left/right belong to the radio).
     let next_spawn = keys.just_pressed(KeyCode::KeyG);
     if next_spawn {
@@ -529,9 +529,20 @@ fn switch_car(keys: Res<ButtonInput<KeyCode>>, mut garage: ResMut<Garage>, track
     }
     if delta != 0 {
         let n = garage.cars.len() as i32;
-        garage.current = ((garage.current as i32 + delta).rem_euclid(n)) as usize;
-        info!("car {} / {}: {}", garage.current + 1, n, garage.cars[garage.current]);
-        *pending = Some(time.elapsed_secs());
+        // Owned cars only while car ownership is on (progression::wallet; FH1_OWNERSHIP=0 = every car).
+        let owned = |i: usize| !progression::wallet::ownership_on() || profile.as_deref().is_none_or(|p| progression::wallet::owns(p, &garage.cars[i]));
+        let mut next = garage.current as i32;
+        for _ in 0..n {
+            next = (next + delta).rem_euclid(n);
+            if owned(next as usize) {
+                break;
+            }
+        }
+        if next as usize != garage.current {
+            garage.current = next as usize;
+            info!("car {} / {}: {}", garage.current + 1, n, garage.cars[garage.current]);
+            *pending = Some(time.elapsed_secs());
+        }
     }
     // P6: N/P spawned every car pressed past in full (130-270 ms hitches). Spawn once the keys rest 0.35 s. FH1_CAR_DEBOUNCE=0 = old.
     let rest = std::env::var("FH1_CAR_DEBOUNCE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.35);

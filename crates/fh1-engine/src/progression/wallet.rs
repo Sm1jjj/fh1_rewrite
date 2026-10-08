@@ -21,7 +21,8 @@ pub const STARTER_CARS: [&str; 1] = ["VW_Corrado_95"];
 /// Credits a new career starts with (INFERRED: GlobalRegistry E3Demo/BaseCredits).
 pub const STARTING_CREDITS: i64 = 10_000;
 
-/// A credits change, sent the frame it happens.
+/// A credits change, sent the frame it happens (read by the garage menus / HUD, ui/*; drop the allow once one does).
+#[allow(dead_code)]
 #[derive(Message, Clone, Debug)]
 pub struct CreditsChanged {
     pub delta: i64,

@@ -369,6 +369,7 @@ pub fn main_menu(
     mut exit: MessageWriter<AppExit>,
     (mut actions, mut switch): (MessageWriter<super::GameAction>, ResMut<super::world_load::MapSwitch>),
     (mut typed, mut net_join): (MessageReader<bevy::input::keyboard::KeyboardInput>, ResMut<crate::net::NetConnect>),
+    profile: Option<Res<crate::progression::Profile>>,
 ) {
     if !ld.on_launch() {
         return;
@@ -380,6 +381,19 @@ pub fn main_menu(
     input.back |= keys.just_pressed(KeyCode::Escape);
     input.confirm |= pads.iter().any(|p| p.just_pressed(GamepadButton::Start));
     let car_now = settings.car.as_ref().and_then(|c| garage.cars.iter().position(|x| x == c)).unwrap_or(garage.current);
+    // Car ownership (progression::wallet, FH1_OWNERSHIP=0 = every car): only owned cars start a world or are listed.
+    let owned = |i: usize| -> bool {
+        !crate::progression::wallet::ownership_on() || profile.as_deref().is_none_or(|p| garage.cars.get(i).is_some_and(|c| crate::progression::wallet::owns(p, c)))
+    };
+    let car_now = if owned(car_now) {
+        car_now
+    } else {
+        // The first owned car, in garage-list order (a new career: the starter Corrado).
+        profile.as_deref().and_then(|p| crate::progression::wallet::owned(p).iter().find_map(|o| garage.cars.iter().position(|c| *c == o.car))).unwrap_or(car_now)
+    };
+    let owned_catalog = |cat: Arc<CarCatalog>| -> Arc<CarCatalog> {
+        if crate::progression::wallet::ownership_on() && profile.is_some() { Arc::new(cat.subset(|e| owned(e.index))) } else { cat }
+    };
     let mut start: Option<WorldChoice> = None;
     let menu = &mut *menu;
     let modes = menu.modes();
@@ -447,7 +461,7 @@ pub fn main_menu(
             Pick::Map(id) => {
                 let name = map_name(&menu.motorsport, &id);
                 menu.track = Some((id, name));
-                let cat = menu.catalog.get_or_insert_with(|| catalog_for(&garage.assets, &garage.cars)).clone();
+                let cat = owned_catalog(menu.catalog.get_or_insert_with(|| catalog_for(&garage.assets, &garage.cars)).clone());
                 menu.screen = Screen::Cars(CarBrowser::new(cat, menu.car.unwrap_or(car_now)));
                 menu.dirty = true;
             }
@@ -473,7 +487,7 @@ pub fn main_menu(
                 *cursor = (*cursor as i32 + input.vertical).rem_euclid(list.len().max(1) as i32) as usize;
                 menu.dirty = true;
             } else if input.back {
-                let cat = menu.catalog.clone().unwrap_or_else(|| catalog_for(&garage.assets, &garage.cars));
+                let cat = owned_catalog(menu.catalog.clone().unwrap_or_else(|| catalog_for(&garage.assets, &garage.cars)));
                 menu.screen = Screen::Cars(CarBrowser::new(cat, menu.car.unwrap_or(car_now)));
                 menu.dirty = true;
             } else if input.confirm {

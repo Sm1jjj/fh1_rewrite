@@ -666,7 +666,7 @@ fn bank(chain: &Chain, events: &Events, profile: &mut Profile, banners: &mut Ban
             banners.push(format!("EVENT UNLOCKED  {}", def.name));
             banners.1.push(super::CareerNotice::EventUnlocked { name: def.name.clone() });
         }
-        super::pay_rank_milestones(profile, rank, banners);
+        super::pay_rank_milestones(profile, c, rank, banners);
     }
     pay_skill_sponsors(profile, c, banners);
     profile.commit();

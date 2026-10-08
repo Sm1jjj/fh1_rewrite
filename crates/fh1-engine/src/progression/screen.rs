@@ -178,9 +178,19 @@ pub fn draw_career(
     } else {
         s += &format!("POPULARITY #1   {} fame - top of the Horizon\n", fmt_num(p.fame as i64));
     }
-    s += &format!("CREDITS {} CR", fmt_num(p.credits));
-    if !p.cars_won.is_empty() {
-        s += &format!("   cars won: {}", p.cars_won.len());
+    s += &format!("CREDITS {} CR", fmt_num(super::wallet::credits(&profile)));
+    s += &format!("   garage: {} car(s)", super::wallet::owned(&profile).len());
+    // The car being driven: autoshow value / sell value (P10 economy; none before setup events-5).
+    if let Some(car) = cars.iter().next() {
+        let m = &car.0.data.media_name;
+        match super::wallet::price(c, m) {
+            Some(v) => s += &format!("   this car: {} CR", fmt_num(v)),
+            None if c.cars.get(m).is_some_and(|i| i.unicorn) => s += "   this car: rare (not in the autoshow)",
+            None => {}
+        }
+    }
+    if let Some(last) = p.ledger.last() {
+        s += &format!("   last: {:+} ({})", last.delta, last.reason);
     }
     if let Some(car) = cars.iter().next() {
         let m = &car.0.data.media_name;
