@@ -91,7 +91,7 @@ const HEADER: &str = "kind,t_s,utc,map,car,renderer,state,x,y,z,speed_kmh,fps,fr
 rt_extract,rt_prepare_assets,rt_specialize,rt_queue,rt_prepare,rt_render,rt_total,main_wait,main_to_preupdate,main_to_update,\
 main_to_postupdate,main_to_last,main_busy,cpu_process,cpu_system,ram_process_mb,ram_system_mb,gpu_util,vram_mb,vram_total_mb,gpu_temp,\
 entities,meshes,meshes_visible,zones_loaded,zones_pending,prop_tiles,prop_pending,prop_placing,zone_loads,prop_tile_loads,\
-scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms";
+scenery_spawned,views_3d,draws_opaque,draws_mask,draws_transparent,views_shadow,draws_shadow,draws_unbatched,draws_total,present_mode,render_exec,hitch_ms,mesh_props,mesh_props_visible,mesh_zones,mesh_zones_visible,mesh_crowd,mesh_grass,mesh_casters,mesh_other,mesh_other_visible,prop_levels_deferred";
 
 /// One (map, car, renderer) stretch of play.
 #[derive(Default)]
@@ -247,7 +247,7 @@ fn record(
     track: Option<Res<Track>>,
     cars: Query<&Car>,
     scenery: Option<Res<Scenery>>,
-    meshes: Query<&ViewVisibility, With<Mesh3d>>,
+    meshes: Query<(&ViewVisibility, MeshCat), With<Mesh3d>>,
     entities: Query<()>,
     menu: Option<Res<crate::ui::Menu>>,
     mut exit: MessageReader<AppExit>,
@@ -333,7 +333,31 @@ fn record(
             let s = diag.as_ref().and_then(|d| d.shared.lock().ok().map(|s| s.clone())).unwrap_or_default();
             let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
             let (pos, kmh) = car.map_or((Vec3::ZERO, 0.0), |c| (c.0.position, c.0.velocity.length() * 3.6));
-            let (total, visible) = meshes.iter().fold((0usize, 0usize), |(t, v), vis| (t + 1, v + vis.get() as usize));
+            // Per-category counts (P8): [props, props visible, zones, zones visible, crowd, grass, casters, other, other visible].
+            let mut cat = [0usize; 9];
+            let (mut total, mut visible) = (0usize, 0usize);
+            for (vis, (prop, zone, crowd, walker, figure, skinned, grass, caster)) in &meshes {
+                let v = vis.get() as usize;
+                total += 1;
+                visible += v;
+                let (k, kv) = if prop {
+                    (0, Some(1))
+                } else if zone {
+                    (2, Some(3))
+                } else if crowd || walker || figure || skinned {
+                    (4, None)
+                } else if grass {
+                    (5, None)
+                } else if caster {
+                    (6, None)
+                } else {
+                    (7, Some(8))
+                };
+                cat[k] += 1;
+                if let Some(kv) = kv {
+                    cat[kv] += v;
+                }
+            }
             let ds: Vec<u32> = (0..3).map(|k| streamed[k] - r.streamed_prev[k]).collect();
             let mut row = Row::new("sec", r.t, &map, &car_name, r.renderer, sec_state, pos, kmh);
             row.set("fps", 1000.0 / mean.max(0.001), 1);
@@ -360,6 +384,10 @@ fn record(
             row.text("entities", entities.iter().count().to_string());
             row.text("meshes", total.to_string());
             row.text("meshes_visible", visible.to_string());
+            for (c, n) in ["mesh_props", "mesh_props_visible", "mesh_zones", "mesh_zones_visible", "mesh_crowd", "mesh_grass", "mesh_casters", "mesh_other", "mesh_other_visible"].iter().zip(cat) {
+                row.text(c, n.to_string());
+            }
+            row.text("prop_levels_deferred", scenery.as_ref().map_or(0, |s| s.deferred_prop_levels()).to_string());
             // Last frame's render-phase draw counts (perf/draws.rs).
             for (name, c) in super::draws::NAMES.iter().zip(&super::draws::COUNTS) {
                 row.text(name, c.load(std::sync::atomic::Ordering::Relaxed).to_string());
@@ -398,6 +426,19 @@ fn record(
         r.write_summary();
     }
 }
+
+/// Mesh categories for the CSV (P8): scenery props / zone models (scenery.rs tags), crowd (cards, walkers, GPU figures,
+/// skinned), grass, shadow caster proxies; the rest is "other" (tiles, cars, anim objects, effects, UI).
+type MeshCat = (
+    Has<crate::scenery::PropMesh>,
+    Has<crate::scenery::ZoneMesh>,
+    Has<MeshMaterial3d<crate::crowd::CrowdMaterial>>,
+    Has<MeshMaterial3d<crate::crowd::WalkerMaterial>>,
+    Has<crate::crowd::GpuFigure>,
+    Has<bevy::mesh::skinning::SkinnedMesh>,
+    Has<MeshMaterial3d<crate::grass::GrassMaterial>>,
+    Has<fh1_render::shadow::CasterProxy>,
+);
 
 /// One CSV row, filled by column name (unknown names panic in debug: the header is the single source of the columns).
 struct Row(Vec<String>);

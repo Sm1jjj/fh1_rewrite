@@ -21,7 +21,7 @@ use fh1_render::{FxGlobals, FxLibrary, FxMaterial};
 use crate::Car;
 
 mod p2;
-pub use p2::P2Plugin;
+pub use p2::{P2Plugin, PropMesh, ZoneMesh};
 
 /// Load tiles whose centre is within this distance of the car; unload past it plus a margin.
 const LOAD_RADIUS: f32 = 1800.0;
@@ -93,6 +93,8 @@ pub struct Scenery {
     /// End of this frame's streaming time ([`stream_ms`]); None = no time budget.
     deadline: Option<std::time::Instant>,
     retire: std::collections::VecDeque<(Entity, usize)>,
+    /// P8: scenery mesh -> its bounds, computed once when prepared ([`Scenery::static_bounds`]).
+    aabbs: HashMap<AssetId<Mesh>, bevy::camera::primitives::Aabb>,
 }
 
 /// Entities streaming may spawn per frame, and despawn per frame (P5b). A whole prop tile (hundreds of placements x LODs
@@ -559,9 +561,10 @@ fn spawn_zone_model(commands: &mut Commands, sc: &mut Scenery, cast: bool, fade_
         STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         sc.budget = sc.budget.saturating_sub(1);
         let e = material.spawn(commands, mesh.clone(), Transform::IDENTITY, parent);
-        if sc.p2.stats {
-            commands.entity(e).insert(p2::ZoneMesh);
-        }
+        // Category tag for the perf CSV (perf/record.rs) and the P2 stats.
+        commands.entity(e).insert(p2::ZoneMesh);
+        no_cpu_cull(commands, e);
+        sc.static_bounds(commands, e, mesh);
         if !cast {
             commands.entity(e).insert(bevy::light::NotShadowCaster);
         }
@@ -871,6 +874,7 @@ impl Scenery {
             budget: usize::MAX,
             deadline: None,
             retire: Default::default(),
+            aabbs: HashMap::new(),
         })
     }
 
@@ -924,7 +928,32 @@ enum BatchMaterial {
     Remaster(Handle<fh1_remaster::material::RemasterMaterial>),
 }
 
+/// P8 (2026-10-08): static scenery meshes (zone models, prop placements, tiles) carry Bevy's `NoCpuCulling`: they skip
+/// the CPU visibility systems (frustum, VisibilityRange, directional-light cascades; ~1.5 ms/frame in log 105206) and
+/// are frustum- and range-culled in the GPU mesh preprocess instead. Their ViewVisibility then mirrors
+/// InheritedVisibility (the perf CSV's visible counts count them as visible). Not on smash pieces, cars, crowds,
+/// particles. `FH1_NO_CPU_CULL=0` = CPU culling (old).
+fn no_cpu_cull_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_NO_CPU_CULL").map_or(true, |v| v != "0"))
+}
+
+fn no_cpu_cull(commands: &mut Commands, e: Entity) {
+    if no_cpu_cull_on() {
+        commands.entity(e).insert(bevy::camera::visibility::NoCpuCulling);
+    }
+}
+
 impl BatchMaterial {
+    fn id(&self) -> bevy::asset::UntypedAssetId {
+        match self {
+            BatchMaterial::Fx(m) => m.id().untyped(),
+            BatchMaterial::Simple(m) => m.id().untyped(),
+            BatchMaterial::Raw(m) => m.id().untyped(),
+            BatchMaterial::Remaster(m) => m.id().untyped(),
+        }
+    }
+
     fn spawn(&self, commands: &mut Commands, mesh: Handle<Mesh>, transform: Transform, parent: Entity) -> Entity {
         match self {
             BatchMaterial::Fx(m) => commands.spawn((Mesh3d(mesh), MeshMaterial3d(m.clone()), transform, ChildOf(parent))).id(),
@@ -935,7 +964,59 @@ impl BatchMaterial {
     }
 }
 
+/// P8 lever 2 (2026-10-08): a model's / template's / tile's parts that end up with the same material (the setup splits
+/// batches by game material x flags x vertex attribute set; the remaster gives every part ONE vertex layout, so splits by
+/// attribute set share a material there) become one mesh, one entity. Only parts with identical topology and attribute
+/// sets merge. `FH1_PART_MERGE=0` = one entity per part (old).
+fn part_merge_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_PART_MERGE").map_or(true, |v| v != "0"))
+}
+
+fn merge_parts(parts: Vec<(Mesh, BatchMaterial)>) -> Vec<(Mesh, BatchMaterial)> {
+    if !part_merge_on() || parts.len() < 2 {
+        return parts;
+    }
+    let layout = |m: &Mesh| {
+        let mut ids: Vec<_> = m.attributes().map(|(a, _)| (a.id, a.format)).collect();
+        ids.sort_by_key(|(id, _)| *id);
+        (m.primitive_topology(), ids, m.indices().is_some())
+    };
+    let mut out: Vec<(Mesh, BatchMaterial)> = Vec::with_capacity(parts.len());
+    for (mesh, material) in parts {
+        let id = material.id();
+        let into = out.iter_mut().find(|(m, mat)| mat.id() == id && m.primitive_topology() == PrimitiveTopology::TriangleList && layout(m) == layout(&mesh));
+        // Same layout and topology: the merge can't fail.
+        if let Some((m, _)) = into {
+            if m.merge(&mesh).is_ok() {
+                continue;
+            }
+        }
+        out.push((mesh, material));
+    }
+    out
+}
+
+/// P8 (2026-10-08): static scenery entities get their mesh's bounds (computed once per mesh in `prepare`) plus
+/// `NoAutoAabb`, so Bevy's calculate_bounds no longer computes one per spawned entity nor scans them every frame for
+/// changed mesh assets (particles / skid marks / smoke modify meshes every frame). `FH1_STATIC_AABB=0` = Bevy computes
+/// them (old).
+fn static_aabb_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_STATIC_AABB").map_or(true, |v| v != "0"))
+}
+
 impl Scenery {
+    /// Inserts `mesh`'s precomputed bounds + `NoAutoAabb` on static scenery entity `e` (`static_aabb_on`).
+    fn static_bounds(&self, commands: &mut Commands, e: Entity, mesh: &Handle<Mesh>) {
+        if !static_aabb_on() {
+            return;
+        }
+        if let Some(a) = self.aabbs.get(&mesh.id()) {
+            commands.entity(e).insert((*a, bevy::camera::visibility::NoAutoAabb));
+        }
+    }
+
     /// The batch material for a simple-path StandardMaterial: itself, or its FxRawStandard copy while the post
     /// chain is on.
     fn simple(&mut self, m: Handle<StandardMaterial>, materials: &Assets<StandardMaterial>, fx: &mut FxParams) -> BatchMaterial {
@@ -957,14 +1038,14 @@ impl Scenery {
         materials: &mut Assets<StandardMaterial>,
         fx: &mut FxParams,
     ) -> Vec<(Handle<Mesh>, BatchMaterial)> {
-        let mut out = Vec::new();
+        let mut out: Vec<(Mesh, BatchMaterial)> = Vec::new();
         match data {
             TileData::Fx(batches) => {
                 for b in batches {
                     if b.flags & STANDIN == 0 {
                         match fx.remaster.batch(&self.dir, b.material) {
                             fh1_remaster::scenery::RemasterBatch::Material(m, _) => {
-                                out.push((meshes.add(fh1_remaster::scenery::prepare_mesh(b.mesh)), BatchMaterial::Remaster(m)));
+                                out.push((fh1_remaster::scenery::prepare_mesh(b.mesh), BatchMaterial::Remaster(m)));
                                 continue;
                             }
                             fh1_remaster::scenery::RemasterBatch::Skip => continue,
@@ -978,7 +1059,7 @@ impl Scenery {
                         None
                     };
                     match fx_material {
-                        Some(m) => out.push((meshes.add(b.mesh), BatchMaterial::Fx(m))),
+                        Some(m) => out.push((b.mesh, BatchMaterial::Fx(m))),
                         None => {
                             // Stand-ins (untextured) and materials whose game shader is missing (diffuse only).
                             if b.flags & STANDIN == 0 {
@@ -996,7 +1077,7 @@ impl Scenery {
                                 mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, c);
                             }
                             let m = self.simple(material, materials, fx);
-                    out.push((meshes.add(mesh), m));
+                            out.push((mesh, m));
                         }
                     }
                 }
@@ -1010,11 +1091,22 @@ impl Scenery {
                         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, c);
                     }
                     let m = self.simple(material, materials, fx);
-                    out.push((meshes.add(mesh), m));
+                    out.push((mesh, m));
                 }
             }
         }
-        out
+        merge_parts(out)
+            .into_iter()
+            .map(|(mesh, m)| {
+                use bevy::camera::primitives::MeshAabb;
+                let aabb = mesh.compute_aabb();
+                let h = meshes.add(mesh);
+                if let Some(a) = aabb {
+                    self.aabbs.insert(h.id(), a);
+                }
+                (h, m)
+            })
+            .collect()
     }
 
     fn load_task(&self, file: &str) -> Task<Option<TileData>> {
@@ -1064,6 +1156,10 @@ struct Props {
     radius: HashMap<u16, f32>,
     /// Template -> largest |coordinate| of its vertices (m, template space), for the far cull (`prop_far_end`).
     extent: HashMap<u16, f32>,
+    /// P8 lever 1 (`level_stream_on`): placed tile -> its LOD level entries; the car position and speed this frame.
+    levels: HashMap<(i32, i32), TileLevels>,
+    eye: Vec3,
+    speed: f32,
 }
 
 /// Remaster: props whose placed bounding radius is under this (m) don't cast sun shadows. Bevy's cascades have no
@@ -1113,6 +1209,8 @@ struct PlaceJob {
     /// Remaster: the tile's merged meshes being built; `merged` = merging placements are skipped by `place_props`.
     merge: Option<fh1_remaster::batch::MergeTask>,
     merged: bool,
+    /// P8 lever 1: every placement LOD level of the tile, spawned or not (empty with `FH1_PROP_LEVEL_STREAM=0`).
+    levels: Vec<LevelEntry>,
 }
 
 /// Scale on the game's prop LOD / fade distances (pop-in, P2: LODs switch further out, where the change is
@@ -1319,8 +1417,10 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
             let min_end = ring_min_end(ring);
             sc.props.merge.start(placements, &sc.props.lods, PROP_DEFAULT_FADE * prop_lod_scale(), min_end, broken)
         });
-        sc.props.placing.push_back(PlaceJob { k, ring, list, next: 0, parent, spawned: 0, placed: Vec::new(), merged: merge.is_some(), merge });
+        sc.props.placing.push_back(PlaceJob { k, ring, list, next: 0, parent, spawned: 0, placed: Vec::new(), merged: merge.is_some(), merge, levels: Vec::new() });
     }
+    // Level changes of placed tiles first: a late one shows as a missing LOD, a late tile only as later detail.
+    update_prop_levels(commands, sc, fx);
     while sc.budget > 0 {
         let Some(mut job) = sc.props.placing.pop_front() else { break };
         if let Some(task) = job.merge.take() {
@@ -1331,7 +1431,11 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
             }
             for ((_, material), m) in block_on(future::poll_once(task)).unwrap_or_default() {
                 let fh1_remaster::scenery::RemasterBatch::Material(h, _) = fx.remaster.batch(&sc.dir, material) else { continue };
-                commands.spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(h), m.aabb, m.shadow, Transform::IDENTITY, ChildOf(job.parent)));
+                let e = commands.spawn((Mesh3d(meshes.add(m.mesh)), MeshMaterial3d(h), m.aabb, m.shadow, Transform::IDENTITY, ChildOf(job.parent))).id();
+                no_cpu_cull(commands, e);
+                if static_aabb_on() {
+                    commands.entity(e).insert(bevy::camera::visibility::NoAutoAabb);
+                }
                 sc.p2.spawned += 1;
                 STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 job.spawned += 1;
@@ -1346,9 +1450,16 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
         let k = job.k;
         // A tile changing ring replaces its previous load (now that the new one is complete: no blink).
         if let Some((e, _)) = sc.props.loaded.remove(&k) {
-            let n = sc.props.tile_entities.remove(&k).unwrap_or(1);
+            let n = sc.props.tile_entities.remove(&k).unwrap_or(1) + sc.props.levels.remove(&k).map_or(0, |l| l.live);
             sc.retire(commands, e, n, budget_on);
             sc.props.placed.retain(|p, _| (p.0, p.1) != k);
+        }
+        // Entities of the level entries are counted in the entries' `live` (they despawn individually).
+        let mut level_live = 0;
+        if !job.levels.is_empty() {
+            level_live = job.levels.iter().map(|e| e.spawned.len()).sum();
+            // Checked again next frame: the car has moved while the tile was being placed.
+            sc.props.levels.insert(k, TileLevels { entries: std::mem::take(&mut job.levels), checked_at: Vec3::splat(1.0e9), live: level_live });
         }
         // Smash bookkeeping for the new placements (after the old tile's entries are gone).
         for (key, e) in job.placed.drain(..) {
@@ -1359,14 +1470,14 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
         STREAMED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("props: tile {k:?} placed");
         sc.props.loaded.insert(k, (job.parent, job.ring));
-        sc.props.tile_entities.insert(k, job.spawned + 1);
+        sc.props.tile_entities.insert(k, (job.spawned + 1).saturating_sub(level_live));
     }
     // Unload, then start nearby loads (nearest first, a few per frame).
     let reach = [0, 1, 2].map(|r| ring_radius(r) + size * 0.75);
     let gone: Vec<(i32, i32)> = sc.props.loaded.keys().copied().filter(|&k| centre(k).distance(here) > reach[2] + 100.0).collect();
     for k in gone {
         if let Some((e, _)) = sc.props.loaded.remove(&k) {
-            let n = sc.props.tile_entities.remove(&k).unwrap_or(1);
+            let n = sc.props.tile_entities.remove(&k).unwrap_or(1) + sc.props.levels.remove(&k).map_or(0, |l| l.live);
             sc.retire(commands, e, n, budget_on);
             sc.props.placed.retain(|p, _| (p.0, p.1) != k);
         }
@@ -1374,10 +1485,118 @@ fn stream_props(commands: &mut Commands, sc: &mut Scenery, here: Vec2, meshes: &
     stream_prop_loads(sc, here, reach);
 }
 
+/// P8 lever 1 (2026-10-08): a prop LOD level is spawned only while the car is near its distance band, not for the whole
+/// tile lifetime (a ring-0 tile spawned every placement x every LOD level x batch: ~25-35k festival entities, ~85% of
+/// them range-hidden, all walked by visibility / extract every frame). Levels spawn within [from - margin, to + margin]
+/// (3D distance to the car) and despawn past that plus `LEVEL_HYST`; the VisibilityRange fades stay. Margin = camera
+/// offset + fade band + `LEVEL_STEP` + `LEVEL_LOOKAHEAD_S` x speed. `FH1_PROP_LEVEL_STREAM=0` = every level for the
+/// tile's lifetime (old).
+fn level_stream_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_PROP_LEVEL_STREAM").map_or(true, |v| v != "0"))
+}
+
+/// Fixed part of the level margin (m): chase camera offset (~10 m) + the widest LOD cross-fade half band (10 m) + slack.
+const LEVEL_MARGIN: f32 = 24.0;
+/// Levels are re-checked once the car has moved this far (m) since a tile's last check.
+const LEVEL_STEP: f32 = 8.0;
+/// Speed look-ahead (s) on the margin.
+const LEVEL_LOOKAHEAD_S: f32 = 1.5;
+/// Extra distance (m) past the spawn band before a level despawns (no churn at the band edge).
+const LEVEL_HYST: f32 = 30.0;
+/// Level spawns per frame allowed past the streaming budgets.
+const LEVEL_MIN_SPAWNS: usize = 256;
+
+/// One LOD level of one placement (P8 lever 1): what `spawn_level` needs, and its entities while spawned.
+struct LevelEntry {
+    /// Placement index in the tile file (smash key).
+    placement: u32,
+    lod: u16,
+    m: Mat4,
+    normal: Vec3,
+    tint: u32,
+    lightmap: Option<u32>,
+    small: bool,
+    from: f32,
+    to: f32,
+    last: bool,
+    spawned: Vec<Entity>,
+}
+
+impl LevelEntry {
+    fn wanted(&self, eye: Vec3, margin: f32) -> bool {
+        let d = self.m.w_axis.truncate().distance(eye);
+        d >= self.from - margin && d <= self.to + margin
+    }
+}
+
+/// A placed tile's level entries, where the car was at their last check, and the entities they have spawned.
+struct TileLevels {
+    entries: Vec<LevelEntry>,
+    checked_at: Vec3,
+    live: usize,
+}
+
+/// The level spawn margin at `speed` (m/s).
+fn level_margin(speed: f32) -> f32 {
+    LEVEL_MARGIN + LEVEL_STEP + speed.min(120.0) * LEVEL_LOOKAHEAD_S
+}
+
+/// Spawns one placement LOD level's batches under `parent` (shared by `place_props` and `update_prop_levels`).
+fn spawn_level(
+    commands: &mut Commands,
+    sc: &mut Scenery,
+    templates: &HashMap<u16, Vec<(Handle<Mesh>, BatchMaterial)>>,
+    fx: &mut FxParams,
+    parent: Entity,
+    e: &LevelEntry,
+) -> Vec<Entity> {
+    let Some(batches) = templates.get(&e.lod) else { return Vec::new() };
+    let t = Transform::from_matrix(e.m);
+    // ~2% of placements are mirrored: authored culling would draw them inside out.
+    let mirrored = e.m.determinant() < 0.0;
+    let object = fh1_render::material::object_consts(e.tint, e.normal);
+    let range = prop_range(e.from, e.to, e.last);
+    let mut out = Vec::with_capacity(batches.len());
+    for (mesh, material) in batches {
+        let material = match material {
+            BatchMaterial::Fx(h) => BatchMaterial::Fx(sc.fx.as_mut().map_or(h.clone(), |f| {
+                let v = f.object_variant(h, object, &mut fx.materials);
+                e.lightmap.map_or(v.clone(), |l| f.lightmap_variant(&v, l, &mut fx.materials))
+            })),
+            BatchMaterial::Remaster(h) => BatchMaterial::Remaster(e.lightmap.map_or(h.clone(), |l| fx.remaster.lightmap_variant(h, l))),
+            other => other.clone(),
+        };
+        let material = match (mirrored, material) {
+            (true, BatchMaterial::Remaster(h)) => BatchMaterial::Remaster(fx.remaster.mirrored(&h)),
+            (true, m) => sc.props.mirrored(&m, &mut fx.materials),
+            (false, m) => m,
+        };
+        let id = material.spawn(commands, mesh.clone(), t, parent);
+        sc.static_bounds(commands, id, mesh);
+        sc.p2.spawned += 1;
+        STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sc.budget = sc.budget.saturating_sub(1);
+        // PropMesh: category tag for the perf CSV (perf/record.rs) and the P2 stats.
+        let mut ec = commands.entity(id);
+        ec.insert((range.clone(), p2::PropMesh));
+        if no_cpu_cull_on() {
+            ec.insert(bevy::camera::visibility::NoCpuCulling);
+        }
+        if e.small {
+            ec.insert(bevy::light::NotShadowCaster);
+        }
+        out.push(id);
+    }
+    out
+}
+
 /// Spawn `job`'s placements until the frame's spawn budget is used up.
 fn place_props(commands: &mut Commands, sc: &mut Scenery, job: &mut PlaceJob, fx: &mut FxParams) {
     let (k, ring, parent) = (job.k, job.ring, job.parent);
     let min_end = ring_min_end(ring);
+    let streaming = level_stream_on();
+    let (eye, margin) = (sc.props.eye, level_margin(sc.props.speed));
     // Taken out while placing (mirrored placements need `sc.props` mutably); put back below.
     let templates = sc.props.templates.take().unwrap_or_default();
     let default_chain = |n: u16| vec![(n, 0.0, PROP_DEFAULT_FADE * prop_lod_scale())];
@@ -1386,73 +1605,90 @@ fn place_props(commands: &mut Commands, sc: &mut Scenery, job: &mut PlaceJob, fx
         let i = job.next;
         job.next += 1;
         let (n, m, normal, tint, lightmaps) = job.list[i];
-        {
-            let key = (k.0, k.1, i as u32);
-            if sc.props.broken.contains(&key) {
-                continue;
-            }
-            if job.merged && sc.props.merge.merges(n, sc.props.lods.get(&n)) {
-                continue;
-            }
-            let t = Transform::from_matrix(m);
-            // ~2% of placements are mirrored: authored culling would draw them inside out.
-            let mirrored = m.determinant() < 0.0;
-            let object = fh1_render::material::object_consts(tint, normal);
-            // Placement scale (largest axis), for the small-caster radius test and the far cull.
-            let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
-            let mut chain = sc.props.lods.get(&n).cloned().unwrap_or_else(|| default_chain(n));
-            // P4: the last LOD stays out to the size-based far cull.
-            if let (Some(last), Some(end)) = (chain.last_mut(), prop_far_end(sc.props.extent.get(&n).copied(), scale)) {
-                last.2 = last.2.max(end);
-            }
-            if chain.iter().all(|c| c.2 <= min_end) {
-                continue;
-            }
-            let levels = chain.len();
-            // Ring 1 / 2 tiles lie past the previous ring's radius (their centre is past its reach): parts ending sooner never show.
-            for (level, (lod, from, to)) in chain.into_iter().enumerate().filter(|(_, c)| c.2 > min_end) {
-                let range = prop_range(from, to, level + 1 == levels);
-                let Some(batches) = templates.get(&lod) else { continue };
-                // Night lightmap of this LOD's draw record (LOD0 / LOD1 only; fh1-render lightmap_variant).
-                let lightmap = lightmaps.get(level).copied().filter(|&l| l != u32::MAX);
-                let small = small_casters_off() && sc.props.radius.get(&lod).is_some_and(|r| r * scale < SMALL_CASTER_RADIUS);
-                for (mesh, material) in batches {
-                    let material = match material {
-                        BatchMaterial::Fx(h) => BatchMaterial::Fx(sc.fx.as_mut().map_or(h.clone(), |f| {
-                            let v = f.object_variant(h, object, &mut fx.materials);
-                            lightmap.map_or(v.clone(), |l| f.lightmap_variant(&v, l, &mut fx.materials))
-                        })),
-                        BatchMaterial::Remaster(h) => BatchMaterial::Remaster(lightmap.map_or(h.clone(), |l| fx.remaster.lightmap_variant(h, l))),
-                        other => other.clone(),
-                    };
-                    let material = match (mirrored, material) {
-                        (true, BatchMaterial::Remaster(h)) => BatchMaterial::Remaster(fx.remaster.mirrored(&h)),
-                        (true, m) => sc.props.mirrored(&m, &mut fx.materials),
-                        (false, m) => m,
-                    };
-                    let e = material.spawn(commands, mesh.clone(), t, parent);
-                    sc.p2.spawned += 1;
-                    STREAMED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    job.spawned += 1;
-                    sc.budget = sc.budget.saturating_sub(1);
-                    if sc.p2.stats {
-                        commands.entity(e).insert(p2::PropMesh);
-                    }
-                    commands.entity(e).insert(range.clone());
-                    if small {
-                        commands.entity(e).insert(bevy::light::NotShadowCaster);
-                    }
-                    if ring == 0 {
-                        job.placed.push((key, e));
-                    }
+        let key = (k.0, k.1, i as u32);
+        if sc.props.broken.contains(&key) {
+            continue;
+        }
+        if job.merged && sc.props.merge.merges(n, sc.props.lods.get(&n)) {
+            continue;
+        }
+        // Placement scale (largest axis), for the small-caster radius test and the far cull.
+        let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
+        let mut chain = sc.props.lods.get(&n).cloned().unwrap_or_else(|| default_chain(n));
+        // P4: the last LOD stays out to the size-based far cull.
+        if let (Some(last), Some(end)) = (chain.last_mut(), prop_far_end(sc.props.extent.get(&n).copied(), scale)) {
+            last.2 = last.2.max(end);
+        }
+        if chain.iter().all(|c| c.2 <= min_end) {
+            continue;
+        }
+        let levels = chain.len();
+        // Ring 1 / 2 tiles lie past the previous ring's radius (their centre is past its reach): parts ending sooner never show.
+        for (level, (lod, from, to)) in chain.into_iter().enumerate().filter(|(_, c)| c.2 > min_end) {
+            let small = small_casters_off() && sc.props.radius.get(&lod).is_some_and(|r| r * scale < SMALL_CASTER_RADIUS);
+            // Night lightmap of this LOD's draw record (LOD0 / LOD1 only; fh1-render lightmap_variant).
+            let lightmap = lightmaps.get(level).copied().filter(|&l| l != u32::MAX);
+            let mut entry = LevelEntry { placement: i as u32, lod, m, normal, tint, lightmap, small, from, to, last: level + 1 == levels, spawned: Vec::new() };
+            if !streaming || entry.wanted(eye, margin) {
+                entry.spawned = spawn_level(commands, sc, &templates, fx, parent, &entry);
+                job.spawned += entry.spawned.len();
+                if !streaming && ring == 0 {
+                    job.placed.extend(entry.spawned.iter().map(|&e| (key, e)));
                 }
+            }
+            if streaming {
+                job.levels.push(entry);
             }
         }
     }
     sc.props.templates = Some(templates);
 }
 
-/// Start placement loads for tiles entering the rings (`ring_radius`; `reach` = each ring's tile-centre reach).
+/// P8 lever 1: spawn / despawn the placed tiles' LOD levels as the car moves (`level_stream_on`). A tile is re-checked
+/// once the car is `LEVEL_STEP` from its last check; a check cut short by the spawn budget resumes next frame. The first
+/// `LEVEL_MIN_SPAWNS` spawns of a frame ignore the frame budgets (progress floor while tiles stream).
+fn update_prop_levels(commands: &mut Commands, sc: &mut Scenery, fx: &mut FxParams) {
+    if !level_stream_on() || sc.props.levels.is_empty() {
+        return;
+    }
+    let (eye, margin) = (sc.props.eye, level_margin(sc.props.speed));
+    let keep = margin + LEVEL_HYST;
+    let templates = sc.props.templates.take().unwrap_or_default();
+    let mut levels = std::mem::take(&mut sc.props.levels);
+    let mut spawned = 0;
+    for (k, tl) in levels.iter_mut() {
+        if tl.checked_at.distance_squared(eye) < LEVEL_STEP * LEVEL_STEP {
+            continue;
+        }
+        let Some(&(parent, _)) = sc.props.loaded.get(k) else { continue };
+        let mut complete = true;
+        for e in tl.entries.iter_mut() {
+            if e.spawned.is_empty() {
+                if e.wanted(eye, margin) {
+                    if spawned >= LEVEL_MIN_SPAWNS && (sc.budget == 0 || sc.over_time()) {
+                        complete = false;
+                        break;
+                    }
+                    e.spawned = spawn_level(commands, sc, &templates, fx, parent, e);
+                    tl.live += e.spawned.len();
+                    spawned += e.spawned.len();
+                }
+            } else if !e.wanted(eye, keep) {
+                tl.live = tl.live.saturating_sub(e.spawned.len());
+                for id in e.spawned.drain(..) {
+                    commands.entity(id).despawn();
+                }
+            }
+        }
+        if complete {
+            tl.checked_at = eye;
+        }
+    }
+    sc.props.levels = levels;
+    sc.props.templates = Some(templates);
+}
+
+// Start placement loads for tiles entering the rings (`ring_radius`; `reach` = each ring's tile-centre reach).
 fn stream_prop_loads(sc: &mut Scenery, here: Vec2, reach: [f32; 3]) {
     let size = sc.tile_size;
     let centre = |k: (i32, i32)| Vec2::new((k.0 as f32 + 0.5) * size, (k.1 as f32 + 0.5) * size);
@@ -1568,6 +1804,8 @@ pub fn stream(
     let size = sc.tile_size;
     let centre = |k: (i32, i32)| Vec2::new((k.0 as f32 + 0.5) * size, (k.1 as f32 + 0.5) * size);
     let here = Vec2::new(p.x, p.z);
+    sc.props.eye = p;
+    sc.props.speed = car.0.velocity.length();
 
     let zones_loaded = sc.zones.as_ref().map_or(0, |z| z.loaded.len());
     let props_loaded = sc.props.loaded.len();
@@ -1641,7 +1879,9 @@ pub fn stream(
         if let Some(data) = block_on(future::poll_once(task)).flatten() {
             let parent = commands.spawn((Transform::IDENTITY, Visibility::default(), crate::ui::world_load::WorldEntity)).id();
             for (mesh, material) in sc.prepare(data, &mut meshes, &mut materials, &mut fx) {
-                material.spawn(&mut commands, mesh, Transform::IDENTITY, parent);
+                let e = material.spawn(&mut commands, mesh.clone(), Transform::IDENTITY, parent);
+                no_cpu_cull(&mut commands, e);
+                sc.static_bounds(&mut commands, e, &mesh);
             }
             sc.loaded.insert(k, parent);
         }
@@ -1833,6 +2073,25 @@ impl Scenery {
         for e in self.props.placed.remove(&key).unwrap_or_default() {
             commands.entity(e).despawn();
         }
+        // P8 lever 1: the placement's level entries go (spawned ones despawn).
+        if let Some(tl) = self.props.levels.get_mut(&(key.0, key.1)) {
+            let live = &mut tl.live;
+            tl.entries.retain_mut(|e| {
+                if e.placement != key.2 {
+                    return true;
+                }
+                *live = live.saturating_sub(e.spawned.len());
+                for id in e.spawned.drain(..) {
+                    commands.entity(id).despawn();
+                }
+                false
+            });
+        }
+    }
+
+    /// Prop LOD level entries currently not spawned (P8 lever 1; perf CSV `prop_levels_deferred`).
+    pub fn deferred_prop_levels(&self) -> usize {
+        self.props.levels.values().map(|t| t.entries.iter().filter(|e| e.spawned.is_empty()).count()).sum()
     }
 
     /// Spawns prop template `n` (LOD0 batches) as children of `parent` at `transform` (local to the parent).

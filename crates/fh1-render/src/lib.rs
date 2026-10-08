@@ -15,6 +15,7 @@ pub mod material;
 pub mod post;
 pub mod postfx;
 pub mod program;
+pub mod quality;
 pub mod mirror;
 pub mod reflect;
 pub mod scenery;

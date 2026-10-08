@@ -20,6 +20,7 @@ pub mod assists;
 pub mod browser;
 pub mod customize;
 pub mod customize_upgrades;
+pub mod graphics;
 pub mod hud;
 // L1: launch screen + loading covers.
 pub mod laptimer;
@@ -76,6 +77,8 @@ impl Plugin for UiPlugin {
             .init_resource::<UiFont>()
             .add_plugins((materials::UiMaterialsPlugin, scene::AnarkPlugin, hud::HudPlugin, minimap::MinimapPlugin, notify::NotifyPlugin, worldmap::WorldMapPlugin, skillhud::SkillHudPlugin))
             .add_plugins(assists::AssistsPlugin)
+            // Options > Graphics: AA, render scale, quality preset (P8).
+            .add_plugins(graphics::GraphicsPlugin)
             // Garage > Customize (ui/customize.rs; garage.json beside settings.json).
             .add_plugins(customize::CustomizePlugin { path: self.settings_path.with_file_name("garage.json") })
             // L1: launch screen and loading covers (FH1_LAUNCH_SCREEN=0 / FH1_LOADING=0).
@@ -141,6 +144,8 @@ pub struct Settings {
     /// Video renderer: "remaster" (default), "rtx" (remaster + ray-traced lighting) or "faithful" (the game's shaders).
     /// Applies on restart (main.rs sets FH1_RENDERER / FH1_RTX from it unless those are already set).
     pub renderer: Option<String>,
+    /// Options > Graphics (ui/graphics.rs, P8): quality preset, anti-aliasing, render scale.
+    pub graphics: graphics::GraphicsSettings,
 }
 
 impl Default for Settings {
@@ -165,6 +170,7 @@ impl Default for Settings {
             car: None,
             original_shaders: false,
             renderer: None,
+            graphics: graphics::GraphicsSettings::default(),
         }
     }
 }
@@ -202,7 +208,12 @@ enum Page {
     Customize,
     /// ui/worldmap.rs: the full-screen world map (Colorado; replaces the Fast travel row there).
     Map,
+    /// Options > Graphics (ui/graphics.rs): quality preset, anti-aliasing, render scale.
+    Graphics,
 }
+
+/// Row of "Graphics" on the Options page (back from Options > Graphics lands on it).
+const GRAPHICS_ROW: usize = 14;
 
 /// Long list pages: the cursor indexes the whole list and the rows scroll (like the car list).
 fn is_list(p: Page) -> bool {
@@ -806,6 +817,9 @@ enum Opt {
     Shaders,
     DrivingLine,
     AiDifficulty,
+    Quality,
+    AntiAlias,
+    RenderScale,
 }
 
 #[derive(Clone, Copy)]
@@ -899,8 +913,21 @@ fn items(menu: &Menu, settings: &Settings, garage: &Garage, track: &Track, maps:
                     opt("Engine volume", pct(settings.engine_volume), Opt::EngineVolume),
                     opt("Radio volume", pct(settings.radio_volume), Opt::RadioVolume),
                     opt("Renderer", renderer_value(settings).into(), Opt::Shaders),
+                    item("Graphics", Act::Open(Page::Graphics)),
                     Item { label: "Map".into(), value: Some(track.name.clone()), act: Act::Open(Page::Maps) },
                     item("Controls", Act::Open(Page::Controls)),
+                ],
+                0,
+            )
+        }
+        Page::Graphics => {
+            let opt = |l: &str, v: String, o: Opt| Item { label: l.into(), value: Some(v), act: Act::Opt(o) };
+            let g = &settings.graphics;
+            (
+                vec![
+                    opt("Quality", g.quality.name().into(), Opt::Quality),
+                    opt("Anti-aliasing", graphics::aa_value(g), Opt::AntiAlias),
+                    opt("Render scale", graphics::scale_value(g), Opt::RenderScale),
                 ],
                 0,
             )
@@ -963,6 +990,7 @@ fn page_title(p: Page) -> &'static str {
         Page::Garage => "GARAGE",
         Page::Customize => "CUSTOMIZE",
         Page::Map => "WORLD MAP",
+        Page::Graphics => "GRAPHICS",
     }
 }
 
@@ -1039,6 +1067,9 @@ fn adjust(settings: &mut Settings, o: Opt, dir: i32) {
             settings.abs = i != 2;
         }
         Opt::DrivingLine => settings.driving_line = settings.driving_line.next(dir < 0),
+        Opt::Quality => settings.graphics.quality = settings.graphics.quality.next(dir < 0),
+        Opt::AntiAlias => settings.graphics.aa = settings.graphics.aa.next(dir < 0),
+        Opt::RenderScale => graphics::step_scale(&mut settings.graphics, dir),
         Opt::AiDifficulty => settings.ai_difficulty = settings.ai_difficulty.next(dir < 0),
         Opt::Stm => settings.stm = !settings.stm,
         Opt::Rewind => settings.rewind = !settings.rewind,
@@ -1231,11 +1262,13 @@ fn menu_input(
             close_menu(&mut menu, &settings, &path);
         } else {
             let from = menu.page;
-            menu.page = Page::Main;
+            // Graphics is a sub-page of Options: back returns to its row there.
+            menu.page = if from == Page::Graphics { Page::Options } else { Page::Main };
             menu.cursor = match from {
                 Page::FastTravel | Page::Map => 2,
                 Page::Cars | Page::Garage | Page::Customize => 3,
                 Page::Options | Page::Controls | Page::Maps => 5,
+                Page::Graphics => GRAPHICS_ROW,
                 Page::Main => 0,
             };
             menu.dirty = true;
@@ -1519,7 +1552,7 @@ fn draw_menu(
         }
         let hint: String = match menu.page {
             Page::Main => "Enter / A  select      Esc / B  resume".into(),
-            Page::Options => "Left / Right  change      Esc / B  back".into(),
+            Page::Options | Page::Graphics => "Left / Right  change      Esc / B  back".into(),
             Page::Cars => menu.cars.as_ref().map_or("Esc / B  back".into(), |b| b.hint()),
             Page::Maps => menu.maps.hint(),
             Page::Customize => menu.custom.hint(),

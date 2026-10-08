@@ -1589,18 +1589,49 @@ fn spawn_fx_car_bodies(
 }
 
 /// Hide the glTF section nodes an [`FxCarBody`] draws (runs until the scene has spawned them).
+/// P8 (2026-10-08): change-driven instead of walking every car's whole hierarchy every frame (0.14 ms with traffic):
+/// a car's descendants are walked when its [`FxCarDrawn`] is added / changed, newly named entities (scene nodes spawning
+/// later) are checked against their car ancestor, and every car is re-walked once a second as a safety net.
+/// `FH1_HIDE_NODES_SCAN=1` = the full walk every frame (old).
+#[allow(clippy::too_many_arguments)]
 fn hide_replaced_gltf_nodes(
     cars: Query<(Entity, &FxCarDrawn)>,
+    changed: Query<(Entity, &FxCarDrawn), Changed<FxCarDrawn>>,
+    new_named: Query<Entity, Added<Name>>,
+    drawn_q: Query<&FxCarDrawn>,
+    parents: Query<&ChildOf>,
     children: Query<&Children>,
     mut named: Query<(&Name, &mut Visibility)>,
+    time: Res<Time<Real>>,
+    mut last_scan: Local<f32>,
 ) {
-    for (e, drawn) in &cars {
-        for d in children.iter_descendants(e) {
-            if let Ok((name, mut vis)) = named.get_mut(d) {
-                if drawn.0.contains(name.as_str()) && *vis != Visibility::Hidden {
-                    *vis = Visibility::Hidden;
-                }
+    static SCAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let scan_all = *SCAN.get_or_init(|| std::env::var("FH1_HIDE_NODES_SCAN").as_deref() == Ok("1"));
+    fn hide(d: Entity, drawn: &FxCarDrawn, named: &mut Query<(&Name, &mut Visibility)>) {
+        if let Ok((name, mut vis)) = named.get_mut(d) {
+            if drawn.0.contains(name.as_str()) && *vis != Visibility::Hidden {
+                *vis = Visibility::Hidden;
             }
+        }
+    }
+    let now = time.elapsed_secs();
+    if scan_all || now - *last_scan >= 1.0 {
+        *last_scan = now;
+        for (e, drawn) in &cars {
+            for d in children.iter_descendants(e) {
+                hide(d, drawn, &mut named);
+            }
+        }
+        return;
+    }
+    for (e, drawn) in &changed {
+        for d in children.iter_descendants(e) {
+            hide(d, drawn, &mut named);
+        }
+    }
+    for d in &new_named {
+        if let Some(drawn) = parents.iter_ancestors(d).find_map(|a| drawn_q.get(a).ok()) {
+            hide(d, drawn, &mut named);
         }
     }
 }

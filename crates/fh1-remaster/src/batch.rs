@@ -107,13 +107,16 @@ struct Accum {
     finite_ends: u32,
     /// Largest placement half-diagonal (m) in this chunk (small-caster shadow cull, [`ShadowLod::max_radius`]).
     max_radius: f32,
+    /// Smallest placement LOD start / largest end (infinite if any) in this chunk: the entity's coarse range (P8).
+    min_start: f32,
+    max_end: f32,
 }
 
 impl Accum {
     fn new(template: &Mesh) -> Self {
         let layout: Vec<MeshVertexAttribute> = template.attributes().map(|(a, _)| a.clone()).collect();
         let values = template.attributes().map(|(_, v)| empty_like(v)).collect();
-        Self { layout, values, indices: Vec::new(), lod: Vec::new(), tint: Vec::new(), min: Vec3::MAX, max: Vec3::MIN, verts: 0, instances: 0, start_sum: 0.0, end_sum: 0.0, finite_ends: 0, max_radius: 0.0 }
+        Self { layout, values, indices: Vec::new(), lod: Vec::new(), tint: Vec::new(), min: Vec3::MAX, max: Vec3::MIN, verts: 0, instances: 0, start_sum: 0.0, end_sum: 0.0, finite_ends: 0, max_radius: 0.0, min_start: f32::MAX, max_end: 0.0 }
     }
 
     fn push(&mut self, template: &Mesh, inst: &Instance) {
@@ -173,6 +176,8 @@ impl Accum {
         self.verts += n;
         self.instances += 1;
         self.start_sum += inst.lod.0;
+        self.min_start = self.min_start.min(inst.lod.0);
+        self.max_end = self.max_end.max(inst.lod.1);
         if inst.lod.1.is_finite() {
             self.end_sum += inst.lod.1;
             self.finite_ends += 1;
@@ -195,7 +200,8 @@ impl Accum {
         let start = self.start_sum / self.instances.max(1) as f32;
         // Most placements culled -> the mean finite end; else never culled.
         let end = if self.finite_ends * 2 > self.instances { self.end_sum / self.finite_ends as f32 } else { f32::INFINITY };
-        Merged { mesh, aabb: Aabb::from_min_max(self.min, self.max), instances: self.instances, shadow: ShadowLod { centre: (self.min + self.max) * 0.5, start, end, max_radius: self.max_radius } }
+        let range = (self.min_start.min(self.max_end), self.max_end);
+        Merged { mesh, aabb: Aabb::from_min_max(self.min, self.max), instances: self.instances, range, shadow: ShadowLod { centre: (self.min + self.max) * 0.5, start, end, max_radius: self.max_radius } }
     }
 }
 
@@ -204,6 +210,9 @@ pub struct Merged {
     pub mesh: Mesh,
     pub aabb: Aabb,
     pub instances: u32,
+    /// Smallest LOD start / largest LOD end (m, `INFINITY` = never culled) of its placements (P8: the cell's coarse
+    /// VisibilityRange, widened by the bounds' half diagonal by the caller).
+    pub range: (f32, f32),
     /// Insert on the spawned entity: picks whether it casts shadows (see [`ShadowLod`]).
     pub shadow: ShadowLod,
 }
@@ -547,19 +556,35 @@ pub struct Placement {
 /// LOD chain of a model: (LOD model, draw from, draw to), as engine scenery.rs `Props::lods` (scaled distances).
 pub type LodChain = Vec<(u16, f32, f32)>;
 
-/// Merge a prop tile: every placement's every LOD level into one mesh per (LOD level, game material), each vertex
+/// P8 lever 3 (2026-10-08): merged prop meshes are cut per `CELL` m square (x, z of the placement origin), so each
+/// keeps tight bounds for frustum culling and a coarse per-cell VisibilityRange. `FH1_BATCH_CELL=<m>` overrides;
+/// 0 = one mesh per tile (W4, old).
+pub const CELL: f32 = 64.0;
+
+pub fn cell_size() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_BATCH_CELL").ok().and_then(|v| v.parse().ok()).filter(|v: &f32| *v >= 0.0).unwrap_or(CELL))
+}
+
+/// Merge key: (cell x, cell z, LOD level, game material).
+pub type MergeKey = (i32, i32, u8, u32);
+
+/// Merge a prop tile: every placement's every LOD level into one mesh per (cell, LOD level, game material), each vertex
 /// carrying its placement's LOD range. `skip(i)` drops placement `i` (broken / smashable / not mergeable). Placements
 /// of models without a chain draw their own model from 0 to `default_end`; LOD levels ending at or before `min_end`
-/// are left out (the far ring: those never show there).
+/// are left out (the far ring: those never show there). `last_end[i]` (if longer than the chain's) is placement `i`'s
+/// pushed-out cull of its last LOD (engine `prop_far_end`); 0 = none.
 pub fn merge_props(
     list: &[Placement],
     chains: &HashMap<u16, LodChain>,
     templates: &HashMap<u16, Vec<TemplatePart>>,
     default_end: f32,
     min_end: f32,
+    last_end: &[f32],
     skip: impl Fn(usize) -> bool,
-) -> Vec<((u8, u32), Merged)> {
-    let mut b: Batcher<(u8, u32)> = Batcher::default();
+) -> Vec<(MergeKey, Merged)> {
+    let cell = cell_size();
+    let mut b: Batcher<MergeKey> = Batcher::default();
     for (i, p) in list.iter().enumerate() {
         if skip(i) {
             continue;
@@ -568,22 +593,26 @@ pub fn merge_props(
         let chain: &[(u16, f32, f32)] = chains.get(&p.model).map_or(&own, |c| c.as_slice());
         let c = |s: u32| ((p.tint >> s) & 0xFF) as u8;
         let tint = [c(16), c(8), c(0), c(24)];
+        let o = p.transform.w_axis;
+        let (cx, cz) = if cell > 0.0 { ((o.x / cell).floor() as i32, (o.z / cell).floor() as i32) } else { (0, 0) };
+        let levels = chain.len();
         for (level, &(lod, from, to)) in chain.iter().enumerate() {
+            let to = if level + 1 == levels { to.max(last_end.get(i).copied().unwrap_or(0.0)) } else { to };
             if to <= min_end {
                 continue;
             }
             let Some(parts) = templates.get(&lod) else { continue };
             for part in parts {
-                b.add((level as u8, part.material), &part.mesh, Instance { transform: p.transform, tint, lod: (from, to) });
+                b.add((cx, cz, level as u8, part.material), &part.mesh, Instance { transform: p.transform, tint, lod: (from, to) });
             }
         }
     }
     b.finish()
 }
 
-/// Engine seam state for merged props (scenery.rs `Props`, remaster mode). OPT-IN (`FH1_BATCH=1`) until merged
-/// chunks are small cells with a CPU VisibilityRange per LOD level: tile-sized chunks defeated frustum / range culling
-/// (more GPU draws than one entity per placement part; f5's FH1_RM_STATS counts, 2026-10-06).
+/// Engine seam state for merged props (scenery.rs `Props`, remaster mode). W4 was opt-in: tile-sized chunks defeated
+/// frustum / range culling (more GPU draws than one entity per placement part; f5's FH1_RM_STATS counts, 2026-10-06).
+/// P8 lever 3 (2026-10-08): `CELL` m chunks with a coarse per-cell VisibilityRange; DEFAULT-ON, `FH1_BATCH=0` = off.
 #[derive(Default)]
 pub struct PropMerge {
     /// Mergeable templates: every part has a remaster material (CPU meshes after `prepare_mesh`).
@@ -596,11 +625,12 @@ pub struct PropMerge {
     smashable: Option<std::collections::HashSet<u16>>,
 }
 
-pub type MergeTask = bevy::tasks::Task<Vec<((u8, u32), Merged)>>;
+pub type MergeTask = bevy::tasks::Task<Vec<(MergeKey, Merged)>>;
 
 impl PropMerge {
     pub fn on() -> bool {
-        crate::enabled() && std::env::var("FH1_BATCH").as_deref() == Ok("1")
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        crate::enabled() && *ON.get_or_init(|| std::env::var("FH1_BATCH").as_deref() != Ok("0"))
     }
 
     /// A loaded template: its CPU parts when all of them have remaster materials, `None` = not mergeable.
@@ -637,11 +667,13 @@ impl PropMerge {
         }
     }
 
-    /// Start merging a tile on the async pool. `skip(i)`: broken placements; non-merging models are skipped here.
-    pub fn start(&mut self, list: Vec<Placement>, chains: &HashMap<u16, LodChain>, default_end: f32, min_end: f32, skip: std::collections::HashSet<u32>) -> MergeTask {
+    /// Start merging a tile on the async pool. `skip(i)`: placements that stay entities (broken, own lightmaps);
+    /// non-merging models are skipped here. `last_end`: see [`merge_props`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn start(&mut self, list: Vec<Placement>, chains: &HashMap<u16, LodChain>, default_end: f32, min_end: f32, skip: std::collections::HashSet<u32>, last_end: Vec<f32>) -> MergeTask {
         let templates = self.shared.get_or_insert_with(|| Arc::new(self.templates.clone())).clone();
         let keep: Vec<bool> = list.iter().enumerate().map(|(i, p)| !skip.contains(&(i as u32)) && self.merges(p.model, chains.get(&p.model))).collect();
         let chains: HashMap<u16, LodChain> = list.iter().filter_map(|p| Some((p.model, chains.get(&p.model)?.clone()))).collect();
-        bevy::tasks::AsyncComputeTaskPool::get().spawn(async move { merge_props(&list, &chains, &templates, default_end, min_end, |i| !keep[i]) })
+        bevy::tasks::AsyncComputeTaskPool::get().spawn(async move { merge_props(&list, &chains, &templates, default_end, min_end, &last_end, |i| !keep[i]) })
     }
 }

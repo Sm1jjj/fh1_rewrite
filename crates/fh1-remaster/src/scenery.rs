@@ -7,7 +7,7 @@
 //!   13-16k game materials collapse to the distinct ones, all in one bindless pipeline family.
 //! - Textures: the scenery group's DDS (game mips), uploaded as sRGB when the game fetches them with gamma (the
 //!   `.bix` word / BC4-BC5 rule), so the hardware decodes them; one cache per track, never evicted (v1).
-//! - Night: [`RemasterNight`] changes are applied to every material in steps of 1/16 (rare: dusk / dawn).
+//! - Night: [`RemasterNight`] changes (steps of 1/16, dusk / dawn) go only to the materials whose output depends on them, a batch per frame (PERF P8-B).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -63,6 +63,8 @@ pub struct RemasterScenery {
     provider: AssetHandleProvider,
     /// Night values last written into the materials.
     night: RemasterNight,
+    /// Materials still to receive `night` (P8: a few per frame, only the ones whose output depends on it).
+    night_queue: Vec<Handle<RemasterMaterial>>,
     pub loaded_textures: usize,
     /// Bytes of each resident texture (CPU-side data size = its VRAM, mips included).
     bytes: HashMap<AssetId<Image>, usize>,
@@ -83,6 +85,7 @@ impl RemasterScenery {
             loading: Vec::new(),
             provider,
             night: RemasterNight::default(),
+            night_queue: Vec::new(),
             loaded_textures: 0,
             bytes: HashMap::new(),
             resident_bytes: 0,
@@ -340,18 +343,59 @@ fn poll(mut sc: ResMut<RemasterScenery>, mut images: ResMut<Assets<Image>>, nigh
             info!("remaster: {} scenery textures loaded, {} resident ({} MB)", sc.loaded_textures, sc.images.len(), sc.resident_bytes >> 20);
         }
     }
-    // Night: quantised to 1/16 so a TOD sweep rewrites the materials ~16 times per dusk, not every frame.
+    // Night: quantised to 1/16 so a TOD sweep changes the values ~16 times per dusk, not every frame.
     let q = |v: f32| (v * 16.0).round() / 16.0;
     let want = RemasterNight { lightmap: q(night.lightmap), switch_on: q(night.switch_on), ..*night };
+    let n = Vec4::new(want.lightmap, want.switch_on, want.emissive_scale, want.lamp_scale);
     if want != sc.night {
         sc.night = want;
-        let n = Vec4::new(want.lightmap, want.switch_on, want.emissive_scale, want.lamp_scale);
-        for h in sc.materials.values() {
-            if let Some(mut m) = materials.get_mut(h) {
-                m.extension.params.night = n;
+        if night_all() {
+            // Old: every material, at once (P8: ~13k bindless re-prepares = a 90 ms PrepareAssets hitch per step).
+            for h in sc.materials.values() {
+                if let Some(mut m) = materials.get_mut(h) {
+                    m.extension.params.night = n;
+                }
             }
+        } else {
+            // Only the materials whose shader output changes (night lightmap / switched emissive); `get` doesn't mark
+            // the asset changed. Applied a batch per frame below, always with the latest value.
+            sc.night_queue = sc.materials.values().filter(|h| materials.get(*h).is_some_and(|m| night_matters(&m.extension.params, n))).cloned().collect();
         }
     }
+    let per_frame = night_batch();
+    for _ in 0..per_frame {
+        let Some(h) = sc.night_queue.pop() else { break };
+        if let Some(mut m) = materials.get_mut(&h) {
+            m.extension.params.night = n;
+        }
+    }
+}
+
+/// `FH1_RM_NIGHT_ALL=1`: the old night update (every material in one frame).
+fn night_all() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_RM_NIGHT_ALL").is_ok_and(|v| v == "1"))
+}
+
+/// Night material updates per frame (`FH1_RM_NIGHT_BATCH`, default 256).
+fn night_batch() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_RM_NIGHT_BATCH").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(256))
+}
+
+/// Does the scenery shader's output change from `p.night` to `n`? (material.rs fragment, "Night": role 8 = night
+/// lightmap unless FLAG_LM_BAKED, weight max(night.x, p3.x), scale night.z; role 9 + FLAG_NIGHT_EMISSIVE = emissive
+/// when night.y >= 0.5, scale night.w. Everything else ignores `night`.)
+fn night_matters(p: &material::SceneryUniform, n: Vec4) -> bool {
+    let o = p.night;
+    let flags = (p.info.z & 0xFFFF) as u16;
+    let lm = p.info.y & (1 << 8) != 0 && flags & material::FLAG_LM_BAKED == 0;
+    let em = p.info.y & (1 << 9) != 0 && flags & material::FLAG_NIGHT_EMISSIVE != 0;
+    let floor = p.p[3].x;
+    let lm_changed = o.x.max(floor) != n.x.max(floor) || ((o.x.max(floor) > 0.0 || n.x.max(floor) > 0.0) && o.z != n.z);
+    let em_on = |v: Vec4| v.y >= 0.5;
+    let em_changed = em_on(o) != em_on(n) || (em_on(n) && o.w != n.w);
+    (lm && lm_changed) || (em && em_changed)
 }
 
 /// Seconds between cache sweeps, and how long an entry only the cache holds is kept (tile-boundary churn); the

@@ -144,7 +144,15 @@ pub(crate) fn plugin(app: &mut App) {
     render_app
         .insert_resource(GradePipeline { shader, layout: BindGroupLayoutDescriptor::new("fh1_remaster_grade_layout", &entries), ids: Vec::new() })
         .add_systems(Render, prepare_grade.in_set(RenderSystems::Prepare))
-        .add_systems(Core3d, grade_system.in_set(Core3dSystems::PostProcess).after(tonemapping));
+        // Before FXAA / SMAA (Options > Graphics > Anti-aliasing, fh1-engine ui/graphics.rs): they expect the final colour.
+        .add_systems(
+            Core3d,
+            grade_system
+                .in_set(Core3dSystems::PostProcess)
+                .after(tonemapping)
+                .before(bevy::anti_alias::fxaa::fxaa)
+                .before(bevy::anti_alias::smaa::smaa),
+        );
 }
 
 /// Calibration of light.rs's physical exposure to the game curve's input scale: the festival at 16:00 matched the

@@ -410,13 +410,30 @@ fn update_lights(
 
 /// Only the main camera gets cascades: the UI scene and minimap cameras' cascades would be empty shadow views
 /// that still cost the render thread (P6 "main-only"; fh1-render's shadow.rs, which did this, is off here).
-fn main_view_cascades_only(main: Query<Entity, With<RemasterView>>, mut lights: Query<&mut Cascades>) {
+#[allow(clippy::type_complexity)]
+fn main_view_cascades_only(
+    main: Query<Entity, With<RemasterView>>,
+    cams: Query<Option<&bevy::camera::visibility::RenderLayers>, With<Camera>>,
+    mut lights: Query<(&mut Cascades, Option<&bevy::camera::visibility::RenderLayers>)>,
+) {
     let Some(cam) = main.iter().next() else { return };
     // Emptied, not removed: Bevy's prepare_lights unwraps the per-view entry (bevy_pbr render/light.rs
     // `light.cascades.get(&entity).unwrap()`) for every active view that sees the light's layers. Removing it panicked as
     // soon as the car probe's face camera (car_probe.rs) switched to layer 0 for its first bake. An empty list = no
     // shadow views for that camera (fh1-render shadow.rs / reflect.rs keep their extra cameras the same way).
-    for mut c in &mut lights {
+    // P8 (2026-10-08 pm): a view that does NOT see the light's layers (HUD / world map / minimap Camera2d: Bevy builds
+    // cascades for every active camera with a projection) is skipped by prepare_lights before that unwrap, so its entry
+    // is removed: an empty entry still made check_dir_light_mesh_visibility walk every caster once more per frame for
+    // that view. FH1_RM_CASCADE_PRUNE=0 = old (emptied only).
+    let prune = cascade_prune();
+    for (mut c, light_layers) in &mut lights {
+        if prune {
+            let light_layers = light_layers.cloned().unwrap_or_default();
+            let blind = |v: &Entity| *v != cam && cams.get(*v).is_ok_and(|l| !light_layers.intersects(&l.cloned().unwrap_or_default()));
+            if c.cascades.keys().any(&blind) {
+                c.cascades.retain(|v, _| !blind(v));
+            }
+        }
         if c.cascades.iter().any(|(v, l)| *v != cam && !l.is_empty()) {
             for (v, l) in c.cascades.iter_mut() {
                 if *v != cam {
@@ -425,6 +442,12 @@ fn main_view_cascades_only(main: Query<Entity, With<RemasterView>>, mut lights: 
             }
         }
     }
+}
+
+/// FH1_RM_CASCADE_PRUNE=0 = keep (empty) cascade entries for views that can't see the light (see `main_view_cascades_only`).
+fn cascade_prune() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !flag_off("FH1_RM_CASCADE_PRUNE"))
 }
 
 fn flag_off(name: &str) -> bool {

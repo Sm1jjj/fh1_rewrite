@@ -64,6 +64,11 @@ fn flag(k: &str, default: bool) -> bool {
     std::env::var(k).map_or(default, |v| v != "0")
 }
 
+fn lazy_path() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("FH1_TRAFFIC_LAZY_PATH", true))
+}
+
 /// FH1_TRAFFIC_DRAW: traffic cars further than this are not drawn (m).
 fn draw_dist() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -880,19 +885,25 @@ fn step_traffic(
         let mut leader: Option<(f32, f32)> = None;
         let mut leader_is_player = false;
         let fwd = (v.rotation * Vec3::NEG_Z).normalize_or(Vec3::NEG_Z);
-        let path: Vec<(f32, Vec3, Vec3)> = (1..=(look / 4.0) as usize).map(|k| {
-            let d = k as f32 * 4.0;
-            let (p, t) = sim.driver.ahead(net, d);
-            (d, p, t)
-        }).collect();
-        for o in &others {
-            if o.e == Some(e) {
-                continue;
-            }
-            let rel = o.o.position - v.position;
-            if rel.length_squared() > (look + 10.0) * (look + 10.0) || rel.dot(fwd) <= 0.0 {
-                continue;
-            }
+        // P8 perf: the look-ahead path (up to 22 lane walks) only when some car is ahead within reach.
+        // FH1_TRAFFIC_LAZY_PATH=0 = always built (old).
+        let ahead: Vec<&Other> = others
+            .iter()
+            .filter(|o| {
+                let rel = o.o.position - v.position;
+                o.e != Some(e) && rel.length_squared() <= (look + 10.0) * (look + 10.0) && rel.dot(fwd) > 0.0
+            })
+            .collect();
+        let path: Vec<(f32, Vec3, Vec3)> = if ahead.is_empty() && lazy_path() {
+            Vec::new()
+        } else {
+            (1..=(look / 4.0) as usize).map(|k| {
+                let d = k as f32 * 4.0;
+                let (p, t) = sim.driver.ahead(net, d);
+                (d, p, t)
+            }).collect()
+        };
+        for o in ahead {
             let reach = o.o.half_width + 1.1;
             for &(d, p, t) in &path {
                 let off = o.o.position - p;

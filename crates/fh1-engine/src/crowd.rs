@@ -62,6 +62,9 @@ const PICK_SLOTS: usize = 50;
 mod figures_gpu;
 mod walk_gpu;
 
+pub use figures_gpu::GpuFigure;
+pub use walk_gpu::WalkerMaterial;
+
 pub struct CrowdPlugin;
 
 impl Plugin for CrowdPlugin {
