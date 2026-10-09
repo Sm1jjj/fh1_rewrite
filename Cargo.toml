@@ -13,6 +13,8 @@ publish = false
 lzxd = { path = "vendor/lzxd" }
 # Vendored bevy_pbr 0.19.1 with directional shadow cascade caching (see vendor/bevy_pbr/FH1_PATCHES.md).
 bevy_pbr = { path = "vendor/bevy_pbr" }
+# Vendored wgpu-core 29.0.4: bind groups merged into a pass's usage scope once per pass (see vendor/wgpu-core/FH1_PATCHES.md).
+wgpu-core = { path = "vendor/wgpu-core" }
 
 # Bevy is slow unoptimised; optimise dependencies even in dev builds.
 [profile.dev.package."*"]

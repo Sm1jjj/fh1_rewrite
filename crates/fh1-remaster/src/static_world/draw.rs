@@ -113,6 +113,14 @@ fn shadow_dither_on() -> bool {
     *V.get_or_init(|| flag_on("FH1_SW_SHADOW_DITHER"))
 }
 
+/// P16: cascade pipelines that don't sample textures (opaque bins) leave the material bind group out, and the cascade
+/// pass draws them first, then the cutout bins slab by slab: a bindless slab bind costs the render thread a walk over
+/// its hundreds of texture views (wgpu usage tracking + memory-init checks), once per bind per pass.
+fn shadow_nomat_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| flag_on("FH1_SW_SHADOW_NOMAT"))
+}
+
 fn env_f32(k: &str, default: f32) -> f32 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -302,16 +310,22 @@ impl SpecializedRenderPipeline for ShadowPipeline {
             // Pre-pass: the material table only to drop cloth / non-opaque materials in the vertex stage.
             defs.push("PREPASS".into());
         }
-        if mask || (pre && self.bindless) {
+        let table = mask || (pre && self.bindless);
+        if table {
             defs.push("TABLE".into());
         }
         let frag = mask || dither;
         if frag {
             defs.push("FRAG".into());
         }
+        // P16: without the table the shader reads nothing from the material group (FH1_SW_SHADOW_NOMAT=0 = old).
+        let mut layout = vec![self.view_layout.clone(), self.arena_layout.clone()];
+        if table || !shadow_nomat_on() {
+            layout.push(self.material_layout.clone());
+        }
         RenderPipelineDescriptor {
             label: Some(if pre { "static world prepass" } else { "static world shadow" }.into()),
-            layout: vec![self.view_layout.clone(), self.arena_layout.clone(), self.material_layout.clone()],
+            layout,
             vertex: VertexState { shader: SHADOW_SHADER, shader_defs: defs.clone(), entry_point: Some("vertex".into()), buffers: Vec::new() },
             fragment: frag.then(|| FragmentState { shader: SHADOW_SHADER, shader_defs: defs, entry_point: Some("fragment".into()), targets: Vec::new() }),
             primitive: PrimitiveState { cull_mode: v.face(), unclipped_depth: self.unclipped && !pre, ..default() },
@@ -561,6 +575,8 @@ pub(super) struct DrawLists {
     arena_bind_group: Option<(u32, BindGroup)>,
     /// Cascade pipelines per (variant, dithering class).
     shadow_pipelines: HashMap<(Variant, bool), CachedRenderPipelineId>,
+    /// P16: cascade draw order (bin indices): bins that need no material first, then the rest grouped by slab.
+    shadow_order: Vec<u32>,
     /// P15-A: the bins are split into draw classes (culling + compaction + FH1_SW_DRAW_ORDER).
     split: bool,
 }
@@ -649,6 +665,12 @@ fn build_lists(mut arena: ResMut<Arena>, mut lists: ResMut<DrawLists>, device: R
             bins.push(*b);
         }
     }
+    let mut order: Vec<u32> = (0..bins.len() as u32).collect();
+    order.sort_by_key(|&b| {
+        let bin = &bins[b as usize];
+        (bin.variant.mask, if bin.variant.mask { bin.group } else { 0 }, b)
+    });
+    lists.shadow_order = order;
     lists.bins = bins;
     lists.split = split;
     lists.count = slots.len() as u32;
@@ -1199,6 +1221,7 @@ fn draw_static_shadows(
     lists: Res<DrawLists>,
     uniforms: Res<ViewUniforms>,
     cull: Option<Res<CullPipeline>>,
+    shadow: Option<Res<ShadowPipeline>>,
     cache: Res<PipelineCache>,
     allocators: Res<MaterialBindGroupAllocators>,
     mut ctx: RenderContext,
@@ -1213,6 +1236,7 @@ fn draw_static_shadows(
         return;
     };
     let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
+    let Some(shadow) = shadow else { return };
     let counts = if cull.compact { lists.counts.as_ref() } else { None };
     let recorder = ctx.diagnostic_recorder();
     let diagnostics = recorder.as_deref();
@@ -1234,7 +1258,8 @@ fn draw_static_shadows(
         pass.set_bind_group(1, arena_bg, &[]);
         pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
         let span = diagnostics.pass_span(&mut pass, "static_world_shadow");
-        for (b, bin) in lists.bins.iter().enumerate() {
+        for &b in &lists.shadow_order {
+            let bin = &lists.bins[b as usize];
             // Cascades: far = all casters, near = the in-band (dithered) ones (P15-A fade mode 1); no occluder class.
             let dithered = match bin.class {
                 CLASS_FAR => false,
@@ -1243,11 +1268,14 @@ fn draw_static_shadows(
             };
             let Some(id) = lists.shadow_pipelines.get(&(bin.variant, dithered)) else { continue };
             let Some(p) = cache.get_render_pipeline(*id) else { continue };
-            let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
-            let Some(material_bg) = slab.bind_group() else { continue };
+            // Same rule as ShadowPipeline::specialize: only alpha-tested (bindless) cutouts read the material table.
+            if !(shadow_nomat_on() && !(bin.variant.mask && shadow.bindless)) {
+                let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
+                let Some(material_bg) = slab.bind_group() else { continue };
+                pass.set_bind_group(2, material_bg, &[]);
+            }
             pass.set_render_pipeline(p);
-            pass.set_bind_group(2, material_bg, &[]);
-            draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, b as u32, bin);
+            draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, b, bin);
         }
         span.end(&mut pass);
     }
