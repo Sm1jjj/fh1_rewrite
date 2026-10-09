@@ -222,6 +222,44 @@ fn opacity(p: &mut Player, o: usize, on: bool) {
     p.set(o, fh1_ui::names::OPACITY, Value::Float(if on { 100.0 } else { 0.0 }));
 }
 
+/// Name / value row layout of a skill slot (`FH1_SKILLNAME_LAYOUT=0` = the authored fixed positions, which overlap for long names).
+fn name_layout() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_SKILLNAME_LAYOUT").map_or(true, |v| v != "0"))
+}
+
+/// Authored TEXT_POP_SKILLNAME / SkillValue (VERIFIED, 947_HUD objects 616/618): both centre-aligned `horizon_e` size 11 on
+/// one line, at local x −29 and 35, authored for text_width 90 / 33 px ("SUPERMAN" / "250"). The scene's SUPER_STACKER-style
+/// `stacker` isn't evaluated, so a longer name ("GREAT NEAR MISS") ran through the value and past the tape.
+const NAME_FONT: &str = "horizon_e";
+const NAME_SIZE_PX: f32 = 11.0 * super::scene::TEXT_PT_TO_PX;
+const AUTH_NAME_X: f32 = -29.0;
+const AUTH_VALUE_X: f32 = 35.0;
+const AUTH_NAME_W: f32 = 90.0;
+const AUTH_VALUE_W: f32 = 33.0;
+
+/// Local x of the name and value centres for texts of the given widths: the authored row (same gap, same centre) grown to fit.
+fn row_layout(name_w: f32, value_w: f32) -> (f32, f32) {
+    let gap = (AUTH_VALUE_X - AUTH_VALUE_W / 2.0) - (AUTH_NAME_X + AUTH_NAME_W / 2.0);
+    let centre = ((AUTH_NAME_X - AUTH_NAME_W / 2.0) + (AUTH_VALUE_X + AUTH_VALUE_W / 2.0)) / 2.0;
+    let left = centre - (name_w + gap + value_w) / 2.0;
+    (left + name_w / 2.0, left + name_w + gap + value_w / 2.0)
+}
+
+/// Set a slot's name and value and lay the two out side by side without overlapping.
+fn set_slot_texts(p: &mut Player, data: Option<&UiData>, name: usize, value: usize, name_s: String, value_s: String) {
+    if name_layout() {
+        if let Some(font) = data.and_then(|d| d.font(NAME_FONT)) {
+            let w = |s: &str| font.text_width(s, 0.0) * NAME_SIZE_PX;
+            let (nx, vx) = row_layout(w(&name_s), w(&value_s));
+            p.set(name, fh1_ui::names::POSITION_X, Value::Float(nx));
+            p.set(value, fh1_ui::names::POSITION_X, Value::Float(vx));
+        }
+    }
+    p.set_text(name, name_s);
+    p.set_text(value, value_s);
+}
+
 /// A string from the disc's tables, else the fallback.
 fn text(data: Option<&UiData>, file: &str, id: &str, fallback: &str) -> String {
     data.and_then(|d| d.strings.as_ref()).and_then(|s| s.get(file, id)).map(fh1_ui::strtable::strip_markup).unwrap_or_else(|| fallback.to_owned())
@@ -344,8 +382,7 @@ fn drive(
                 let k = if st.slots[st.top] == Slot::Live { st.top } else { next_slot(&mut st, p) };
                 let (slot, name, value, _) = o.slots[k];
                 // The running skill's grade-0 name ("DRIFT") from progression's label ("DRIFT 42 m" -> "DRIFT").
-                p.set_text(name, label.split_whitespace().next().unwrap_or(label).to_owned());
-                p.set_text(value, value_text.clone());
+                set_slot_texts(p, data, name, value, label.split_whitespace().next().unwrap_or(label).to_owned(), value_text.clone());
                 if st.slots[k] != Slot::Live {
                     st.slots[k] = Slot::Live;
                     p.fire_at("SHOW", slot);
@@ -358,8 +395,7 @@ fn drive(
                 // A running skill completes in its own slot; instant skills and combos take a new one.
                 let k = if !is_combo && st.slots[st.top] == Slot::Live { st.top } else { next_slot(&mut st, p) };
                 let (slot, name, value, icon) = o.slots[k];
-                p.set_text(name, skill_name(data, *kind, *fame, label));
-                p.set_text(value, fmt_num(*fame as i64));
+                set_slot_texts(p, data, name, value, skill_name(data, *kind, *fame, label), fmt_num(*fame as i64));
                 if is_combo {
                     if let Some((slide, _)) = combo(label) {
                         p.goto_slide(icon, slide);
@@ -544,6 +580,28 @@ fn drive(
             } else {
                 st.bar_hide = Some(left);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn authored_row_is_reproduced() {
+        let (n, v) = row_layout(AUTH_NAME_W, AUTH_VALUE_W);
+        assert!((n - AUTH_NAME_X).abs() < 1e-3 && (v - AUTH_VALUE_X).abs() < 1e-3, "{n} {v}");
+    }
+
+    #[test]
+    fn long_names_do_not_overlap_the_value() {
+        for name_w in [60.0f32, 90.0, 146.0, 175.0, 260.0] {
+            let value_w = 40.0;
+            let (n, v) = row_layout(name_w, value_w);
+            assert!(n + name_w / 2.0 < v - value_w / 2.0, "name {name_w} runs into the value");
+            let centre = ((n - name_w / 2.0) + (v + value_w / 2.0)) / 2.0;
+            assert!((centre - (-11.25)).abs() < 1e-3, "row centre moved: {centre}");
         }
     }
 }

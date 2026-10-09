@@ -25,12 +25,14 @@ use fh1_engine::ai::driver::{Driver, Obstacle, Situation};
 use fh1_engine::ai::line::RacingLine;
 use fh1_engine::ai::tables::AiTables;
 use fh1_engine::ai::{line_path, route_id, AiCar, AiRaceControl, AiRacer, AiWheel, DespawnRaceAi, DrivingLine, SpawnRaceAi};
-use fh1_engine::data::CarData;
 use fh1_engine::vehicle::{contact, SteeringAssist, Vehicle};
 use fh1_engine::world::MIRROR_Z;
 
 use crate::track::Track;
 use crate::{Car, Garage};
+
+/// AI TCS / contact / drafting (docs/AI.md "P17").
+mod race_physics;
 
 const SUBSTEPS: usize = 4;
 
@@ -138,7 +140,9 @@ fn spawn_ai(
         let Some(line) = lines.line(&garage.assets, &track.id, route) else { continue };
         let tables = lines.tables(&garage.assets);
         let dir = garage.assets.join("cars").join(&m.car_id);
-        let data = match CarData::load(&dir) {
+        // Upgraded to the event's class (src/ai/upgrade.rs; `FH1_AI_UPGRADE=0` or no request = the stock car).
+        let tune = m.tune.as_ref().and_then(|req| crate::ai_upgrade::plan(&garage.assets, &m.car_id, req));
+        let data = match crate::ai_upgrade::load_car(&garage.assets, &dir, &m.car_id, tune.as_ref()) {
             Ok(d) => d,
             Err(e) => {
                 warn!("AI slot {}: {}: {e:#}", m.slot, m.car_id);
@@ -151,7 +155,9 @@ fn spawn_ai(
         let mut vehicle = Vehicle::new(data, point);
         vehicle.place(point, yaw);
         let params = tables.driver(m.skill, m.temperament, m.rubberband, m.driver_id);
-        let driver = Driver::new(&line, &vehicle, params, m.slot.wrapping_mul(7919) ^ route);
+        let mut driver = Driver::new(&line, &vehicle, params, m.slot.wrapping_mul(7919) ^ route);
+        // P17: the route's TrackStartingMerges row (staggered grid merge; None = the P9 lane hold).
+        driver.set_start_merge(tables.start_merge(route));
         info!(
             "AI slot {}: {} on route {route} ({:.0} m), skill {} temperament {} rubberband {}, predicted {:.1} s",
             m.slot, m.car_id, line.length, params.skill.id, params.temperament.id, params.rubberband.id, driver.profile_max.time
@@ -217,9 +223,18 @@ fn drive_ai(
     mut player: Query<&mut Car>,
 ) {
     if ai.is_empty() {
+        // No race: the player's car must not keep a stale draft (ai/race_physics.rs).
+        if let Some(mut p) = player.iter_mut().next() {
+            race_physics::clear(&mut p.0);
+        }
         return;
     }
     let dt = time.delta_secs();
+    // AI TCS numbers, contact params and drafting (ai/race_physics.rs): draft scales for all race cars incl. the player's.
+    let phys = race_physics::begin_tick(ai.iter().map(|(c, _, _)| &c.0), player.iter().next().map(|c| &c.0));
+    if let Some(mut p) = player.iter_mut().next() {
+        race_physics::set_player(&mut p.0, &phys);
+    }
     let player_pos = player.iter().next().map(|c| c.0.position);
     let mut obstacles: Vec<(u32, Obstacle)> = ai.iter().map(|(c, _, r)| (r.slot, Obstacle::of(&c.0))).collect();
     if let Some(p) = player.iter().next() {
@@ -234,7 +249,13 @@ fn drive_ai(
     order.sort_by(|a, b| b.1.total_cmp(&a.1));
     let rank = |slot: u32| order.iter().position(|o| o.0 == slot).unwrap_or(0) as i32;
     let mut others = Vec::with_capacity(obstacles.len());
-    for (mut car, mut brain, racer) in &mut ai {
+    // Grid positions for the start merge / RaceStartBoost (P17): race.rs puts AI slot s at grid index s - 1 and the
+    // player last (PIWithPlayerLast), so the grid holds every AI car plus the player.
+    let grid_n = ai.iter().count() as u32 + 1;
+    for (ai_index, (mut car, mut brain, racer)) in ai.iter_mut().enumerate() {
+        if control.hold || dev.hold {
+            brain.driver.set_grid(racer.slot.saturating_sub(1), grid_n);
+        }
         let pp = player_pos.map(|p| brain.track_player(p));
         others.clear();
         others.extend(obstacles.iter().filter(|(s, _)| *s != racer.slot).map(|(_, o)| *o));
@@ -244,9 +265,11 @@ fn drive_ai(
             player_progress: pp,
             positions_from_player: rank(racer.slot) - rank(0),
             obstacles: &others,
+            player_distance: player_pos.map(|p| p.distance(car.0.position)),
         };
         let v = &mut car.0;
         v.begin_tick();
+        race_physics::set_ai(v, &phys, ai_index);
         let dec = brain.driver.update(v, sit, dt);
         v.torque_mult = dec.torque_mult;
         let ground = crate::smash::PropGround::new(track.ground.as_ref(), Some(&*props), v);
@@ -258,14 +281,15 @@ fn drive_ai(
         props.apply_hits(v, hits);
     }
     // Car-vs-car contact (once per tick).
+    let (ai_ai, human_ai) = (race_physics::contact_params(race_physics::PairKind::AiAi), race_physics::contact_params(race_physics::PairKind::HumanAi));
     let mut cars: Vec<Mut<AiCar>> = ai.iter_mut().map(|(c, _, _)| c).collect();
     for i in 0..cars.len() {
         for j in i + 1..cars.len() {
             let (a, b) = cars.split_at_mut(j);
-            contact::collide(&mut a[i].0, &mut b[0].0);
+            contact::collide_with(&mut a[i].0, &mut b[0].0, &ai_ai);
         }
         if let Some(mut p) = player.iter_mut().next() {
-            contact::collide(&mut p.0, &mut cars[i].0);
+            contact::collide_with(&mut p.0, &mut cars[i].0, &human_ai);
         }
     }
 }

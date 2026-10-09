@@ -53,6 +53,15 @@ const TCS_FULL_EFFECT: f32 = 0.25;
 /// TCSFullSteerSlipScale FWD / RWD / AWD (PhysicsSettings.ini; drive-type mapping verified at 82D36AF8).
 const TCS_FULL_STEER_SCALE: [f32; 3] = [1.2, 1.1, 2.0];
 
+/// Overrides for the TCS numbers above (the race AI's PhysicsSettings.ini TractionControlSpeedAI / TCSFullEffectFricDiffAI /
+/// TCSFullSteerSlipScale*AI; ai/race_physics.rs). `speed` in m/s, `steer_scale` = [FWD, RWD, AWD] like TCS_FULL_STEER_SCALE.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TcsParams {
+    pub speed: f32,
+    pub full_effect: f32,
+    pub steer_scale: [f32; 3],
+}
+
 /// STM (82D2CE50, docs/ASSISTS.md): acts above StabilityManageSpeed 30 mph (x the surface's
 /// TCandStabilitySpeedMultiplier, 1 on asphalt) while moving forwards. Gamedb AutoSteerOverrides: STMSlipMin / Max 1.5 / 3.0
 /// (identical for every row; car+0x17C0 / +0x17C4), or AutoSteerSTMSlipMin / Max 0.4 / 0.82 with the Assisted steering.
@@ -392,7 +401,11 @@ impl Vehicle {
             self.tcs_cut = 0.0;
             return throttle;
         }
-        let target = if self.speed() > TCS_SPEED { TCS_MOVING_SLIP } else { TCS_TAKEOFF_SLIP };
+        let (tcs_speed, full_effect, steer_scale) = match self.tcs_params {
+            Some(p) => (p.speed, p.full_effect, p.steer_scale),
+            None => (TCS_SPEED, TCS_FULL_EFFECT, TCS_FULL_STEER_SCALE),
+        };
+        let target = if self.speed() > tcs_speed { TCS_MOVING_SLIP } else { TCS_TAKEOFF_SLIP };
         let driven = self.driven_wheels();
         let dir = if fwd_speed < 0.0 || self.gear == 0 { -1.0 } else { 1.0 };
         let n = driven.len().max(1) as f32;
@@ -405,8 +418,8 @@ impl Vehicle {
             _ => 1,
         };
         // Surface multiplier (OffRoadTCSFullEffectMultiplier) is 1.
-        let lower = target * (1.0 + (TCS_FULL_STEER_SCALE[drive] - 1.0) * steer);
-        let cut = ((slip - lower) / TCS_FULL_EFFECT).clamp(0.0, 1.0);
+        let lower = target * (1.0 + (steer_scale[drive] - 1.0) * steer);
+        let cut = ((slip - lower) / full_effect).clamp(0.0, 1.0);
         self.tcs_cut = cut;
         // UNVERIFIED: the cut (stored at +0x168C) scales the throttle by 1 - cut.
         throttle * (1.0 - cut)

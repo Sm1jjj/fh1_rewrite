@@ -275,7 +275,7 @@ pub fn drive_hud(
     }
     let Ok(mut sc) = scenes.get_mut(hud.entity) else { return };
     let Ok(car) = cars.single() else { return };
-    let want = settings.hud && !menu.open && !rig.photo;
+    let want = settings.hud && !menu.open && !rig.photo && !crate::cutscene::hide_hud();
     sc.visible = want;
     if !want {
         return;

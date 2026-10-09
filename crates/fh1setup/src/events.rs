@@ -413,6 +413,13 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(-1))))?
         .collect::<Result<_, _>>()?;
 
+    // Tracks.RouteId (events-8): the number of the track's route files (`TrackRoute<n>.xml`, `route_<n>.owt`). It equals the track id
+    // for 108-111 / 131.. but the festival tracks 115 / 322-330 / 1001 have no file under their own id: their route is 11 / 2-10 / 12.
+    let route_ids: HashMap<i64, i64> = db
+        .prepare("SELECT id, RouteId FROM Tracks")?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(-1))))?
+        .collect::<Result<_, _>>()?;
+
     let scoring: Vec<i64> = db.prepare("SELECT Credits FROM EventScoring WHERE ScoringID = 1 ORDER BY place")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
     let cars: HashMap<i64, String> = db.prepare("SELECT Id, MediaName FROM Data_Car")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut stmt = db.prepare(
@@ -495,7 +502,22 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
     let mut races = Vec::new();
     let (mut skipped, mut ratios) = (Vec::new(), Vec::new());
     for (race_id, event_id, track_id, laps, horizon, name, desc, career, drivers, prize, class, skills, type_name, mode, length, temperaments, rubberbands) in rows {
-        let file = ribbon.join(format!("TrackRoute{track_id:03}.xml"));
+        // The route file: TrackRoute<track id>, else (events-8) TrackRoute<Tracks.RouteId> (FR05 / FR23 / FR28 / FR33 / FR40 / FR11 /
+        // FR27 / FR15 / FR48 / FR53 / FR56 / FR39 / FR19 / FR36 / FR65 / FR03 / FR57 / STREET_PLNS_005). Free roam (track 317, RouteId 0)
+        // is not a race.
+        if horizon == "FREE_ROAM" {
+            skipped.push(format!("{horizon} (track {track_id}: free roam, not a race)"));
+            continue;
+        }
+        let own = ribbon.join(format!("TrackRoute{track_id:03}.xml"));
+        let (file_no, file) = if own.is_file() || !routes_fix_on() {
+            (track_id, own)
+        } else {
+            match route_ids.get(&track_id).copied().filter(|r| *r >= 0) {
+                Some(r) => (r, ribbon.join(format!("TrackRoute{r:03}.xml"))),
+                None => (track_id, own),
+            }
+        };
         let Ok(xml) = std::fs::read_to_string(&file) else {
             skipped.push(format!("{horizon} (track {track_id}: no route file)"));
             continue;
@@ -513,7 +535,7 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
         // than one lap: NumLaps is also set on point-to-point routes (FR25 / FR17 / FR66 / FR24 / FR21 / FR01), where the
         // old "laps > 1 = circuit" closed the open route with a return leg. A one-lap "circuit" runs grid -> finish like a
         // point-to-point.
-        let line = if routes_fix_on() { owt.get(&track_id) } else { None };
+        let line = if routes_fix_on() { owt.get(&file_no) } else { None };
         let closed = match (line, ribbon_cfg.get(&track_id)) {
             (Some((c, _)), _) => *c,
             (None, Some(cfg)) => *cfg == 0,
@@ -621,7 +643,9 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
             })
             .collect();
         let (bits, near, on) = barriers.bits_for(&path);
-        let objects = u8::try_from(track_id).ok().and_then(|a| event_objects.get(&a)).cloned().unwrap_or_default();
+        // Event objects: activity id = the race's track id (VERIFIED, docs/RACES.md); for the tracks whose route is filed under
+        // Tracks.RouteId (2..12, no Tracks row with that id) the RouteId is tried (INFERRED; no activity list of another race has it).
+        let objects = u8::try_from(file_no).ok().and_then(|a| event_objects.get(&a)).cloned().unwrap_or_default();
         let marker = markers.get(&horizon).copied();
         let field: Vec<Value> = participants_q
             .query_map([event_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
@@ -642,6 +666,10 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
             "circuit": circuit,
             "ribbon_closed": closed,
             "route_src": if line.is_some() { "racing_line" } else { "astar" },
+            // events-8: where the route came from. "racing_line" = the game's OWTM line (VERIFIED); "inferred_road_graph" = the game's
+            // own checkpoints / waypoints joined by A* on colorado.nav (path INFERRED, gates real).
+            "route_source": if line.is_some() { "racing_line" } else { "inferred_road_graph" },
+            "route_file_by": if file_no == track_id { "track_id" } else { "route_id" },
             "drivers": drivers,
             "credits": prize,
             "target_class": class,
@@ -649,7 +677,7 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
             "ai_temperaments": temperaments,
             "ai_rubberbands": rubberbands,
             "track_id": track_id,
-            "route_file": format!("Ribbon_00/TrackRoute{track_id:03}.xml"),
+            "route_file": format!("Ribbon_00/TrackRoute{file_no:03}.xml"),
             "length_m": len,
             "start_gate": start_gate,
             "game_length_m": length,
@@ -814,8 +842,30 @@ fn progression_tables(db: &Connection, text: &dyn Fn(&str) -> String, cars: &Has
         .filter_map(|r| r.ok())
         .map(|(tier, car)| json!({"tier": tier, "car": cars.get(&car)}))
         .collect();
-    println!("[events] progression: {} wristbands, {} hubs, {} drivers, {} cars", wristbands.len(), hubs.len(), drivers.len(), car_info.len());
+    // Rewards_EventUnlock (events-7): completing `by` opens `unlocks` (Darius 169 after the Headline 167). Raw rows plus the
+    // required event's race HorizonEventID (the profile key) / name so the engine can match its profile records and word the lock text.
+    // A row whose `by` is not in Events (91 -> 92) keeps null `by_horizon`; the engine ignores it.
+    let unlock_rows: Vec<(i64, i64)> = match db.prepare("SELECT EventId, UnlockEventId FROM Rewards_EventUnlock ORDER BY EventId") {
+        Ok(mut st) => {
+            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?.filter_map(|r| r.ok()).collect();
+            rows
+        }
+        Err(_) => Vec::new(),
+    };
+    let event_unlocks: Vec<Value> = unlock_rows
+        .into_iter()
+        .map(|(by, unlocks)| {
+            let ev = db
+                .query_row("SELECT (SELECT r.HorizonEventID FROM Races r WHERE r.EventId = e.Id ORDER BY r.Id LIMIT 1), e.Name FROM Events e WHERE e.Id = ?1", [by], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))
+                .ok();
+            json!({"by": by, "unlocks": unlocks,
+                "by_horizon": ev.as_ref().and_then(|e| e.0.clone()),
+                "by_name": ev.as_ref().and_then(|e| e.1.as_deref().map(text))})
+        })
+        .collect();
+    println!("[events] progression: {} wristbands, {} hubs, {} drivers, {} cars, {} event unlocks", wristbands.len(), hubs.len(), drivers.len(), car_info.len(), event_unlocks.len());
     Ok(json!({
+        "event_unlocks": event_unlocks,
         "wristbands": wristbands,
         "hubs": hubs,
         "classes": class_json,
@@ -904,5 +954,46 @@ fn collect_levels(v: &Value, out: &mut Vec<(i64, i64)>) {
         }
         Value::Array(a) => a.iter().for_each(|c| collect_levels(c, out)),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn disc_root() -> Option<PathBuf> {
+        let root = std::env::var_os("FH1_DISC").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../disc"));
+        root.join("media").is_dir().then_some(root)
+    }
+
+    /// events-8: the 18 races whose tracks (115, 322-330, 1001) have no `TrackRoute<track id>.xml` install through
+    /// Tracks.RouteId (2-12), each with >= 2 gates, a path and a sane length; free roam stays out. Skipped without the disc.
+    #[test]
+    fn disc_route_id_races_install() {
+        let Some(disc) = disc_root() else { return };
+        let out = std::env::temp_dir().join(format!("fh1_events_test_{}", std::process::id()));
+        build(&disc, &out).unwrap();
+        let j: Value = serde_json::from_slice(&std::fs::read(out.join("colorado/events.json")).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&out);
+        let races = j["races"].as_array().unwrap();
+        assert!(races.iter().all(|r| r["horizon_id"] != "FREE_ROAM"), "free roam is not a race");
+        let ids = [
+            "FR05", "FR23", "FR28", "STREET_PLNS_005", "FR33", "FR40", "FR11", "FR27", "FR15", "FR48", "FR53", "FR56", "FR39", "FR19", "FR36", "FR65", "FR03", "FR57",
+        ];
+        for id in ids {
+            let r = races.iter().find(|r| r["horizon_id"] == id).unwrap_or_else(|| panic!("{id} not installed"));
+            assert!(r["gates"].as_array().unwrap().len() >= 2, "{id}: gates");
+            assert!(r["path"].as_array().unwrap().len() >= 2, "{id}: path");
+            assert_eq!(r["route_file_by"], "route_id", "{id}");
+            let (len, game) = (r["length_m"].as_f64().unwrap(), r["game_length_m"].as_f64().unwrap());
+            assert!(len > game * 0.5 && len < game * 2.0, "{id}: path {len} m vs gamedb {game} m");
+            let (laps, circuit) = (r["laps"].as_u64().unwrap(), r["circuit"].as_bool().unwrap());
+            assert!(circuit == (laps > 1), "{id}: circuit {circuit} laps {laps}");
+            assert!(!r["grid"].as_array().unwrap().is_empty(), "{id}: grid");
+        }
+        // Races that already had a file under their own track id are unchanged.
+        let fr02 = races.iter().find(|r| r["horizon_id"] == "FR02").unwrap();
+        assert_eq!(fr02["route_file_by"], "track_id");
     }
 }

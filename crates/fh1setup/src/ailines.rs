@@ -5,8 +5,9 @@
 //!   `fh1_engine::ai::line`). Route NNN belongs to `Ribbon_00/TrackRouteNNN.xml` (file number = gamedb Tracks.id).
 //! - `index.json`: `{ "<track>": [route ids...] }`.
 //! - `ai_tables.json`: every row of the AI tables (AISkills, AIRubberbands, AIRubberbandModeChoices, AITemperaments,
-//!   AILineChoices, AIPlayers, AISkillAdjustments, MPAIDifficultyMap, TrackSpecificAI, FreeRoamDrivers, AIDiff), keyed by
-//!   table, with the original column names.
+//!   AILineChoices, AIPlayers, AISkillAdjustments, MPAIDifficultyMap, TrackSpecificAI, FreeRoamDrivers, AIDiff), plus the
+//!   race tables the AI field / start use (Events, EventParticipants, TrackStartingMerges, StartGridPositions, Tracks,
+//!   CarPIOverrides, CarClasses; ailines-2), keyed by table, with the original column names.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -29,6 +30,14 @@ const TABLES: &[&str] = &[
     "TrackSpecificAI",
     "FreeRoamDrivers",
     "AIDiff",
+    // ailines-2: AI upgrades to the event (Events.UpgradeAI / TargetClass, EventParticipants.TuningLevel), grid / merge.
+    "Events",
+    "EventParticipants",
+    "TrackStartingMerges",
+    "StartGridPositions",
+    "Tracks",
+    "CarPIOverrides",
+    "CarClasses",
 ];
 
 pub fn build(disc: &Path, out: &Path) -> Result<()> {

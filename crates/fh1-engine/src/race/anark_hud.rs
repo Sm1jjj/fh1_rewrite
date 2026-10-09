@@ -278,7 +278,7 @@ pub fn drive_race_hud(
                     _ => format!("SET_EVENTICON_FESTIVALEVENT{}", tier.min(6) + 1),
                 };
                 opacity(p, o.prompt, 100.0);
-                text(p, o.prompt_title, r.name.to_uppercase());
+                text(p, o.prompt_title, super::states::prompt_title(&r.name, rs.prompt_locked.as_deref()));
                 fire(p, &icon, o.prompt);
                 fire(p, if locked { "SET_MODE_LOCKED" } else { "SET_MODE_AVAILABLE" }, o.prompt);
                 fire(p, "SHOW", o.prompt);

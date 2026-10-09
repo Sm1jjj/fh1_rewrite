@@ -19,6 +19,7 @@ name = "drive_probe"
 path = "src/bin/drive_probe.rs"
 
 [dependencies]
+fh1-video = { path = "../fh1-video" }
 libloading = "0.8"
 sysinfo = "0.38"
 fh1-world = { path = "../fh1-world" }

@@ -63,6 +63,8 @@ impl Plugin for CustomizePlugin {
     fn build(&self, app: &mut App) {
         let cars = if garage_on() { read_looks(&self.path) } else { BTreeMap::new() };
         let assets = app.world().get_resource::<Garage>().map(|g| g.assets.clone()).unwrap_or_default();
+        // The upgrades worker's garage API (ui/customize_upgrades/garage_api.rs): GarageAction / GarageResult, GarageApi.
+        app.add_plugins(super::customize_upgrades::garage_api::GarageApiPlugin);
         app.insert_resource(CarLooks { path: self.path.clone(), assets, cars, preview: None })
             .add_systems(Update, apply_requests.after(super::menu_input).after(super::menu_mouse).before(super::draw_menu))
             // PI header (47's customize_upgrades::pi_preview, off-thread): FH1_PI_HEADER=0 = none.
@@ -74,6 +76,8 @@ fn read_looks(path: &Path) -> BTreeMap<String, CarLook> {
     match std::fs::read(path) {
         Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
             warn!("garage: {}: {e}", path.display());
+            // Keep the unreadable file: the next save would otherwise wipe every look.
+            let _ = std::fs::copy(path, path.with_extension("json.bad"));
             BTreeMap::new()
         }),
         Err(_) => BTreeMap::new(),
@@ -122,14 +126,8 @@ pub enum Paint {
     Custom { rgb: u32, metallic: bool },
 }
 
-/// Body kit slots: (garage.json key, gamedb table, label, carbin section stems).
-const KIT_SLOTS: [(&str, &str, &str, &[&str]); 5] = [
-    ("front_bumper", "List_UpgradeCarBodyFrontBumper", "Front bumper", &["bumperf"]),
-    ("rear_bumper", "List_UpgradeCarBodyRearBumper", "Rear bumper", &["bumperr"]),
-    ("side_skirts", "List_UpgradeCarBodySideSkirt", "Side skirts", &["skirtl", "skirtr"]),
-    ("hood", "List_UpgradeCarBodyHood", "Hood", &["hood"]),
-    ("rear_wing", "List_UpgradeRearWing", "Rear wing", &["wing"]),
-];
+/// Body kit slots: (garage.json key, gamedb table, label, carbin section stems); the upgrades worker's const.
+use super::customize_upgrades::KIT_SLOTS;
 
 /// The race-section letter (fh1-remaster car.rs kit_node; fh1setup variants.rs).
 const RACE: char = fh1_remaster::car::RACE;
@@ -250,6 +248,41 @@ impl CarLooks {
             }
             body.insert(fh1_render::car::FxCarKit(fh1_render::car::StockKit(letters)));
         }
+    }
+
+    /// The saved look of `car` (the preview ignored; garage API).
+    pub(crate) fn saved(&self, car: &str) -> Option<&CarLook> {
+        self.cars.get(car)
+    }
+
+    /// Every saved look (garage API).
+    pub(crate) fn saved_cars(&self) -> impl Iterator<Item = (&String, &CarLook)> + '_ {
+        self.cars.iter()
+    }
+
+    /// Set (Some) or clear (None) the preview of `car` (garage API; the caller respawns the body).
+    pub(crate) fn set_preview(&mut self, car: &str, look: Option<CarLook>) {
+        self.preview = look.map(|l| (car.to_owned(), l));
+    }
+
+    /// The car being previewed, if any.
+    pub(crate) fn preview_car(&self) -> Option<&str> {
+        self.preview.as_ref().map(|p| p.0.as_str())
+    }
+
+    /// Save `look` as `car`'s look (stock = the entry removed) and write garage.json (garage API).
+    pub(crate) fn commit(&mut self, car: &str, look: CarLook) {
+        if look == CarLook::default() {
+            self.cars.remove(car);
+        } else {
+            self.cars.insert(car.to_owned(), look);
+        }
+        self.save();
+    }
+
+    /// Installed assets.
+    pub(crate) fn assets(&self) -> &Path {
+        &self.assets
     }
 
     /// Credits spent on `car`'s parts (its sell value, ui/garage.rs).
@@ -402,6 +435,19 @@ pub struct CustomizeMenu {
     pi_text: Option<String>,
     pi_for: Option<(String, BTreeMap<String, i64>)>,
     pi_task: Option<bevy::tasks::Task<Option<String>>>,
+    /// Bumped whenever `rows` (and the data behind them) are rebuilt: ui/cards.rs redraws its Customize cards.
+    pub generation: u64,
+}
+
+/// A paint the card menus offer (ui/cards/tune.rs).
+#[derive(Clone, Debug)]
+pub(crate) struct PaintOption {
+    pub name: String,
+    pub paint: Paint,
+    pub rgb: u32,
+    pub metallic: bool,
+    /// The car's stock (first) factory colour.
+    pub stock: bool,
 }
 
 /// Menu navigation (ui.rs `Nav`).
@@ -569,7 +615,25 @@ impl CustomizeMenu {
         self.pending.push(Req::PreviewCustom);
     }
 
-    fn paint_name(&self, look: Option<&CarLook>) -> String {
+    /// Media name of the car the page was loaded for.
+    pub(crate) fn car(&self) -> &str {
+        &self.car
+    }
+
+    /// The car's factory colours and FH1's special colours (loaded by `open`).
+    pub(crate) fn paint_options(&self) -> (Vec<PaintOption>, Vec<PaintOption>) {
+        let stock = self.colours.first().map(|c| c.0);
+        let factory = self
+            .colours
+            .iter()
+            .enumerate()
+            .map(|(i, &(sequence, rgb, metallic))| PaintOption { name: format!("Colour {}", i + 1), paint: Paint::Factory { sequence }, rgb, metallic, stock: Some(sequence) == stock })
+            .collect();
+        let specials = self.specials.iter().map(|s| PaintOption { name: s.name.clone(), paint: Paint::Custom { rgb: s.rgb, metallic: s.metallic }, rgb: s.rgb, metallic: s.metallic, stock: false }).collect();
+        (factory, specials)
+    }
+
+    pub(crate) fn paint_name(&self, look: Option<&CarLook>) -> String {
         match look.and_then(|l| l.paint) {
             Some(Paint::Custom { rgb, metallic }) => match self.specials.iter().find(|s| s.rgb == rgb && s.metallic == metallic) {
                 Some(s) => s.name.clone(),
@@ -584,7 +648,7 @@ impl CustomizeMenu {
     }
 
     /// (RGB, metallic) the car shows with `look`.
-    fn shown_rgb(&self, look: Option<&CarLook>) -> Option<(u32, bool)> {
+    pub(crate) fn shown_rgb(&self, look: Option<&CarLook>) -> Option<(u32, bool)> {
         match look.and_then(|l| l.paint) {
             Some(Paint::Custom { rgb, metallic }) => Some((rgb, metallic)),
             _ => {
@@ -616,6 +680,7 @@ impl CustomizeMenu {
     }
 
     fn build_rows(&mut self, looks: &CarLooks) {
+        self.generation = self.generation.wrapping_add(1);
         let look = looks.get(&self.car);
         // Prices are shown when the economy is on; what the saved look owns (or wears) shows as owned.
         let shop = crate::progression::wallet::ownership_on();
@@ -639,7 +704,7 @@ impl CustomizeMenu {
                         selectable: !self.parts.is_empty(),
                         ..row(
                             "Upgrades",
-                            Some(match look.map_or(0, |l| l.upgrades.keys().filter(|t| !KIT_SLOTS.iter().any(|k| k.1 == t.as_str())).count()) {
+                            Some(match look.map_or(0, |l| l.upgrades.keys().filter(|t| t.as_str() != upgrades::RIM_TABLE && !KIT_SLOTS.iter().any(|k| k.1 == t.as_str())).count()) {
                                 _ if self.parts.is_empty() => "No parts".into(),
                                 0 => "Stock".into(),
                                 n => format!("{n} part{}", if n == 1 { "" } else { "s" }),
@@ -875,26 +940,26 @@ fn set_preview(looks: &mut CarLooks, car: &str, look: CarLook) -> bool {
 const CUSTOM_FINISH: usize = 3;
 
 /// 0xRRGGBB of hue (deg), saturation, value.
-fn hsv_rgb([h, s, v]: [f32; 3]) -> u32 {
+pub(crate) fn hsv_rgb([h, s, v]: [f32; 3]) -> u32 {
     let c = Color::from(Hsva::new(h, s, v, 1.0)).to_srgba();
     let b = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
     (b(c.red) << 16) | (b(c.green) << 8) | b(c.blue)
 }
 
 /// Hue (deg), saturation, value of 0xRRGGBB.
-fn rgb_hsv(rgb: u32) -> [f32; 3] {
+pub(crate) fn rgb_hsv(rgb: u32) -> [f32; 3] {
     let h = Hsva::from(Color::from(srgb(rgb).to_srgba()));
     [h.hue, h.saturation, h.value]
 }
 
-fn srgb(rgb: u32) -> Color {
+pub(crate) fn srgb(rgb: u32) -> Color {
     Color::srgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
 /// Carry out the page's requests: (re)build its rows, preview, keep or drop a look, save garage.json and respawn the
 /// player car's body.
 #[allow(clippy::too_many_arguments)]
-fn apply_requests(
+pub(super) fn apply_requests(
     mut commands: Commands,
     mut menu: ResMut<Menu>,
     mut looks: ResMut<CarLooks>,

@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use super::driver::{Driver, Obstacle, Situation};
 use super::line::RacingLine;
-use super::tables::AiTables;
+use super::start::{self, BoostInput};
+use super::tables::{AiTables, StartMerge};
 use crate::data::{private_assets, CarData};
 use crate::vehicle::{contact, Vehicle};
 use crate::world::{WorldGround, MIRROR_Z};
@@ -43,6 +44,7 @@ struct Run {
     resets: u32,
     off_track: u32,
     max_lateral_err: f32,
+    laps: Vec<f32>,
 }
 
 /// Lap the route with one AI car: route time vs the profile's prediction, off-track excursions, resets.
@@ -61,6 +63,14 @@ fn ai_laps_route() {
         let l = line(&e, route);
         let mut v = Vehicle::new(d.clone(), l.point_at(0.0));
         v.place(l.point_at(0.0), l.yaw_at(0.0));
+        if std::env::var_os("AI_GEES").is_some() {
+            let wb = (v.data.hubs[2][2] - v.data.hubs[0][2]).abs();
+            for sp in [15.0f32, 20.0, 25.0, 30.0, 35.0, 40.0] {
+                let lock = v.steer_lock_at(sp);
+                let a = v.lateral_grip(sp);
+                eprintln!("GEES v {sp} lock {:.2} deg a_max {a:.2} implied gees {:.2}", lock.to_degrees(), lock.tan() * sp * sp / wb / a);
+            }
+        }
         let params = e.tables.driver(skill, 0, 0, 0);
         let mut drv = Driver::new(&l, &v, params, route);
         let run = lap(&mut v, &mut drv, &e.world, 600.0, &[]);
@@ -75,6 +85,9 @@ fn ai_laps_route() {
             run.off_track,
             run.max_lateral_err
         );
+        let pace = drv.profile_max.time;
+        let flying = run.laps.last().copied().unwrap_or(run.time);
+        eprintln!("  laps {:?}: last/flying {:.1} s vs profile {:.1} s ({:+.1} %)", run.laps, flying, pace, 100.0 * (flying / pace - 1.0));
         total_resets += run.resets;
         assert!(run.finished, "route {route}: AI didn't finish");
     }
@@ -87,7 +100,10 @@ fn lap(v: &mut Vehicle, drv: &mut Driver, ground: &WorldGround, max_t: f32, obst
     const SUB: usize = 4;
     let dt = 1.0 / HZ;
     let mut r = Run::default();
-    let goal = drv.progress + drv.line.length as f64 - if drv.line.closed { 0.0 } else { 5.0 };
+    let laps = if drv.line.closed { var("AI_LAPS", 2u32).max(1) } else { 1 };
+    let start = drv.progress;
+    let goal = drv.progress + drv.line.length as f64 * laps as f64 - if drv.line.closed { 0.0 } else { 5.0 };
+    let mut next_split = start + drv.line.length as f64;
     while r.time < max_t {
         v.begin_tick();
         let dec = drv.update(v, Situation { obstacles, ..Default::default() }, dt);
@@ -104,6 +120,10 @@ fn lap(v: &mut Vehicle, drv: &mut Driver, ground: &WorldGround, max_t: f32, obst
                 r.time, drv.proj.s, v.forward_speed(), drv.profile_max.v_pred_at(&drv.line, drv.proj.s), v.rpm, drv.target_speed, drv.profile_max.v_corner[drv.proj.index], drv.proj.lateral, drv.proj.half_width,
                 drv.proj.distance, c.steer, c.throttle, c.brake, v.gear, v.wheels[0].norm_slip_angle, v.wheels[2].norm_slip_angle
             );
+        }
+        if drv.progress >= next_split && drv.line.closed {
+            r.laps.push(r.time - r.laps.iter().sum::<f32>());
+            next_split += drv.line.length as f64;
         }
         if drv.progress >= goal {
             r.finished = true;
@@ -227,14 +247,18 @@ fn ai_grid_hold_then_go() {
         let p = c + lv * if k % 2 == 0 { 0.35 } else { -0.35 };
         let mut v = Vehicle::new(d, p);
         v.place(p, l.yaw_at(s));
-        let drv = Driver::new(&l, &v, e.tables.driver(50, 0, 0, 0), k as u32 + 1);
+        let mut drv = Driver::new(&l, &v, e.tables.driver(50, 0, 0, 0), k as u32 + 1);
+        // P17: the game's merge schedule (the most common TrackStartingMerges row when the installed tables predate
+        // ailines-2) and the start boost, so this test covers the merge path and the boosted launch.
+        drv.set_start_merge(e.tables.start_merge(route).or(Some(StartMerge { waypoints_to_first_merge: 5.0, waypoints_before_corner: -100.0, waypoints_between_merges: 8.0, max_offline: 1.5 })));
+        drv.set_grid(k as u32, cars.len() as u32 + 1);
         let s0 = drv.proj.s;
         field.push((v, drv, s0));
     }
     let dt = 1.0 / 120.0;
     let mut t = 0.0f32;
     let mut worst = vec![0.0f32; cars.len()];
-    while t < 9.0 {
+    while t < 13.0 {
         let hold = t < 5.0;
         for (k, (v, drv, s0)) in field.iter_mut().enumerate() {
             v.begin_tick();
@@ -248,8 +272,111 @@ fn ai_grid_hold_then_go() {
         t += dt;
     }
     for (k, (v, drv, s0)) in field.iter().enumerate() {
-        eprintln!("car {k} {}: worst backwards {:.2} m, after GO {:.1} m, {:.1} m/s, gear {}", cars[k], -worst[k], drv.proj.s - s0, v.forward_speed(), v.gear);
+        eprintln!(
+            "car {k} {}: worst backwards {:.2} m, after GO {:.1} m, {:.1} m/s, gear {}, off the line {:.1} m",
+            cars[k], -worst[k], drv.proj.s - s0, v.forward_speed(), v.gear, drv.proj.distance
+        );
         assert!(worst[k] > -0.2, "{}: rolled back {:.2} m", cars[k], -worst[k]);
         assert!(v.forward_speed() > 3.0 && v.gear >= 1, "{}: not leaving forwards", cars[k]);
     }
+}
+
+/// RaceStartBoost curve (pure): pole / middle / last at 0, 400, 1200 and 2000 m (skill id 80 = x1, then id 1 = x2).
+#[test]
+fn start_boost_curve() {
+    let at = |index: u32, count: u32, skill_id: u32, driven: f32| start::start_boost(&BoostInput { index, count, skill_id, driven, behind_player: false, speed: 10.0 });
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+    // Pole of 8: 0.6 for 500 m, then fades over 1000 m.
+    for (d, want) in [(0.0, 0.6), (400.0, 0.6), (1200.0, 0.18), (2000.0, 0.0)] {
+        assert!(near(at(0, 8, 80, d), want), "pole at {d}: {}", at(0, 8, 80, d));
+    }
+    // Last of 8: 0.2 for 250 m.
+    for (d, want) in [(0.0, 0.2), (400.0, 0.17), (1200.0, 0.01), (2000.0, 0.0)] {
+        assert!(near(at(7, 8, 80, d), want), "last at {d}: {}", at(7, 8, 80, d));
+    }
+    // Middle of 3 (fraction 0.5): 0.4 for 375 m.
+    for (d, want) in [(0.0, 0.4), (400.0, 0.39), (1200.0, 0.07), (2000.0, 0.0)] {
+        assert!(near(at(1, 3, 80, d), want), "middle at {d}: {}", at(1, 3, 80, d));
+    }
+    // Skill 1 doubles it; ids over 80 (fixed test skills) get x1.
+    assert!(near(at(0, 8, 1, 0.0), 1.2));
+    assert!(near(at(0, 8, 201, 0.0), 0.6));
+    assert!(near(start::skill_boost_factor(40), 2.0 - 39.0 / 79.0));
+    // A lone car is the pole; behind the player and past 25 m/s the boost is BehindPlayer (0).
+    assert!(near(at(0, 1, 80, 0.0), 0.6));
+    let behind = |speed: f32| start::start_boost(&BoostInput { index: 0, count: 8, skill_id: 80, driven: 0.0, behind_player: true, speed });
+    assert!(near(behind(10.0), 0.6) && near(behind(30.0), 0.0));
+}
+
+/// TrackStartingMerges schedule (pure): staggered by grid slot, squeezed by a close first corner.
+#[test]
+fn start_merge_schedule() {
+    let m = StartMerge { waypoints_to_first_merge: 5.0, waypoints_before_corner: -100.0, waypoints_between_merges: 8.0, max_offline: 1.5 };
+    // Corner 500 m ahead: the deadline is 100 waypoints (200 m) before it.
+    let a = start::merge_schedule(&m, 0, 2.0, Some(500.0));
+    let b = start::merge_schedule(&m, 3, 2.0, Some(500.0));
+    assert_eq!((a.from, a.by), (10.0, 300.0));
+    assert_eq!((b.from, b.by), (58.0, 300.0));
+    // Corner 50 m ahead: the deadline can't come before first merge + 20 m, and later cars start no later than by - 20.
+    let c = start::merge_schedule(&m, 5, 2.0, Some(50.0));
+    assert_eq!((c.from, c.by), (10.0, 30.0));
+    // No corner ahead: merge over 150 m after the car's own start.
+    let d = start::merge_schedule(&m, 3, 2.0, None);
+    assert_eq!((d.from, d.by), (58.0, 208.0));
+}
+
+/// ai_tables.json rows of ailines-2: merges by route, grid offsets by track (pure).
+#[test]
+fn start_tables_parse() {
+    let v = serde_json::json!({
+        "TrackStartingMerges": [{"Tracks_id": 5, "WaypointsToFirstMerge": 5, "WaypointsBeforeCorner": -185, "WaypointsBetweenMerges": 12, "MaxStartOfflineDistance": 1.5}],
+        "StartGridPositions": [
+            {"id": 37, "StartIndex": 1, "MetersBackFromStartLine": 12.5, "MetersRightOfCenterLine": 2.7, "Yaw": 0.0},
+            {"id": 37, "StartIndex": 0, "MetersBackFromStartLine": 4.7, "MetersRightOfCenterLine": -3.5, "Yaw": 0.05}
+        ],
+        "Tracks": [{"id": 324, "RouteId": 5, "DefaultStartGridPositionsId": 37}, {"id": 96, "RouteId": 96, "DefaultStartGridPositionsId": null}]
+    });
+    let t = AiTables::from_json(&v);
+    let m = t.start_merge(5).expect("merge row");
+    assert_eq!((m.waypoints_to_first_merge, m.waypoints_before_corner, m.waypoints_between_merges, m.max_offline), (5.0, -185.0, 12.0, 1.5));
+    assert!(t.start_merge(6).is_none());
+    let g = t.grid_offsets(324).expect("grid");
+    assert_eq!(g.len(), 2);
+    assert_eq!(g[0], (4.7, -3.5, 0.05));
+    assert_eq!(t.grid_offsets_for_route(5), Some(g));
+    assert!(t.grid_offsets(96).is_none());
+}
+
+/// A car spun to face backwards (as after a hit) coasts, is reset onto the line facing along it within a few seconds,
+/// and never reverses.
+#[test]
+fn ai_spun_car_resets_without_reversing() {
+    let Some(e) = env() else {
+        eprintln!("skipped: needs data/ with world + ailines (fh1setup)");
+        return;
+    };
+    let d = CarData::load(&e.assets.join("cars").join("VW_Corrado_95")).expect("car");
+    let l = line(&e, 5);
+    let s0 = 300.0;
+    let mut v = Vehicle::new(d, l.point_at(s0));
+    v.place(l.point_at(s0), l.yaw_at(s0) + std::f32::consts::PI);
+    let mut drv = Driver::new(&l, &v, e.tables.driver(1, 0, 0, 0), 5);
+    let dt = 1.0 / 120.0;
+    let mut t = 0.0;
+    let mut worst_back = 0.0f32;
+    while t < 6.0 && drv.resets == 0 {
+        v.begin_tick();
+        let dec = drv.update(&mut v, Situation::default(), dt);
+        v.torque_mult = dec.torque_mult;
+        for _ in 0..4 {
+            v.step(dec.controls, dt / 4.0, &e.world);
+        }
+        worst_back = worst_back.min(v.forward_speed());
+        t += dt;
+    }
+    assert_eq!(drv.resets, 1, "a spun car should be reset once");
+    assert!(t > 1.4 && t < 4.0, "reset at {t:.1} s");
+    assert!(worst_back > -3.0, "reversed at {worst_back:.1} m/s");
+    let fwd = v.rotation * bevy::math::Vec3::NEG_Z;
+    assert!(fwd.dot(l.tangent_at(drv.proj.s)) > 0.9, "not facing along the line after the reset");
 }

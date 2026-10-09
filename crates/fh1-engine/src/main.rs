@@ -14,10 +14,20 @@
 
 #[path = "ai/plugin.rs"]
 mod ai_plugin;
+#[path = "ai/upgrade.rs"]
+mod ai_upgrade;
 mod logpipe;
 #[path = "traffic/plugin.rs"]
 mod traffic_plugin;
 mod anim;
+mod ambience;
+mod cutscene;
+mod missions;
+mod sfx_bank;
+mod sfx_world;
+mod sfx_race;
+mod sfx_horn;
+mod vo;
 mod audio;
 mod backfire;
 mod camera;
@@ -249,6 +259,9 @@ fn main() -> AppExit {
         .add_plugins(perf::PerfPlugin)
         .add_plugins(scenery::P2Plugin)
         .add_plugins(ui::UiPlugin { settings_path: data_dir.join("settings.json") })
+        .add_plugins(ambience::AmbiencePlugin)
+        .add_plugins(cutscene::CutscenePlugin)
+        .add_plugins((sfx_world::SfxWorldPlugin, sfx_race::RaceSfxPlugin, sfx_horn::HornPlugin, vo::VoPlugin))
         .add_plugins(diag::DiagPlugin)
         .add_systems(Startup, flags::log_startup)
         .init_resource::<PendingCar>()
@@ -278,11 +291,14 @@ fn main() -> AppExit {
         .add_systems(Update, effects::tyre_smoke.run_if(ui::driving))
         .add_plugins(progression::ProgressionPlugin { path: data_dir.join("profile.json") })
         .insert_resource(events)
+        .add_plugins(missions::MissionsPlugin)
         .init_resource::<race::RaceState>()
         .add_systems(Startup, race::spawn_race_hud)
         .add_systems(Update, (race::race_update, race::race_objects, race::race_markers).run_if(ui::driving))
         .add_systems(Update, race::race_hud)
         .add_systems(Update, race::race_nav)
+        .add_plugins(race::airborne::AirbornePlugin)
+        .add_plugins(race::airborne_link::AirborneLinkPlugin)
         .add_systems(Update, objects::teleport.before(scenery::stream))
         .init_resource::<smash::PropCollision>()
         .add_systems(Update, (smash::update.after(scenery::stream), smash::test_drive))

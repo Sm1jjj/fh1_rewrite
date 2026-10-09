@@ -74,6 +74,13 @@ pub struct ProfileData {
     pub credits: i64,
     /// Popularity (banked skill chains).
     pub fame: u64,
+    /// Story movies already shown (ui/intro.rs: FMV_01 / FMV_02 / FMV_04), once per profile.
+    pub fmv_seen: Vec<String>,
+    /// First-time career steps done (ui/intro.rs): "intro_done", "festival_arrived", "race_central_seen", "first_wristband".
+    pub story_flags: Vec<String>,
+    /// Free-roam activities (missions.rs, docs/MISSIONS.md).
+    #[serde(default)]
+    pub missions: crate::missions::save::MissionsSave,
     pub events: BTreeMap<String, EventRecord>,
     /// Prize / wristband reward cars won (MediaName).
     pub cars_won: Vec<String>,

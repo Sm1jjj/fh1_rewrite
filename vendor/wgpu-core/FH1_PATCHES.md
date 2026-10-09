@@ -16,3 +16,11 @@ them. Rebase them when wgpu is upgraded (or drop them if upstream stops re-walki
    - `PassState.init_bind_groups` (render passes only; `None` for compute): groups whose memory-init actions were
      already registered in this pass; a re-bind skips the walk (the first registration already initialises the memory
      before the pass; nothing inside a render pass discards a sampled resource).
+
+2. **Usage scopes reset sparsely** (P16-A, worker site-75, 2026-10-09; docs/PERF_P16_A.md). `UsageScope::drop` called
+   `clear()` (empties the state vectors) and the next `new_pooled` called `set_size(device size)`, refilling every slot
+   of every buffer / texture alive on the device, for each of the ~60-90 render / compute passes per frame. Now
+   `clear_sparse()` resets only the owned slots to the same defaults (`BufferUses::empty()`, `TextureUses::UNINITIALIZED`)
+   and keeps the lengths, so `set_size` is a no-op unless the device grew. The compute path's mid-pass removals
+   (`set_and_remove_from_usage_scope_sparse`) now also reset the removed slot, so every slot reads exactly as after the
+   old clear + resize. Revert = the two `clear()` calls in `track/mod.rs`.

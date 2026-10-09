@@ -6,7 +6,7 @@
 #   bin\fh1-engine.exe         the game
 #   bin\fh1setup.exe           asset converter, built with --features fh2,fm4
 #   bin\extract-xiso.exe       ISO extraction (pinned XboxDev build, SHA-256 checked)
-#   bin\ffmpeg.exe             XMA decoding during setup (pinned gyan.dev essentials build, SHA-256 checked)
+#   bin\ffmpeg.exe             XMA decoding during setup + FMV playback in the game (pinned gyan.dev essentials build, SHA-256 checked)
 #   bin\*.dll                  VC++ runtime (app-local, Microsoft redistributable)
 #   licenses\, README.txt
 #
@@ -98,6 +98,10 @@ Playground Games. No game files are included: you need your own Forza Horizon di
 Controls: W/S or RT/LT throttle/brake, A/D or left stick steer, Space/A handbrake, C/RB camera, Esc/Start pause.
 Logs: data\logs. Source code: https://github.com/Sm1jjj/fh1_rewrite
 "@ | Set-Content (Join-Path $Out "README.txt")
+
+# Ship no game assets: nothing converted from a disc may end up in the ZIP.
+$assets = Get-ChildItem $Out -Recurse -File | Where-Object { $_.Extension -in ".wmv", ".mp4", ".wav", ".fsb", ".fev", ".soundscape", ".xds", ".carbin", ".dds" }
+if ($assets) { throw "release: game assets in $Out`n$(($assets | ForEach-Object FullName) -join "`n")" }
 
 $zip = Join-Path $Dist "FH1Rewrite-$Version-win64.zip"
 if (Test-Path $zip) { Remove-Item $zip }

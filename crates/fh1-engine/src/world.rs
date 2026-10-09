@@ -68,6 +68,12 @@ impl WorldGround {
         routes & (self.routes | self.event_routes.load(std::sync::atomic::Ordering::Relaxed)) != 0 || (routes & 0x7FFF != 0 && self.event_tri_active(tri))
     }
 
+    fn is_ground_tri(&self, tri: u32) -> bool {
+        let p = self.world.tri_points(tri);
+        let (u, v) = (Vec3::from(p[1]) - Vec3::from(p[0]), Vec3::from(p[2]) - Vec3::from(p[0]));
+        u.cross(v).normalize_or_zero().y.abs() >= 0.5
+    }
+
     fn event_tri_active(&self, tri: u32) -> bool {
         self.event_tris_on.load(std::sync::atomic::Ordering::Relaxed) && self.event_tris.read().is_ok_and(|s| s.contains(&tri))
     }
@@ -133,7 +139,8 @@ impl WorldGround {
         let mut hits = Vec::new();
         for p in probes {
             self.world.sphere_contacts(Self::to_world(p), radius, &mut hits);
-            out.extend(hits.iter().map(|c| c.tri).filter(|&t| self.world.tris[t as usize].routes & 0x7FFF != 0));
+            // Walls only: event ground would be a hidden floor / ramp beside the barrier.
+            out.extend(hits.iter().map(|c| c.tri).filter(|&t| self.world.tris[t as usize].routes & 0x7FFF != 0 && !self.is_ground_tri(t)));
         }
         out
     }

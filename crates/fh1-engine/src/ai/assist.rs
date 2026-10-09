@@ -37,7 +37,7 @@ impl PlayerLine {
     pub fn new(route: u32, line: &RacingLine, v: &Vehicle) -> Self {
         let mut params = DriverParams::default();
         params.skill = Skill { braking: [1.0, 1.0], cornering: [1.25, 1.25], ..Skill::default() };
-        let mut driver = Driver::new(line, v, params, route);
+        let mut driver = Driver::with_margin(line, v, params, route, super::driver::MARGIN);
         driver.assist_only = true;
         Self { route, car: v.data.media_name.clone(), driver, ai: Controls::default() }
     }

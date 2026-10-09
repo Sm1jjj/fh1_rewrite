@@ -117,6 +117,13 @@
 //!   the sun disk landed in the cube (~1e4-1e5 exposed units in a texel or two), doubling the analytic sun highlight and
 //!   smeared by the GGX / irradiance filter into blotches over the panels; see [`probe_clamp`].
 //!
+//! - **P16-B** (2026-10-09, docs/PERF_P16_B.md; flag = old): the blit makes every face texel finite before the hot-spot cap
+//!   (the sun disk overflowed f16 to +inf, the cap made it NaN, the filters scattered NaN texels = black dots on the flake
+//!   paint; [`probe_finite_on`], FH1_RM_PROBE_FINITE). **Gap frames off**: the face camera is inactive between faces
+//!   instead of rendering an empty view ([`gap_sleep_on`], FH1_RM_PROBE_GAP_SLEEP). **Filter once**: Bevy's generator is
+//!   removed after one complete run instead of re-filtering every FILTER_FRAMES frame ([`filter_once_on`],
+//!   FH1_RM_PROBE_FILTER_ONCE). [`set_paused`] = the in-run A/B mode `probeoff` (views.rs).
+//!
 //! Anchor: the player car's `fh1_render::reflect::EnvCubeAnchor` (main.rs). OFF by default since 2026-10-08 (user: the best
 //! run so far was without it, ~80 fps; FH1_RM_CAR_PROBE=1 = on, the camera's atmosphere env only otherwise; before: on, 0 = off, the camera's
 //! atmosphere env only); FH1_RM_CAR_PROBE_RES=n face size (256 since 2026-10-08, was 128). The face camera gets no sun cascades: light.rs empties every
@@ -179,6 +186,43 @@ const NO_FACE: u8 = 255;
 /// Frames the generator runs before its filtered maps are taken (c3's BAKE_FRAMES).
 /// 6 since 2026-10-08 (was 4): margin for the filtered maps' GPU upload under load before a crossfade starts.
 const FILTER_FRAMES: u32 = 6;
+/// Generator runs of the car cube's filter seen by the render world since the current filter entity spawned
+/// ([`count_generation`]; reset by `drive`).
+static GEN_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// FH1_RM_PROBE_FILTER_ONCE=0 = old (P16-B): Bevy's environment-map generator runs the whole filter (SPD downsample, one
+/// GGX pass per mip, irradiance, ~12 fresh bind groups + 11 uniform buffers) on EVERY frame its entity exists
+/// (bevy_pbr light_probe/generate.rs: extract -> prepare bind groups -> downsampling_system / filtering_system, no "done"
+/// state), so the 6 FILTER_FRAMES of each bake ran it ~4 times (the first frames wait for the output `GpuImage`s). The
+/// output is the same each time (same source cube). Now the generator component is removed from the filter entity once
+/// the render world has seen one complete run for the car cube ([`count_generation`]: its bind groups present and all
+/// five compute pipelines compiled, so a first bake during pipeline compilation still waits); SyncComponent then drops the
+/// render-side `RenderEnvironmentMap`. The filter entity keeps its `EnvironmentMapLight` (the written maps) until
+/// FILTER_FRAMES as before, so the crossfade timing is unchanged.
+fn filter_once_on() -> bool {
+    std::env::var("FH1_RM_PROBE_FILTER_ONCE").map_or(true, |v| v != "0")
+}
+
+/// FH1_RM_PROBE_GAP_SLEEP=0 = old (P16-B): with spread 2 the frames between faces kept the face camera active on the empty
+/// IDLE_LAYER, i.e. a whole extra Core3d view (view uniforms / bind groups, preprocess, the atmosphere LUT passes the face
+/// camera carries, empty phases, sky) for nothing, 5 per bake. Now the camera is inactive on those frames. P6 kept it
+/// awake because a wake re-specialised every layer-0 mesh in the view; the static-only faces see only PROBE_LAYER (sun /
+/// moon, sky parts), so a wake is cheap. Inactive, `check_visibility` skips the camera and its `VisibleEntities` keep the
+/// last face's set (bevy_camera visibility/mod.rs), which is why the gap frames keep the capture layers. Only with
+/// [`static_faces_on`] and the lamps off (layer-0 faces = the old P6 case); the wake's warm-up frame is unchanged.
+fn gap_sleep_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_RM_PROBE_GAP_SLEEP").map_or(true, |v| v != "0")) && static_faces_on() && !LAMPS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// In-run A/B (views.rs `FH1_VIEWS_AB=probeoff`): the probe stops capturing and its two slots are dropped, i.e. the
+/// render-thread / GPU state of FH1_RM_CAR_PROBE=0 inside the same run.
+static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// See [`PAUSED`]. No-op when the probe isn't built.
+pub fn set_paused(paused: bool) {
+    PAUSED.store(paused, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// ON by default again since 2026-10-08 late night (user: the P15 build was "the smoothest run", GPU 7.6 -> 5.0 ms, so the
 /// probe fits; FH1_RM_CAR_PROBE=0 = off). It was off for the 200 fps push earlier that day. The 2026-10-06 panic after the
@@ -210,6 +254,8 @@ struct CarProbe(u8);
 struct CarProbeFilter {
     frames: u32,
     intensity: f32,
+    /// Generator removed ([`filter_once_on`]).
+    stopped: bool,
 }
 
 #[derive(Default)]
@@ -249,6 +295,8 @@ struct ProbeState {
     /// Parked rest: seconds stood still, faces left in a rest refresh cycle.
     rest_t: f32,
     rest_cycle: u8,
+    /// [`set_paused`] state applied.
+    paused: bool,
 }
 
 /// Crossfade time (s); 0 = instant swap (before 2026-10-08).
@@ -467,13 +515,23 @@ impl Plugin for CarProbePlugin {
             .add_systems(PostUpdate, drive.after(bevy::transform::TransformSystems::Propagate));
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app.add_systems(Core3d, blit.in_set(Core3dSystems::PostProcess).before(tonemapping));
+        render_app.add_systems(
+            bevy::render::Render,
+            count_generation
+                .after(bevy::pbr::generate::filtering_system)
+                .after(bevy::render::RenderSystems::PrepareBindGroups)
+                .before(bevy::render::RenderSystems::Render),
+        );
     }
 
     fn finish(&self, app: &mut App) {
         if !enabled() {
             return;
         }
-        let shader = app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(BLIT_WGSL.replace("const CAP: f32 = 0.0;", &format!("const CAP: f32 = {:?};", probe_clamp())), "fh1_remaster/car_probe_blit.wgsl"));
+        let wgsl = BLIT_WGSL
+            .replace("const CAP: f32 = 0.0;", &format!("const CAP: f32 = {:?};", probe_clamp()))
+            .replace("const FINITE: bool = false;", &format!("const FINITE: bool = {};", probe_finite_on()));
+        let shader = app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(wgsl, "fh1_remaster/car_probe_blit.wgsl"));
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app.insert_resource(BlitShader(shader));
         render_app.init_resource::<BlitPipeline>();
@@ -623,6 +681,36 @@ fn drive(
     }
     let [Some(slot0), Some(slot1)] = slots else { return };
     let slot_e = |k: u8| if k == 0 { slot0 } else { slot1 };
+    // In-run A/B ([`set_paused`]): no face view, no probes, no filter = the probe-off state; resumes with a fresh bake.
+    let paused = PAUSED.load(std::sync::atomic::Ordering::Relaxed);
+    if paused != state.paused {
+        state.paused = paused;
+        if paused {
+            if state.active.is_some() || state.fade.is_some() {
+                state.remove.extend([slot0, slot1]);
+            }
+            for (e, _, _) in &filters {
+                commands.entity(e).despawn();
+            }
+            state.phase = Phase::Idle;
+            state.last_bake = None;
+            state.active = None;
+            state.fade = None;
+            state.faces_since_bake = 0;
+            state.face_ev = None;
+            f.set_if_neq(CarProbeFace(NO_FACE));
+            layers.set_if_neq(idle.clone());
+            if cam.is_active {
+                cam.is_active = false;
+            }
+        } else if !sleep {
+            // The always-awake modes expect an active camera.
+            cam.is_active = true;
+        }
+    }
+    if paused {
+        return;
+    }
     // Commands apply before the render world extracts this frame (direct mutations too), so every step keeps
     // sum(intensity x weight) / sum(weight) at the full level in the frame it happens. The 2026-10-08 dark blips were the
     // fade start: the new probe inserted at 0 beside the old one still at 1x, averaged over two weights = half for a frame.
@@ -704,9 +792,19 @@ fn drive(
             // Between faces: the face camera idles (no second world view this frame).
             state.gap -= 1;
             f.set_if_neq(CarProbeFace(NO_FACE));
-            layers.set_if_neq(idle.clone());
+            if k > 0 && gap_sleep_on() {
+                // P16-B: no view at all between faces (module doc "Gap frames off"). The wake's warm-up (k == 0) stays.
+                if cam.is_active {
+                    cam.is_active = false;
+                }
+            } else {
+                layers.set_if_neq(idle.clone());
+            }
         }
         Phase::Capture(k) if k < 6 => {
+            if !cam.is_active {
+                cam.is_active = true;
+            }
             state.gap = face_spread().saturating_sub(1);
             let (fwd, up) = face_basis(k);
             // The down face only needs the road under the car (module doc).
@@ -734,10 +832,11 @@ fn drive(
                 cam.is_active = false;
             }
             let intensity = 1.2 * 2f32.powf(state.ev100);
+            GEN_RUNS.store(0, std::sync::atomic::Ordering::Release);
             commands.spawn((
                 Name::new("fh1_remaster car probe filter"),
                 GeneratedEnvironmentMapLight { environment_map: cube.0.clone(), intensity, rotation: Quat::IDENTITY, affects_lightmapped_mesh_diffuse: true },
-                CarProbeFilter { frames: 0, intensity },
+                CarProbeFilter { frames: 0, intensity, stopped: false },
                 Transform::default(),
             ));
             state.phase = Phase::Filter;
@@ -747,6 +846,11 @@ fn drive(
             for (e, mut fl, env) in &mut filters {
                 let Some(env) = env else { continue };
                 fl.frames += 1;
+                if !fl.stopped && filter_once_on() && GEN_RUNS.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                    // P16-B: the maps are written; stop Bevy re-running the whole generation every frame (module doc).
+                    fl.stopped = true;
+                    commands.entity(e).try_remove::<GeneratedEnvironmentMapLight>();
+                }
                 if fl.frames >= FILTER_FRAMES {
                     let mut env = env.clone();
                     match state.active {
@@ -862,10 +966,24 @@ struct V { @builtin(position) pos: vec4<f32> };
     return o;
 }
 // Copy: the faces are aimed for Bevy's z-negated cube lookup (no mirror). Texels brighter than CAP (exposed units; 0 = no
-// cap) are scaled down to it, keeping their hue ([`probe_clamp`]).
+// cap) are scaled down to it, keeping their hue ([`probe_clamp`]). FINITE: non-finite texels are made finite first
+// ([`probe_finite_on`]): +inf (f16 overflow, the sun disk) -> the f16 max, NaN -> 0, by bit pattern (fast-math safe).
 const CAP: f32 = 0.0;
+const FINITE: bool = false;
+fn finite(x: f32) -> f32 {
+    let b = bitcast<u32>(x);
+    if (b & 0x7f800000u) != 0x7f800000u {
+        return x;
+    }
+    // Exponent all ones: inf (mantissa 0) or NaN.
+    return select(0.0, select(65504.0, -65504.0, (b & 0x80000000u) != 0u), (b & 0x007fffffu) == 0u);
+}
 @fragment fn fragment(v: V) -> @location(0) vec4<f32> {
-    let c = max(textureLoad(src, vec2<i32>(v.pos.xy), 0), vec4<f32>(0.0));
+    var c = textureLoad(src, vec2<i32>(v.pos.xy), 0);
+    if FINITE {
+        c = vec4<f32>(finite(c.r), finite(c.g), finite(c.b), 1.0);
+    }
+    c = max(c, vec4<f32>(0.0));
     let m = max(c.r, max(c.g, c.b));
     if CAP > 0.0 && m > CAP {
         return vec4<f32>(c.rgb * (CAP / m), c.a);
@@ -888,6 +1006,17 @@ const CAP: f32 = 0.0;
 fn probe_clamp() -> f32 {
     let display = env_f32("FH1_RM_PROBE_CLAMP", 4.0).max(0.0);
     display * crate::post::game_unit_scale()
+}
+
+/// FH1_RM_PROBE_FINITE=0 = old (P16-B, 2026-10-09, user: "subtle black dots on the car" since the probe went back on):
+/// the faces' atmosphere draws the sun disk at ~1e4-1e5 exposed units, past Rgba16Float's 65504, so its texel is +inf in
+/// the face's main texture; the hot-spot cap then made it inf x (CAP / inf) = NaN in the cube. Bevy's SPD downsample
+/// carries that NaN up the mip chain (one texel per level, over the sun), and the GGX / irradiance filters, sampling those
+/// levels, scatter NaN texels over the sun-facing half of the filtered maps. The flake-jittered paint normals
+/// (car_paint.rs) hit them at random: isolated black (NaN) pixels on the paint only, densest on the sky-facing roof; smooth
+/// glass samples one direction and stays clean. Now the blit makes every texel finite before the cap.
+fn probe_finite_on() -> bool {
+    std::env::var("FH1_RM_PROBE_FINITE").map_or(true, |v| v != "0")
 }
 
 #[derive(Resource)]
@@ -917,6 +1046,26 @@ impl FromWorld for BlitPipeline {
             ..default()
         });
         Self { layout, id }
+    }
+}
+
+/// Render world, after Bevy's generator systems: counts a complete generator run for the car cube ([`filter_once_on`]).
+/// Bevy's downsampling / filtering systems run for every entity with `GeneratorBindGroups` once all five pipelines are
+/// compiled, and silently skip the frame otherwise. Other generators (the camera's atmosphere env) have another source.
+fn count_generation(
+    gens: Query<&bevy::pbr::generate::RenderEnvironmentMap, With<bevy::pbr::generate::GeneratorBindGroups>>,
+    cube: Option<Res<CarProbeCube>>,
+    images: Res<RenderAssets<GpuImage>>,
+    pipelines: Option<Res<bevy::pbr::generate::GeneratorPipelines>>,
+    pipeline_cache: Res<PipelineCache>,
+) {
+    let (Some(cube), Some(p)) = (cube, pipelines) else { return };
+    let Some(src) = images.get(&cube.0) else { return };
+    let ready = [p.downsample_first, p.downsample_second, p.copy, p.radiance, p.irradiance]
+        .into_iter()
+        .all(|id| pipeline_cache.get_compute_pipeline(id).is_some());
+    if ready && gens.iter().any(|g| g.environment_map.texture.id() == src.texture.id()) {
+        GEN_RUNS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

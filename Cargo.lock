@@ -3009,6 +3009,7 @@ dependencies = [
  "fh1-remaster",
  "fh1-render",
  "fh1-ui",
+ "fh1-video",
  "fh1-world",
  "libloading",
  "serde",
@@ -3095,9 +3096,14 @@ name = "fh1-ui"
 version = "0.1.0"
 dependencies = [
  "fh1-formats",
+ "flate2",
  "png",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "fh1-video"
+version = "0.1.0"
 
 [[package]]
 name = "fh1-world"

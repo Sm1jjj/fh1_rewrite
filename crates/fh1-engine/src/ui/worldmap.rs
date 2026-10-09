@@ -35,9 +35,19 @@
 //! waypoint kept across fast travel, fast travel and event start from the map.
 //!
 //! Flags: `FH1_WORLDMAP=0` = no map (the pause row stays "Fast travel"), `FH1_MAP_ROADS=0` = art only,
-//! `FH1_MAP_DISCOVERY=0` = every road drawn as driven.
+//! `FH1_MAP_DISCOVERY=0` = every road drawn as driven, `FH1_MAP_FRAME=0` = the art floating on the clear colour (no frame).
+//! `FH1_MAP_STATES=0` = no done / locked styling (the old ghost for locked events and the wreath for finished ones stay).
+//! Done = greyed, alpha 0.6, tick (or gold / silver / bronze disc for places 1-3) badge; Locked = dimmed, padlock badge;
+//! the barn rumour hint circle is a ring mesh (`worldmap/circle.rs`). State rules: `worldmap/state.rs`.
+//!
+//! Frame (2026-10-09, user: the map looked like a picture with the world around its edges): an opaque FH1-style frame
+//! (header band with the title and chips, footer band with the controls, side borders, a thin inner line) is part of
+//! the map's own UI, and the art always covers the window inside it: the zoom stops where the art fills the inner
+//! window ([`zoom_max`]) and the pan stops at the art's edges ([`clamp_center`]).
 
+pub(super) mod circle;
 mod discovery;
+pub mod state;
 mod waypoint;
 
 pub use waypoint::{distance_text, Waypoint};
@@ -59,6 +69,7 @@ use bevy::ui::UiTargetCamera;
 use bevy::window::PrimaryWindow;
 
 use self::discovery::Discovered;
+use self::state::{Badge, IconState};
 use super::minimap::{NavGraph, SatNav};
 use super::scene::{UiCamera, UiData};
 use super::UiFont;
@@ -142,6 +153,29 @@ fn enabled() -> bool {
 fn roads_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("FH1_MAP_ROADS").map_or(true, |v| v != "0"))
+}
+
+/// `FH1_MAP_FRAME=0` = old: no frame, zoom out to the whole art + 5 %, pan up to 80 % of half a view past its edges.
+fn frame_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_MAP_FRAME").map_or(true, |v| v != "0"))
+}
+
+/// Frame band sizes (logical px): header (title + chips), footer (controls), sides. Zero without the frame.
+const FRAME_TOP: f32 = 128.0;
+const FRAME_BOTTOM: f32 = 64.0;
+const FRAME_SIDE: f32 = 20.0;
+/// Opaque frame colour (a shade above `BG`) and its inner line.
+const FRAME_BG: Color = Color::srgb(0.045, 0.055, 0.068);
+const FRAME_LINE: Color = Color::srgba(1.0, 1.0, 1.0, 0.16);
+
+/// (top, bottom, side) frame bands in logical px.
+fn frame_px() -> (f32, f32, f32) {
+    if frame_on() {
+        (FRAME_TOP, FRAME_BOTTOM, FRAME_SIDE)
+    } else {
+        (0.0, 0.0, 0.0)
+    }
 }
 
 /// Engine (x, z) -> map plane (x east, y north).
@@ -247,6 +281,12 @@ struct Icon {
     /// Hit size (profile units).
     size: f32,
     locked: bool,
+    /// Done / locked styling (`state::enabled`), the medal (1..=3) of a Done icon, the hint circle radius in metres (0 = none)
+    /// and its entity + mesh.
+    state: IconState,
+    medal: Option<u8>,
+    radius: f32,
+    ring: Option<(Entity, Handle<Mesh>)>,
     /// Pulses (the career's recommended event).
     pulse: bool,
     action: Action,
@@ -284,8 +324,8 @@ struct WorldMap {
     mouse: Option<Vec2>,
     drag: Option<(Vec2, bool)>,
     icons: Vec<Icon>,
-    /// Catalog generation (0 = the race::Events fallback) the icons were built from.
-    icons_from: Option<u32>,
+    /// (Catalog generation (0 = the race::Events fallback), mission icon generation) the icons were built from.
+    icons_from: Option<(u32, u32)>,
     hover: Option<Hover>,
     /// Seconds the cursor has rested on a free point (its route preview waits a moment).
     rest: f32,
@@ -307,6 +347,9 @@ struct WorldMap {
     skip: u8,
     meshes: HashMap<(u32, u32), Handle<Mesh>>,
     mats: HashMap<[u8; 4], Handle<ColorMaterial>>,
+    /// Badge textures (tick, padlock) and the unit quad they are drawn on.
+    badge_tex: [Option<Handle<Image>>; 2],
+    unit_mesh: Option<Handle<Mesh>>,
     /// Road meshes: fade shadow, undriven grey, then driven dirt / b+a / freeway.
     road_meshes: Vec<Handle<Mesh>>,
     live_mesh: Option<(Handle<Mesh>, Handle<Mesh>)>,
@@ -345,6 +388,8 @@ impl Default for WorldMap {
             skip: 0,
             meshes: HashMap::new(),
             mats: HashMap::new(),
+            badge_tex: [None, None],
+            unit_mesh: None,
             road_meshes: Vec::new(),
             live_mesh: None,
             preview_mesh: None,
@@ -390,7 +435,7 @@ impl Plugin for WorldMapPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorldMap>()
             .add_systems(Update, (availability, hotkeys).chain())
-            .add_systems(Update, (sync_open, input, act, draw, panel, sync_hdr).chain().after(availability).run_if(resource_exists::<UiData>));
+            .add_systems(Update, (sync_open, input, act, draw, ring_sync, panel, sync_hdr).chain().after(availability).run_if(resource_exists::<UiData>));
         waypoint::build(app);
         discovery::build(app);
     }
@@ -432,8 +477,8 @@ fn hotkeys(keys: Res<ButtonInput<KeyCode>>, pads: Query<&Gamepad>, real: Res<Tim
 }
 
 /// Which event list the icons come from: the catalog generation, or 0 for the race list fallback.
-fn icon_source(catalog: Option<&EventCatalog>) -> u32 {
-    catalog.filter(|c| !c.events.is_empty()).map_or(0, |c| c.generation.max(1))
+fn icon_source(catalog: Option<&EventCatalog>, missions: Option<&crate::missions::map::MissionMapIcons>) -> (u32, u32) {
+    (catalog.filter(|c| !c.events.is_empty()).map_or(0, |c| c.generation.max(1)), missions.map_or(0, |m| m.generation))
 }
 
 /// Follow the pause menu's Map page: build on first open, (re)build the icons when the events changed, centre on the
@@ -452,14 +497,16 @@ fn sync_open(
     mut ui: Query<&mut Visibility, With<MapUiRoot>>,
     disc: Option<ResMut<Discovered>>,
     real: Res<Time<Real>>,
+    mission_icons: Option<Res<crate::missions::map::MissionMapIcons>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let want = menu.map_open();
     if want && st.open {
         st.opened_s += real.delta_secs();
         // The events changed while the page is up (a catalog refresh): rebuild without the grow.
-        let from = icon_source(catalog.as_deref());
+        let from = icon_source(catalog.as_deref(), mission_icons.as_deref());
         if st.icons_from != Some(from) {
-            rebuild_icons(&mut commands, &mut st, &data, events.as_deref(), catalog.as_deref(), &track, &assets, &mut meshes, &mut mats);
+            rebuild_icons(&mut commands, &mut st, &data, events.as_deref(), catalog.as_deref(), mission_icons.as_deref(), &track, &assets, &mut meshes, &mut mats, &mut images);
             st.icons_from = Some(from);
             st.panel_dirty = true;
         }
@@ -472,9 +519,9 @@ fn sync_open(
         if !st.built {
             build(&mut commands, &mut st, &data, &font, &assets, graph.as_deref(), &mut meshes, &mut mats);
         }
-        let from = icon_source(catalog.as_deref());
+        let from = icon_source(catalog.as_deref(), mission_icons.as_deref());
         if st.icons_from != Some(from) {
-            rebuild_icons(&mut commands, &mut st, &data, events.as_deref(), catalog.as_deref(), &track, &assets, &mut meshes, &mut mats);
+            rebuild_icons(&mut commands, &mut st, &data, events.as_deref(), catalog.as_deref(), mission_icons.as_deref(), &track, &assets, &mut meshes, &mut mats, &mut images);
             st.icons_from = Some(from);
         }
         if let Ok(car) = cars.single() {
@@ -548,7 +595,9 @@ fn build(commands: &mut Commands, st: &mut WorldMap, data: &UiData, font: &UiFon
             // Systems looking for the main 3D camera skip UI cameras.
             UiCamera,
             Camera2d,
-            Camera { order: 11, clear_color: ClearColorConfig::Custom(BG), is_active: false, ..default() },
+            // Active at spawn: `build` runs only on an open, and `sync_open`'s queries can't see these spawns until its
+            // commands apply (the first open used to stay on the paused world until the map was opened again).
+            Camera { order: 11, clear_color: ClearColorConfig::Custom(BG), is_active: true, ..default() },
             Projection::Orthographic(OrthographicProjection { scaling_mode: ScalingMode::FixedVertical { viewport_height: 1000.0 }, ..OrthographicProjection::default_2d() }),
             Tonemapping::None,
             bevy::core_pipeline::tonemapping::DebandDither::Enabled,
@@ -622,8 +671,41 @@ fn build(commands: &mut Commands, st: &mut WorldMap, data: &UiData, font: &UiFon
 fn spawn_ui(commands: &mut Commands, cam: Entity, font: &UiFont, tex: &Handle<Image>) {
     let panel = Color::srgba(0.03, 0.04, 0.05, 0.8);
     commands
-        .spawn((MapUiRoot, UiTargetCamera(cam), Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, Visibility::Hidden))
+        .spawn((MapUiRoot, UiTargetCamera(cam), Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, Visibility::Inherited))
         .with_children(|p| {
+            // Frame first, so every panel below draws over it (module doc "Frame").
+            let (top, bottom, side) = frame_px();
+            if frame_on() {
+                let band = |left: Val, right: Val, top_: Val, bottom_: Val, w: Val, h: Val| Node {
+                    position_type: PositionType::Absolute,
+                    left,
+                    right,
+                    top: top_,
+                    bottom: bottom_,
+                    width: w,
+                    height: h,
+                    ..default()
+                };
+                let full = Val::Percent(100.0);
+                p.spawn((band(Val::Px(0.0), Val::Auto, Val::Px(0.0), Val::Auto, full, Val::Px(top)), BackgroundColor(FRAME_BG)));
+                p.spawn((band(Val::Px(0.0), Val::Auto, Val::Auto, Val::Px(0.0), full, Val::Px(bottom)), BackgroundColor(FRAME_BG)));
+                p.spawn((band(Val::Px(0.0), Val::Auto, Val::Px(top), Val::Px(bottom), Val::Px(side), Val::Auto), BackgroundColor(FRAME_BG)));
+                p.spawn((band(Val::Auto, Val::Px(0.0), Val::Px(top), Val::Px(bottom), Val::Px(side), Val::Auto), BackgroundColor(FRAME_BG)));
+                // Thin line around the map window, and an accent rule under the title band.
+                p.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(side),
+                        right: Val::Px(side),
+                        top: Val::Px(top),
+                        bottom: Val::Px(bottom),
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(FRAME_LINE),
+                ));
+                p.spawn((band(Val::Px(side), Val::Px(side), Val::Px(top - 4.0), Val::Auto, Val::Auto, Val::Px(2.0)), BackgroundColor(ACCENT)));
+            }
             // Title, top left.
             p.spawn(Node { position_type: PositionType::Absolute, left: Val::Px(28.0), top: Val::Px(18.0), flex_direction: FlexDirection::Column, ..default() }).with_children(|p| {
                 p.spawn((Text::new("WORLD MAP"), font.text(34.0), TextColor(Color::WHITE)));
@@ -744,23 +826,28 @@ fn rebuild_icons(
     data: &UiData,
     events: Option<&crate::race::Events>,
     catalog: Option<&EventCatalog>,
+    mission_icons: Option<&crate::missions::map::MissionMapIcons>,
     track: &Track,
     assets: &AssetServer,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<ColorMaterial>,
+    images: &mut Assets<Image>,
 ) {
     for ic in st.icons.drain(..) {
         if let Some(r) = ic.root {
             commands.entity(r).despawn();
         }
+        if let Some((r, _)) = ic.ring {
+            commands.entity(r).despawn();
+        }
     }
     st.hover = None;
-    st.icons = collect_icons(data, events, catalog, track);
-    spawn_icons(commands, st, assets, meshes, mats);
+    st.icons = collect_icons(data, events, catalog, mission_icons, track);
+    spawn_icons(commands, st, assets, meshes, mats, images);
 }
 
 /// Events (progression catalog, else the race list), points of interest and fast-travel points.
-fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: Option<&EventCatalog>, track: &Track) -> Vec<Icon> {
+fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: Option<&EventCatalog>, mission_icons: Option<&crate::missions::map::MissionMapIcons>, track: &Track) -> Vec<Icon> {
     let mut out = Vec::new();
     let races = events.map_or(&[][..], |e| &e.races[..]);
     match catalog.filter(|c| !c.events.is_empty()) {
@@ -770,7 +857,10 @@ fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: O
                 let accent = if e.kind == EventKind::Street { STREET_BLUE } else { crate::progression::tier_color(e.tier) };
                 let completed = matches!(e.state, EventState::Completed { .. });
                 let locked = e.state == EventState::Locked;
-                let (group, layers, size, tilt) = event_layers(e.kind, circuit, accent, completed, e.recommended);
+                let styled = state::enabled();
+                let (ev_state, ev_medal) = if styled { state::info_state(e) } else { (IconState::Available, None) };
+                // The new look draws a badge; the old one the wreath.
+                let (group, layers, size, tilt) = event_layers(e.kind, circuit, accent, completed && !styled, e.recommended);
                 let mut lines = Vec::new();
                 if e.kind != EventKind::Street {
                     lines.push(format!("{} wristband", crate::progression::TIER_NAMES[(e.tier as usize).min(6)]));
@@ -786,10 +876,18 @@ fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: O
                 if let Some(r) = e.reward {
                     lines.push(format!("Reward  {r} CR"));
                 }
-                match e.state {
+                let best = match e.state {
+                    EventState::Completed { place } => Some(place),
+                    _ => None,
+                };
+                if styled {
+                    lines.extend(state::card_line(ev_state, best, e.lock_reason.as_deref()));
+                } else {
+                    match e.state {
                     EventState::Completed { place } => lines.push(format!("Best finish  {}", ordinal(place))),
                     EventState::Locked => lines.push(format!("Locked  ·  {}", e.lock_reason.clone().unwrap_or_else(|| "not yet available".into()))),
                     EventState::Unlocked => {}
+                    }
                 }
                 if e.recommended {
                     lines.push("Recommended next event".into());
@@ -807,6 +905,10 @@ fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: O
                     tilt_deg: tilt,
                     size,
                     locked,
+                    state: ev_state,
+                    medal: ev_medal,
+                    radius: 0.0,
+                    ring: None,
                     pulse: e.recommended,
                     action: if locked { Action::None } else { Action::Start(e.id.clone()) },
                     root: None,
@@ -847,6 +949,10 @@ fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: O
                     tilt_deg: tilt,
                     size,
                     locked: false,
+                    state: IconState::Available,
+                    medal: None,
+                    radius: 0.0,
+                    ring: None,
                     pulse: false,
                     action: Action::Travel(r.marker.0, r.marker.1),
                     root: None,
@@ -860,6 +966,10 @@ fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: O
     let mut seen: HashMap<&str, usize> = HashMap::new();
     let venue = |glyph: (u32, u32)| vec![layer((0, 2), 35.0), layer(glyph, 35.0)];
     for (tag, at) in &pois {
+        // Undiscovered barn finds (missions::map): pois.tsv lists every barn at its exact spot.
+        if mission_icons.is_some_and(|m| m.hides(tag, *at)) {
+            continue;
+        }
         let n = seen.entry(tag.as_str()).or_insert(0);
         *n += 1;
         // (group, name, kind, layers, final offset, action)
@@ -899,6 +1009,63 @@ fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: O
             tilt_deg: 0.0,
             size,
             locked: false,
+            state: IconState::Available,
+            medal: None,
+            radius: 0.0,
+            ring: None,
+            pulse: false,
+            action,
+            root: None,
+        });
+    }
+    // Free-roam missions (missions::map): outposts, speed traps, barn rumours / finds and the running activity's target.
+    // The barn rumour's hint circle (`radius`) is drawn as a ring mesh (`circle::ring_mesh`) by `spawn_icons`.
+    let styled = state::enabled();
+    for m in mission_icons.into_iter().flat_map(|m| m.all()) {
+        use crate::missions::map::IconKind;
+        let (cat, layers, action) = match m.kind {
+            IconKind::Outpost => (Cat::Fuel, vec![layer((6, 0), 45.0).at(-4.0, -4.0), layer((1, 2), 45.0)], Action::TravelRoad),
+            IconKind::SpeedCamera | IconKind::AverageSpeed => (Cat::Cameras, vec![layer((1, 3), 45.0)], Action::None),
+            IconKind::BarnHint | IconKind::BarnFound => (Cat::Barns, vec![layer((0, 4), 45.0)], Action::None),
+            IconKind::Target => (Cat::Events, vec![layer((2, 4), 55.0).tint(ROUTE_GREEN)], Action::None),
+            IconKind::Encounter => continue,
+        };
+        let size = layers.iter().map(|l| l.size).fold(0.0, f32::max);
+        out.push(Icon {
+            key: format!("mission:{}", m.key),
+            cat,
+            pos: m.pos,
+            name: m.name.clone(),
+            kind: match m.kind {
+                IconKind::Outpost => "Horizon Outpost",
+                IconKind::SpeedCamera => "Speed camera",
+                IconKind::AverageSpeed => "Average speed zone",
+                IconKind::BarnHint => "Barn find rumour",
+                IconKind::BarnFound => "Barn find",
+                _ => "Objective",
+            }
+            .into(),
+            accent: if m.kind == IconKind::Target { ROUTE_GREEN } else { ACCENT },
+            lines: {
+                let mut l = m.lines.clone();
+                if styled {
+                    match m.state {
+                        IconState::Done => l.extend(state::card_line(IconState::Done, None, None)),
+                        IconState::Locked if l.is_empty() => l.extend(state::card_line(IconState::Locked, None, None)),
+                        _ => {}
+                    }
+                }
+                l
+            },
+            layers,
+            offset: Vec2::ZERO,
+            tilt_deg: 0.0,
+            size,
+            locked: false,
+            state: if styled { m.state } else { IconState::Available },
+            medal: if styled { m.medal } else { None },
+            radius: if styled { m.radius.max(0.0) } else { 0.0 },
+            ring: None,
             pulse: false,
             action,
             root: None,
@@ -919,6 +1086,10 @@ fn collect_icons(data: &UiData, events: Option<&crate::race::Events>, catalog: O
             tilt_deg: 0.0,
             size: 28.0,
             locked: false,
+            state: IconState::Available,
+            medal: None,
+            radius: 0.0,
+            ring: None,
             pulse: false,
             action: Action::Travel(*p, *yaw),
             root: None,
@@ -963,14 +1134,16 @@ fn cat_z(c: Cat) -> f32 {
     }
 }
 
-fn spawn_icons(commands: &mut Commands, st: &mut WorldMap, assets: &AssetServer, meshes: &mut Assets<Mesh>, mats: &mut Assets<ColorMaterial>) {
+fn spawn_icons(commands: &mut Commands, st: &mut WorldMap, assets: &AssetServer, meshes: &mut Assets<Mesh>, mats: &mut Assets<ColorMaterial>, images: &mut Assets<Image>) {
     let render = RenderLayers::layer(WORLDMAP_LAYER);
     let tex = sheet(assets);
     for i in 0..st.icons.len() {
-        let (pos, cat, locked, layers, tilt) = {
+        let (pos, cat, locked, layers, tilt, istate, medal, radius) = {
             let ic = &st.icons[i];
-            (plane(ic.pos), ic.cat, ic.locked, ic.layers.clone(), ic.tilt_deg)
+            (plane(ic.pos), ic.cat, ic.locked, ic.layers.clone(), ic.tilt_deg, ic.state, ic.medal, ic.radius)
         };
+        let styled = state::enabled();
+        let size = st.icons[i].size;
         // Later icons draw on top within a group (tiny z step).
         let z = cat_z(cat) + i as f32 * 1e-4;
         let root = commands
@@ -978,7 +1151,11 @@ fn spawn_icons(commands: &mut Commands, st: &mut WorldMap, assets: &AssetServer,
             .id();
         for (k, l) in layers.into_iter().enumerate() {
             // Locked = the profile's "ghost": greyed and see-through.
-            let color = if locked {
+            let color = if styled && istate != IconState::Available {
+                let c = l.color.to_srgba();
+                let [r, g, b, a] = state::style_rgba([c.red, c.green, c.blue, c.alpha], istate);
+                Color::srgba(r, g, b, a)
+            } else if !styled && locked {
                 let c = l.color.to_srgba();
                 let g = (c.red + c.green + c.blue) / 3.0 * 0.8;
                 Color::srgba(g, g, g, c.alpha * 0.5)
@@ -989,7 +1166,51 @@ fn spawn_icons(commands: &mut Commands, st: &mut WorldMap, assets: &AssetServer,
             let mat = st.icon_mat(mats, &tex, color);
             commands.spawn((Mesh2d(mesh), MeshMaterial2d(mat), Transform::from_xyz(l.off.x, l.off.y, 0.01 * k as f32).with_scale(Vec3::splat(l.size)), render.clone(), ChildOf(root)));
         }
+        // Done / locked badge at the icon's lower right (a tick, a gold / silver / bronze medal disc, a padlock).
+        if let (true, Some(badge)) = (styled, state::badge_of(istate, medal)) {
+            let slot = usize::from(badge == Badge::Lock);
+            let tex = st.badge_tex[slot].get_or_insert_with(|| images.add(circle::badge_image(badge))).clone();
+            let mesh = st.unit_mesh.get_or_insert_with(|| meshes.add(circle::unit_quad())).clone();
+            let [r, g, b] = state::badge_rgb(badge);
+            let mat = st.icon_mat(mats, &tex, Color::srgba(r, g, b, 0.996));
+            commands.spawn((Mesh2d(mesh), MeshMaterial2d(mat), Transform::from_xyz(size * 0.34, -size * 0.34, 0.5).with_scale(Vec3::splat(size * 0.5)), render.clone(), ChildOf(root)));
+        }
+        // The barn rumour's hint circle: a ring + faint fill in metres, ring width kept at ~3 px by `ring_sync`.
+        if radius > 0.0 {
+            let mesh = meshes.add(circle::ring_mesh(radius, 3.0 * st.zoom, circle::Plane::Xy, [1.0, 0.75, 0.25], 0.1));
+            let e = commands
+                .spawn((MapRing, Mesh2d(mesh.clone()), MeshMaterial2d(mats.add(ColorMaterial { color: Color::WHITE, alpha_mode: AlphaMode2d::Blend, ..default() })), Transform::from_xyz(pos.x, pos.y, 9.4), Visibility::Inherited, render.clone()))
+                .id();
+            st.icons[i].ring = Some((e, mesh));
+        }
         st.icons[i].root = Some(root);
+    }
+}
+
+#[derive(Component)]
+struct MapRing;
+
+/// Keep each hint ring about 3 px wide (rebuild its mesh when the zoom moved by more than [`REBUILD_ZOOM`]) and follow
+/// the category filter.
+fn ring_sync(st: Res<WorldMap>, mut meshes: ResMut<Assets<Mesh>>, mut vis: Query<&mut Visibility, With<MapRing>>, mut last: Local<f32>) {
+    if !st.open {
+        return;
+    }
+    let rebuild = *last <= 0.0 || (st.zoom / *last).max(*last / st.zoom) > REBUILD_ZOOM;
+    for ic in &st.icons {
+        let Some((e, h)) = &ic.ring else { continue };
+        if let Ok(mut v) = vis.get_mut(*e) {
+            let want = if st.filters[cat_index(ic.cat)] { Visibility::Inherited } else { Visibility::Hidden };
+            if *v != want {
+                *v = want;
+            }
+        }
+        if rebuild {
+            let _ = meshes.insert(h.id(), circle::ring_mesh(ic.radius, 3.0 * st.zoom, circle::Plane::Xy, [1.0, 0.75, 0.25], 0.1));
+        }
+    }
+    if rebuild {
+        *last = st.zoom;
     }
 }
 
@@ -997,8 +1218,46 @@ fn window_size(win: &Window) -> Vec2 {
     Vec2::new(win.width(), win.height()).max(Vec2::ONE)
 }
 
+/// Farthest zoom (m per logical px). Framed: the art just covers the window inside the frame (never the clear colour
+/// beside it). Old: the whole art + 5 %.
 fn zoom_max(win: Vec2) -> f32 {
-    (ART_W / win.x).max(ART_H / win.y) * 1.05
+    if !frame_on() {
+        return (ART_W / win.x).max(ART_H / win.y) * 1.05;
+    }
+    let (top, bottom, side) = frame_px();
+    let inner = Vec2::new(win.x - 2.0 * side, win.y - top - bottom).max(Vec2::ONE);
+    (ART_W / inner.x).min(ART_H / inner.y).max(ZOOM_MIN)
+}
+
+/// A mouse position (logical px, top-left origin) on the frame bands (module doc "Frame"): no map clicks there.
+fn over_frame(m: Vec2, win: Vec2) -> bool {
+    let (top, bottom, side) = frame_px();
+    frame_on() && (m.x < side || m.x > win.x - side || m.y < top || m.y > win.y - bottom)
+}
+
+/// A mouse position pulled inside the map window (the free cursor stays on the map while the mouse is on the frame).
+fn into_map(m: Vec2, win: Vec2) -> Vec2 {
+    let (top, bottom, side) = frame_px();
+    Vec2::new(m.x.clamp(side, (win.x - side).max(side)), m.y.clamp(top, (win.y - bottom).max(top)))
+}
+
+/// Keep the view over the art. The camera centre is the window centre; framed, the window inside the frame (not
+/// centred: the header is taller than the footer) must stay on the art; old: up to 80 % of half a view past its edges.
+fn clamp_center(center: Vec2, win: Vec2, zoom: f32) -> Vec2 {
+    let (lo, hi) = (Vec2::new(ART_X0, ART_Y0), Vec2::new(ART_X0 + ART_W, ART_Y0 + ART_H));
+    let half = win * 0.5 * zoom;
+    if !frame_on() {
+        return Vec2::new(
+            if hi.x - lo.x > 2.0 * half.x { center.x.clamp(lo.x + half.x * 0.2, hi.x - half.x * 0.2) } else { (lo.x + hi.x) * 0.5 },
+            if hi.y - lo.y > 2.0 * half.y { center.y.clamp(lo.y + half.y * 0.2, hi.y - half.y * 0.2) } else { (lo.y + hi.y) * 0.5 },
+        );
+    }
+    let (top, bottom, side) = frame_px();
+    // Distances (m) from the centre to the inner window's edges: x both sides, y up to the header, down to the footer.
+    let dx = (win.x * 0.5 - side) * zoom;
+    let (up, down) = ((win.y * 0.5 - top) * zoom, (win.y * 0.5 - bottom) * zoom);
+    let fit = |c: f32, a: f32, b: f32| if a <= b { c.clamp(a, b) } else { (a + b) * 0.5 };
+    Vec2::new(fit(center.x, lo.x + dx, hi.x - dx), fit(center.y, lo.y + down, hi.y - up))
 }
 
 /// Screen (logical px, top-left origin) -> map plane.
@@ -1025,6 +1284,7 @@ fn input(
     chips: Query<(&Interaction, &Chip), Changed<Interaction>>,
     career: Query<&Interaction, (Changed<Interaction>, With<CareerButton>)>,
     race: Option<Res<crate::race::RaceState>>,
+    mut snd: MessageWriter<super::sfx::UiSfx>,
 ) {
     if !st.open {
         return;
@@ -1045,6 +1305,7 @@ fn input(
         return;
     }
     if kp(KeyCode::Escape) || kp(KeyCode::Backspace) || kp(KeyCode::Tab) || pp(GamepadButton::East) || pp(GamepadButton::Select) {
+        snd.write(super::sfx::UiSfx::play(super::sfx::keys::CANCEL));
         request_close(Leave::Back);
         return;
     }
@@ -1107,9 +1368,11 @@ fn input(
         }
     }
     let mut primary = kp(KeyCode::Enter) || kp(KeyCode::Space) || pp(GamepadButton::South);
-    let secondary = kp(KeyCode::KeyF) || pp(GamepadButton::West) || mouse_buttons.just_pressed(MouseButton::Right);
+    // Clicks on the frame bands (title, chips, controls, sides) never reach the map.
+    let on_frame = mouse.is_some_and(|m| over_frame(m, size));
+    let secondary = kp(KeyCode::KeyF) || pp(GamepadButton::West) || (mouse_buttons.just_pressed(MouseButton::Right) && !on_frame);
     if let Some(m) = mouse {
-        if mouse_buttons.just_pressed(MouseButton::Left) {
+        if mouse_buttons.just_pressed(MouseButton::Left) && !on_frame {
             st.drag = Some((m, false));
         }
         if let (Some((start, moved)), Some(last)) = (st.drag, st.mouse) {
@@ -1184,16 +1447,13 @@ fn input(
     }
     // Zoom eases to its target (pad / keys); the wheel set both.
     let k = 1.0 - (-14.0 * dt).exp();
+    // A smaller window (or the frame) can lower the limit under the current zoom.
+    st.zoom_to = st.zoom_to.clamp(ZOOM_MIN, zmax);
     st.zoom = st.zoom + (st.zoom_to - st.zoom) * k;
     // Keep the view over the art.
-    let half = size * 0.5 * st.zoom;
-    let (lo, hi) = (Vec2::new(ART_X0, ART_Y0), Vec2::new(ART_X0 + ART_W, ART_Y0 + ART_H));
-    st.center = Vec2::new(
-        if hi.x - lo.x > 2.0 * half.x { st.center.x.clamp(lo.x + half.x * 0.2, hi.x - half.x * 0.2) } else { (lo.x + hi.x) * 0.5 },
-        if hi.y - lo.y > 2.0 * half.y { st.center.y.clamp(lo.y + half.y * 0.2, hi.y - half.y * 0.2) } else { (lo.y + hi.y) * 0.5 },
-    );
+    st.center = clamp_center(st.center, size, st.zoom);
     st.cursor = match (st.pad_mode, mouse) {
-        (false, Some(m)) => to_plane(&st, size, m),
+        (false, Some(m)) => to_plane(&st, size, into_map(m, size)),
         _ => st.center,
     };
     // Hover: the nearest shown icon under the cursor (wider for the pad), else the waypoint, else the point.
@@ -1225,6 +1485,11 @@ fn input(
         (a, b) => a != Some(b),
     };
     if changed {
+        if let Hover::Icon(i) = hover {
+            // INFERRED (ui_audio.md 4.2 rows 12/13): event icons also raise the event pop-up cue; others only snap.
+            let key = if matches!(st.icons[i].action, Action::Start(_)) { super::sfx::keys::MAP_EVENT_POPUP } else { super::sfx::keys::MAP_SNAP };
+            snd.write(super::sfx::UiSfx::play(key));
+        }
         st.panel_dirty = true;
         st.rest = 0.0;
     } else {
@@ -1258,15 +1523,21 @@ fn input(
                 let ic = &st.icons[i];
                 if wp.source.as_deref() == Some(ic.key.as_str()) {
                     wp.clear();
+                    snd.write(super::sfx::UiSfx::play(super::sfx::keys::MAP_ROUTE_REMOVE));
                 } else {
                     wp.set(ic.pos, ic.name.clone(), Some(ic.key.clone()));
+                    snd.write(super::sfx::UiSfx::play(super::sfx::keys::MAP_ROUTE_ADD));
                 }
             }
-            Hover::Waypoint => wp.clear(),
+            Hover::Waypoint => {
+                wp.clear();
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::MAP_ROUTE_REMOVE));
+            }
             Hover::Point(p) => {
                 // Snap to the nearest road (as FH's waypoints do): an off-road point could never be "reached".
                 let at = graph.as_ref().and_then(|g| g.graph.nearest(p.into()).map(|n| Vec2::from(g.graph.pos[n as usize]))).unwrap_or(p);
                 wp.set(at, "Map location", None);
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::MAP_ROUTE_ADD));
             }
         }
         st.panel_dirty = true;
@@ -1281,6 +1552,9 @@ fn input(
                 Action::Start(id) => Some(Pending::Start(id)),
                 Action::None => None,
             };
+            if st.pending.is_some() {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::ACCEPT));
+            }
         }
     }
 }

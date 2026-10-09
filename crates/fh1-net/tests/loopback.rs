@@ -3,7 +3,7 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use fh1_net::{encode, Client, Config, Event, InfoQuery, PlayerInfo, Relay, RejectReason, Snapshot};
+use fh1_net::{encode, Client, Config, Event, InfoQuery, PlayerInfo, Relay, RejectReason, Snapshot, KIT_SLOTS, KIT_STOCK};
 
 fn snap() -> Snapshot {
     Snapshot {
@@ -21,11 +21,12 @@ fn snap() -> Snapshot {
         rotation: [0.0, 0.0, 0.0, 1.0],
         velocity: [10.0, 0.0, 0.0],
         angular: [0.0; 3],
+        ext: None,
     }
 }
 
 fn me(car: &str) -> PlayerInfo {
-    PlayerInfo { id: 0, name: String::new(), car: car.into(), paint_seq: 2, paint_rgb: 0, paint_flags: 0 }
+    PlayerInfo { id: 0, name: String::new(), car: car.into(), paint_seq: 2, paint_rgb: 0, paint_flags: 0, rim: String::new(), kit: [KIT_STOCK; KIT_SLOTS], look_flags: 0 }
 }
 
 fn pump(sock: &UdpSocket, relay: &mut Relay, started: Instant) {

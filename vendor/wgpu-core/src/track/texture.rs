@@ -283,6 +283,15 @@ impl TextureUsageScope {
         self.metadata.clear();
     }
 
+    /// FH1 patch (P16-A): see `ResourceMetadata::clear_sparse` / `BufferUsageScope::clear_sparse`.
+    pub fn clear_sparse(&mut self) {
+        for index in self.metadata.owned_indices() {
+            unsafe { *self.set.simple.get_unchecked_mut(index) = TextureUses::UNINITIALIZED };
+        }
+        self.set.complex.clear();
+        self.metadata.clear_sparse();
+    }
+
     /// Sets the size of all the vectors inside the tracker.
     ///
     /// Must be called with the highest possible Texture ID before
@@ -662,6 +671,9 @@ impl TextureTracker {
             };
 
             unsafe { scope.metadata.remove(index) };
+            // FH1 patch (P16-A): keep removed slots at the default (UsageScope::drop resets sparsely).
+            unsafe { *scope.set.simple.get_unchecked_mut(index) = TextureUses::UNINITIALIZED };
+            scope.set.complex.remove(&index);
         }
     }
 }

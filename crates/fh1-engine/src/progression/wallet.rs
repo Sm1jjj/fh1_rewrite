@@ -82,7 +82,7 @@ pub fn can_afford(p: &Profile, n: i64) -> bool {
 }
 
 /// Change the balance by `delta` without saving (callers that change more, e.g. race results, commit once).
-pub(super) fn apply(p: &mut Profile, delta: i64, reason: &str) {
+pub(crate) fn apply(p: &mut Profile, delta: i64, reason: &str) {
     if delta == 0 {
         return;
     }

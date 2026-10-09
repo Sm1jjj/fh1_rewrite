@@ -17,8 +17,12 @@
 //!
 //! `<id>` is derived from the SHA-256 of `default.xex`, so one edition maps to one install.
 //! A group is rebuilt only when its pipeline hash changes (or with `--force`).
+#![recursion_limit = "256"]
 
 mod anim;
+mod story;
+mod missions;
+mod airborne_objects;
 mod audio;
 mod camera;
 mod ailines;
@@ -34,6 +38,7 @@ mod crowd;
 mod cars;
 mod dynamicpost;
 mod extract;
+mod fmv;
 #[cfg(feature = "fh2")]
 mod fh2;
 #[cfg(feature = "fm4")]
@@ -57,7 +62,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 /// Asset groups and their pipeline versions. Bump a version when its output changes.
-pub const GROUPS: &[(&str, &str)] = &[("cars", "cars-18"), ("world", "world-3"), ("scenery", "scenery-33"), ("shaders", "shaders-2"), ("tracks", "tracks-3"), ("dynamicpost", "dynamicpost-2"), ("audio", "audio-2"), ("radio", "radio-3"), ("ui", "ui-4"), ("grass", "grass-1"), ("crowd", "crowd-2"), ("anim", "anim-1"), ("sky", "sky-1"), ("camera", "camera-1"), ("effects", "effects-1"), ("events", "events-6"), ("ailines", "ailines-1"), ("traffic", "traffic-1"), ("upgrades", "upgrades-3"), ("variants", "variants-2"), ("remaster", "remaster-5")];
+pub const GROUPS: &[(&str, &str)] = &[("cars", "cars-18"), ("world", "world-3"), ("scenery", "scenery-33"), ("shaders", "shaders-2"), ("tracks", "tracks-3"), ("dynamicpost", "dynamicpost-2"), ("audio", "audio-3"), ("radio", "radio-3"), ("ui", "ui-5"), ("grass", "grass-1"), ("crowd", "crowd-2"), ("anim", "anim-2"), ("sky", "sky-1"), ("camera", "camera-1"), ("effects", "effects-1"), ("events", "events-8"), ("ailines", "ailines-2"), ("traffic", "traffic-1"), ("upgrades", "upgrades-3"), ("variants", "variants-2"), ("remaster", "remaster-5"), ("fmv", "fmv-1"), ("story", "story-1"), ("missions", "missions-2")];
 
 struct Args {
     source: PathBuf,

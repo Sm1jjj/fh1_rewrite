@@ -100,6 +100,15 @@ impl BufferUsageScope {
         self.metadata.clear();
     }
 
+    /// FH1 patch (P16-A): see `ResourceMetadata::clear_sparse`. Owned slots go back to the default `set_size` fills
+    /// with, and removed slots were reset at removal, so every slot reads as after `clear()` + `set_size`.
+    pub fn clear_sparse(&mut self) {
+        for index in self.metadata.owned_indices() {
+            unsafe { *self.state.get_unchecked_mut(index) = BufferUses::empty() };
+        }
+        self.metadata.clear_sparse();
+    }
+
     /// Sets the size of all the vectors inside the tracker.
     ///
     /// Must be called with the highest possible Buffer ID before
@@ -504,6 +513,8 @@ impl BufferTracker {
             };
 
             unsafe { scope.metadata.remove(index) };
+            // FH1 patch (P16-A): keep removed slots at the default (UsageScope::drop resets sparsely).
+            unsafe { *scope.state.get_unchecked_mut(index) = BufferUses::empty() };
         }
     }
 

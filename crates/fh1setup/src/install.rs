@@ -62,6 +62,14 @@ pub fn run(disc: &Path, data: &Path, force: bool, only: Option<&[String]>) -> Re
             std::fs::remove_dir_all(&stage)?;
         }
         std::fs::create_dir_all(&stage)?;
+        // The audio group skips WAVs that already exist: seed the stage with the installed WAVs (hard links, copy
+        // fallback) so a version bump decodes only the new banks. Only *.wav: the JSON is rewritten through fs::write,
+        // which would write through a hard link into the installed group.
+        if group == "audio" && out.join("banks").is_dir() {
+            if let Err(e) = seed_wavs(&out.join("banks"), &stage.join("banks")) {
+                println!("[audio] could not reuse decoded banks ({e:#}); decoding everything");
+            }
+        }
         println!("[{group}] building ({version})");
         match group {
             "cars" => cars::build(disc, &stage)?,
@@ -85,6 +93,9 @@ pub fn run(disc: &Path, data: &Path, force: bool, only: Option<&[String]>) -> Re
             "radio" => fh1_radio::install::build(disc, &stage)?,
             "ui" => fh1_ui::install::build(disc, &stage)?,
             "audio" => crate::audio::build(disc, &stage)?,
+            "fmv" => crate::fmv::build(disc, &stage)?,
+            "story" => crate::story::build(disc, &stage)?,
+            "missions" => crate::missions::build(disc, &stage)?,
             _ => unreachable!(),
         }
         // Move the old group aside before deleting it: a running engine can hold files open, and
@@ -109,5 +120,22 @@ pub fn run(disc: &Path, data: &Path, force: bool, only: Option<&[String]>) -> Re
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&inst)?)?;
     println!("[progress] {0}/{0} done", selected.len());
     println!("installation {id} ready in {}", private.display());
+    Ok(())
+}
+
+/// Mirrors the `.wav` files under `from` into `to` with hard links (copies when linking fails, e.g. across volumes).
+fn seed_wavs(from: &Path, to: &Path) -> Result<()> {
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if e.file_type()?.is_dir() {
+            seed_wavs(&src, &dst)?;
+        } else if src.extension().is_some_and(|x| x.eq_ignore_ascii_case("wav")) {
+            std::fs::create_dir_all(to)?;
+            if std::fs::hard_link(&src, &dst).is_err() {
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+    }
     Ok(())
 }

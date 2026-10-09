@@ -999,15 +999,38 @@ impl StockKit {
     }
 }
 
+/// The kit letter of a stem's race section (`<stem>race`) and of the roll cage (`cagerace`): ui/customize.rs sends it for
+/// Level 3 kit rows / the race weight reduction (same letter as fh1-remaster car.rs `RACE`).
+pub const RACE_LETTER: char = '#';
+
+/// Kit section stems (`<stem><letter>[_tail]`, `<stem>race[_tail]`).
+const KIT_STEMS: [&str; 10] = ["bumperf", "bumperr", "hood", "wing", "skirtl", "skirtr", "exhaustl", "exhaustr", "exhaust", "undercarriage"];
+
+/// FH1 P17 (`FH1_KIT_RACE=0` = old: race sections and the cage never drawn, so a race bumper / wing / hood left a hole).
+fn kit_race_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_KIT_RACE").map_or(true, |v| v != "0"))
+}
+
+/// The stem of a race section name (`bumperfrace`, `wingrace_tail`, `cagerace`), if it is one.
+fn race_stem(n: &str) -> Option<&'static str> {
+    KIT_STEMS.iter().copied().chain(std::iter::once("cage")).find(|stem| n.strip_prefix(stem).is_some_and(|rest| rest == "race" || rest.starts_with("race_")))
+}
+
 /// Stock parts only: drop body-kit letters other than the stock one ([`StockKit`], `a` on all but one car), race
-/// parts, lexan windows and cages (same rule as fh1setup's glTF export, model.rs `is_stock`).
+/// parts, lexan windows and cages (same rule as fh1setup's glTF export, model.rs `is_stock`). A kit whose stem letter is
+/// [`RACE_LETTER`] keeps that stem's race section instead (and `cage` = RACE keeps `cagerace`).
 pub fn is_stock(name: &str, kit: &StockKit) -> bool {
     let n = name.to_ascii_lowercase();
+    if kit_race_on() {
+        if let Some(stem) = race_stem(&n) {
+            return kit.letter(stem) == RACE_LETTER;
+        }
+    }
     if n.starts_with("lexan") || n.starts_with("cage") || n.ends_with("race") {
         return false;
     }
-    const STEMS: [&str; 10] = ["bumperf", "bumperr", "hood", "wing", "skirtl", "skirtr", "exhaustl", "exhaustr", "exhaust", "undercarriage"];
-    for stem in STEMS {
+    for stem in KIT_STEMS {
         if let Some(rest) = n.strip_prefix(stem) {
             let mut ch = rest.chars();
             if let Some(letter) = ch.next().filter(|c| c.is_ascii_lowercase()) {

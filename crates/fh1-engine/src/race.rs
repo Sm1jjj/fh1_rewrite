@@ -16,6 +16,9 @@ use bevy::prelude::*;
 use crate::Car;
 
 mod ai_link;
+pub mod airborne;
+pub mod airborne_link;
+pub mod states;
 pub mod field;
 pub mod anark_hud;
 mod hud;
@@ -103,6 +106,7 @@ pub struct Events {
     pub barrier_templates: std::collections::HashSet<u16>,
     /// Career tables (wristbands, hubs, classes, drivers, cars, popularity ladder).
     pub career: crate::progression::data::CareerData,
+    pub assets: std::path::PathBuf,
 }
 
 impl Events {
@@ -212,7 +216,7 @@ impl Events {
             .collect();
         let career = crate::progression::data::CareerData::from_json(&j["progression"], assets);
         info!("race: {} events installed (career tables: {})", races.len(), if career.installed { "events-2" } else { "built-in" });
-        Self { races, scoring, object_bounds, barrier_templates, career }
+        Self { races, scoring, object_bounds, barrier_templates, career, assets: assets.to_path_buf() }
     }
 }
 
@@ -453,7 +457,7 @@ fn start_race(
     // The AI field (race/field.rs): the game's entrants, matched to the player's class / wristband / rank.
     let player_car = cars.iter().next().map(|c| c.0.data.media_name.clone()).unwrap_or_default();
     let (tier, rank) = profile.map_or((0, 250), |p| (events.career.tier(p.xp), events.career.rank(p.fame)));
-    let ctx = field::FieldCtx { career: &events.career, player_car: &player_car, tier, rank, difficulty: ai.difficulty() };
+    let ctx = field::FieldCtx { career: &events.career, player_car: &player_car, tier, rank, difficulty: ai.difficulty(), assets: Some(events.assets.as_path()) };
     let want = (def.drivers as usize).min(def.grid.len().saturating_sub(1));
     let (entries, note) = field::build(def, &ctx, want);
     // Grid: the player starts last (CareerRaceModes GridOrderingType PIWithPlayerLast); solo = pole.
@@ -557,8 +561,14 @@ fn start_race(
 fn end_race(events: &Events, rs: &mut RaceState, cars: &mut Query<&mut Car>, track: &crate::track::Track, commands: &mut Commands, ai: &mut ai_link::AiLink, to_post: bool) {
     if let Some(def) = rs.race.and_then(|i| events.races.get(i)) {
         if let (true, Some((p, yaw))) = (to_post, def.post_race) {
+            // The original leaves you where you finished; only a car that is off the world (no ground below) goes to post_race.
+            let legacy = std::env::var("FH1_RACE_POST_TELEPORT").is_ok_and(|v| v == "1");
             for mut car in cars.iter_mut() {
-                car.0.place(ground(track, p), yaw);
+                let at = car.0.position;
+                let on_ground = track.ground.ray(at + Vec3::Y * 10.0, Vec3::NEG_Y, 60.0).is_some();
+                if legacy || !on_ground || !at.is_finite() {
+                    car.0.place(ground(track, p), yaw);
+                }
             }
         }
     }
@@ -679,6 +689,10 @@ pub fn race_update(
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| Vec2::new(r.marker.0.x - pos.x, r.marker.0.z - pos.z).length() < MARKER_RADIUS && (r.marker.0.y - pos.y).abs() < 15.0)
+                .filter(|(i, r)| {
+                    !states::filter_on()
+                        || states::marker_visible(locked(*i).is_none(), prof.is_some_and(|p| p.events.get(&r.horizon_id).is_some_and(|e| e.best_place > 0)))
+                })
                 .min_by(|a, b| a.1.marker.0.distance(pos).total_cmp(&b.1.marker.0.distance(pos)))
                 .map(|(i, _)| i)
                 .filter(|_| vel.length() < MARKER_MAX_SPEED);
@@ -873,16 +887,23 @@ pub fn race_update(
 }
 
 /// Event objects: show those within `OBJECT_DRAW` of the player (checked a few times a second).
-pub fn race_objects(mut rs: ResMut<RaceState>, cars: Query<&Car>, mut tick: Local<f32>, time: Res<Time>, mut commands: Commands, props: Option<ResMut<crate::smash::PropCollision>>) {
+pub fn race_objects(mut rs: ResMut<RaceState>, events: Res<Events>, cars: Query<&Car>, mut tick: Local<f32>, time: Res<Time>, mut commands: Commands, props: Option<ResMut<crate::smash::PropCollision>>) {
     // Colliders: added once the prop colliders are loaded; removed after the race (end_race leaves the ids).
     if let Some(mut props) = props {
         if !rs.collision_stale.is_empty() {
             let ids = std::mem::take(&mut rs.collision_stale);
             props.remove(&ids);
         }
+        if props.ready() && props.edge_suppress_race() != rs.race {
+            match rs.race {
+                Some(i) => props.set_edge_suppress(Some(i), &events.races[i].path),
+                None => props.set_edge_suppress(None, &[]),
+            }
+        }
         if rs.race.is_some() && !rs.collision_pending.is_empty() && props.ready() {
             let objs = std::mem::take(&mut rs.collision_pending);
-            let ids = props.add_solid_boxes(&objs);
+            let keep_clear: Vec<Vec3> = cars.iter().map(|c| c.0.position).chain(events.races[rs.race.unwrap_or(0)].grid.iter().map(|g| g.0)).collect();
+            let ids = props.add_solid_boxes(&objs, &keep_clear);
             info!("race: {} event-object colliders", ids.len());
             rs.collision_ids.extend(ids);
         }
@@ -932,6 +953,9 @@ pub fn race_markers(
                 }
                 // Career state (progression.rs): locked = grey, done = dim, the recommended next event = its wristband colour.
                 let info = cat.as_ref().and_then(|c| c.events.get(i).filter(|e| e.race == i));
+                if !states::state_visible(info.map(|e| e.state)) {
+                    continue;
+                }
                 let col = if Some(i) == rs.prompt {
                     Color::srgb(1.0, 0.85, 0.1)
                 } else if info.is_some_and(|e| e.state == crate::progression::EventState::Locked) {

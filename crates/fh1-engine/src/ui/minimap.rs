@@ -53,6 +53,8 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dPlugin};
 use std::sync::Arc;
 
 use super::scene::{UiCamera, UiData};
+use super::worldmap::circle;
+use super::worldmap::state::{self, Badge, IconState};
 use crate::Car;
 
 /// Render layer of the minimap's own world (roads, arrow).
@@ -218,7 +220,80 @@ struct MinimapTarget;
 struct MapPoi {
     pos: Vec3,
     mat: Handle<ColorMaterial>,
+    /// `map/pois.tsv` tag ("" for mission icons) and whether `missions::map` hides it (undiscovered barn find).
+    tag: String,
+    hidden: bool,
+    /// Alpha factor of the icon's state style (Done 0.6, Locked 0.45, else 1); `pois` multiplies the distance fade by it.
+    alpha: f32,
+    /// A catalog event icon (`event_pois`) stands in for this `pois.tsv` event icon.
+    covered: bool,
 }
+
+/// A race event icon from `progression::EventCatalog` (done / locked styled), respawned when the catalog changes.
+#[derive(Component)]
+struct EventPoi;
+
+/// Badge textures (tick, padlock), the unit quad and one material per badge colour, made on first use.
+#[derive(Resource, Default)]
+struct MinimapBadges {
+    tex: [Option<Handle<Image>>; 2],
+    unit: Option<Handle<Mesh>>,
+    mats: std::collections::HashMap<Badge, Handle<ColorMaterial>>,
+}
+
+impl MinimapBadges {
+    fn get(&mut self, b: Badge, images: &mut Assets<Image>, meshes: &mut Assets<Mesh>, mats: &mut Assets<ColorMaterial>) -> (Handle<Mesh>, Handle<ColorMaterial>) {
+        let slot = usize::from(b == Badge::Lock);
+        let tex = self.tex[slot].get_or_insert_with(|| images.add(circle::badge_image(b))).clone();
+        let unit = self.unit.get_or_insert_with(|| meshes.add(circle::unit_quad())).clone();
+        let mat = self
+            .mats
+            .entry(b)
+            .or_insert_with(|| {
+                // Gamma-space bytes straight into the target, like `raw` in `spawn`.
+                let [r, g, bl] = state::badge_rgb(b);
+                mats.add(ColorMaterial { color: Color::linear_rgb(r, g, bl), texture: Some(tex), alpha_mode: AlphaMode2d::Blend, ..default() })
+            })
+            .clone();
+        (unit, mat)
+    }
+}
+
+/// One styled icon: the billboard (tinted / dimmed by `state`) with its badge as a child. `base` = RGBA as gamma values
+/// (the target holds gamma-space colour). Returns the icon entity.
+#[allow(clippy::too_many_arguments)]
+fn spawn_styled(
+    commands: &mut Commands,
+    layer: &RenderLayers,
+    sheet: &Handle<Image>,
+    (meshes, mats, images): (&mut Assets<Mesh>, &mut Assets<ColorMaterial>, &mut Assets<Image>),
+    badges: &mut MinimapBadges,
+    cell: (u32, u32),
+    dsize: f32,
+    base: [f32; 4],
+    at: Vec2,
+    (ist, medal): (IconState, Option<u8>),
+    tag: &str,
+) -> Entity {
+    let styled = state::enabled();
+    let st = if styled { ist } else { IconState::Available };
+    let c = state::style_rgba(base, st);
+    let size = dsize * ARROW_PX / 45.0 * M_PER_PX;
+    let mat = mats.add(ColorMaterial { color: Color::linear_rgba(c[0], c[1], c[2], c[3]), texture: Some(sheet.clone()), alpha_mode: AlphaMode2d::Blend, ..default() });
+    let pos = Vec3::new(at.x, size * 0.5 + 1.0, at.y + order_z(200.0));
+    let e = commands
+        .spawn((Mesh2d(meshes.add(billboard_quad(cell, size))), MeshMaterial2d(mat.clone()), Transform::from_translation(pos), layer.clone(), MapPoi { pos, mat, tag: tag.into(), hidden: false, alpha: c[3], covered: false }))
+        .id();
+    if let (true, Some(b)) = (styled, state::badge_of(ist, medal)) {
+        let (unit, bmat) = badges.get(b, images, meshes, mats);
+        commands.spawn((Mesh2d(unit), MeshMaterial2d(bmat), Transform::from_xyz(size * 0.34, -size * 0.34, 0.05).with_scale(Vec3::splat(size * 0.5)), layer.clone(), ChildOf(e)));
+    }
+    e
+}
+
+/// A free-roam mission icon (`missions::map::MissionMapIcons`), respawned when its generation changes.
+#[derive(Component)]
+struct MissionPoi;
 
 /// The 2D draw order of a minimap layer: the profile's sort order as a sub-millimetre shift along z (z is a ground
 /// axis of the map plane; the 2D phase draws back to front by z).
@@ -285,13 +360,21 @@ impl Plugin for MinimapPlugin {
         embedded_asset!(app, "minimap_road.wgsl");
         app.add_plugins(Material2dPlugin::<RoadFogMaterial>::default());
         app.init_resource::<HeadingSpring>()
+            .init_resource::<MinimapBadges>()
             .init_resource::<MapPace>()
             .insert_resource(SatNav { target, distance_m: None, path: Vec::new() })
             // Colorado's road network: the map, satnav and icons run on Colorado only (X1d; other maps have no nav data
             // yet, and the HUD hides the disc there). The map camera is switched off elsewhere.
             .add_systems(
                 Update,
-                (follow.after(crate::sync_visuals), route.run_if(resource_exists::<RouteData>), pois.after(follow), pace.after(pois).after(route))
+                (
+                    follow.after(crate::sync_visuals),
+                    route.run_if(resource_exists::<RouteData>),
+                    mission_pois.run_if(resource_exists::<MinimapImage>),
+                    event_pois.run_if(resource_exists::<MinimapImage>),
+                    pois.after(follow).after(mission_pois).after(event_pois),
+                    pace.after(pois).after(route),
+                )
                     .run_if(on_colorado),
             )
             .add_systems(Update, park_camera.run_if(not(on_colorado)))
@@ -425,7 +508,7 @@ pub fn spawn(
         let mat = mats.add(blend(Color::WHITE, Some(sheet.clone())));
         // Icons draw over the roads and the route (profile sort orders 200+).
         let pos = Vec3::new(at.x, size * 0.5 + 1.0, at.z + order_z(200.0));
-        commands.spawn((Mesh2d(meshes.add(billboard_quad(cell, size))), MeshMaterial2d(mat.clone()), Transform::from_translation(pos), layer.clone(), MapPoi { pos, mat }));
+        commands.spawn((Mesh2d(meshes.add(billboard_quad(cell, size))), MeshMaterial2d(mat.clone()), Transform::from_translation(pos), layer.clone(), MapPoi { pos, mat, tag: tag.clone(), hidden: false, alpha: 1.0, covered: false }));
         shown += 1;
     }
     info!("minimap: {shown} of {} map POIs", poi_list.len());
@@ -546,6 +629,109 @@ fn route(
     pace.dirty = true;
 }
 
+/// Free-roam mission icons (`missions::map`): when the icon set changes, re-evaluate which `pois.tsv` icons it hides and
+/// respawn the mission icons (outposts, speed traps, barn rumours / finds, the activity target).
+#[allow(clippy::too_many_arguments)]
+fn mission_pois(
+    mut commands: Commands,
+    mission_icons: Option<Res<crate::missions::map::MissionMapIcons>>,
+    mut seen: Local<Option<u32>>,
+    data: Res<UiData>,
+    assets: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut mats: ResMut<Assets<ColorMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut badges: ResMut<MinimapBadges>,
+    mut pace: ResMut<MapPace>,
+    old: Query<Entity, With<MissionPoi>>,
+    mut statics: Query<&mut MapPoi, Without<MissionPoi>>,
+) {
+    use crate::missions::map::IconKind;
+    let Some(mi) = mission_icons else { return };
+    if *seen == Some(mi.generation) {
+        return;
+    }
+    *seen = Some(mi.generation);
+    pace.dirty = true;
+    for mut p in &mut statics {
+        p.hidden = mi.hides(&p.tag, p.pos);
+    }
+    for e in &old {
+        commands.entity(e).despawn();
+    }
+    let sheet: Handle<Image> = assets
+        .load_builder()
+        .with_settings(|s: &mut bevy::image::ImageLoaderSettings| s.is_srgb = false)
+        .load(format!("ui/textures/horizon/map/icons/mapicons/{}/mapiconsheetsmall.png", data.lang.to_ascii_lowercase()));
+    let layer = RenderLayers::layer(MAP_LAYER);
+    let green = [74.0 / 255.0, 238.0 / 255.0, 97.0 / 255.0, 1.0];
+    for m in mi.all() {
+        // (cell, DynamicSize, tint)
+        let (cell, dsize, tint) = match m.kind {
+            IconKind::Outpost => ((1, 2), 45.0, [1.0; 4]),
+            IconKind::SpeedCamera | IconKind::AverageSpeed => ((1, 3), 45.0, [1.0; 4]),
+            IconKind::BarnHint | IconKind::BarnFound => ((0, 4), 45.0, [1.0; 4]),
+            IconKind::Target => ((2, 4), 55.0, green),
+            IconKind::Encounter => continue,
+        };
+        let e = spawn_styled(&mut commands, &layer, &sheet, (&mut meshes, &mut mats, &mut images), &mut badges, cell, dsize, tint, m.pos, (m.state, m.medal), "");
+        commands.entity(e).insert(MissionPoi);
+        // The barn rumour's hint circle: a flat ring + faint fill on the map plane (the tilted camera foreshortens it).
+        if m.radius > 0.0 && state::enabled() {
+            let mesh = meshes.add(circle::ring_mesh(m.radius, 3.0, circle::Plane::Xz, [1.0, 0.75, 0.25], 0.08));
+            let cmat = mats.add(ColorMaterial { color: Color::WHITE, alpha_mode: AlphaMode2d::Blend, ..default() });
+            commands.spawn((Mesh2d(mesh), MeshMaterial2d(cmat), Transform::from_xyz(m.pos.x, 0.6, m.pos.y + order_z(150.0)), layer.clone(), MissionPoi));
+        }
+    }
+}
+
+/// Race events (`progression::EventCatalog`) with their done / locked style. Rebuilt when the catalog changes (it bumps on
+/// every profile change). The `pois.tsv` event icons within 40 m of a catalog event are covered by it. `FH1_MAP_STATES=0`
+/// leaves the old `pois.tsv` icons alone.
+#[allow(clippy::too_many_arguments)]
+fn event_pois(
+    mut commands: Commands,
+    catalog: Option<Res<crate::progression::EventCatalog>>,
+    mut seen: Local<Option<u32>>,
+    assets: Res<AssetServer>,
+    data: Res<UiData>,
+    (mut meshes, mut mats, mut images): (ResMut<Assets<Mesh>>, ResMut<Assets<ColorMaterial>>, ResMut<Assets<Image>>),
+    mut badges: ResMut<MinimapBadges>,
+    mut pace: ResMut<MapPace>,
+    old: Query<Entity, With<EventPoi>>,
+    mut statics: Query<&mut MapPoi, Without<EventPoi>>,
+) {
+    use crate::progression::EventKind;
+    let Some(cat) = catalog else { return };
+    if !state::enabled() || cat.events.is_empty() || *seen == Some(cat.generation) {
+        return;
+    }
+    *seen = Some(cat.generation);
+    pace.dirty = true;
+    for e in &old {
+        commands.entity(e).despawn();
+    }
+    for mut p in &mut statics {
+        p.covered = matches!(p.tag.as_str(), "race" | "exhibition" | "nemesisrace" | "streetrace")
+            && cat.events.iter().any(|e| Vec2::new(e.pos.x, e.pos.z).distance(Vec2::new(p.pos.x, p.pos.z)) < 40.0);
+    }
+    let sheet: Handle<Image> = assets
+        .load_builder()
+        .with_settings(|s: &mut bevy::image::ImageLoaderSettings| s.is_srgb = false)
+        .load(format!("ui/textures/horizon/map/icons/mapicons/{}/mapiconsheetsmall.png", data.lang.to_ascii_lowercase()));
+    let layer = RenderLayers::layer(MAP_LAYER);
+    for ev in &cat.events {
+        let (cell, dsize) = match ev.kind {
+            EventKind::Street => ((2, 1), 45.0),
+            EventKind::Showcase => ((0, 1), 45.0),
+            EventKind::Nemesis => ((4, 1), 55.0),
+            _ => ((1, 0), 45.0),
+        };
+        let e = spawn_styled(&mut commands, &layer, &sheet, (&mut meshes, &mut mats, &mut images), &mut badges, cell, dsize, [1.0; 4], Vec2::new(ev.pos.x, ev.pos.z), state::info_state(ev), "");
+        commands.entity(e).insert(EventPoi);
+    }
+}
+
 /// Icons face the map camera and fade over [`POI_FADE`] from the car.
 #[allow(clippy::type_complexity)]
 fn pois(
@@ -578,6 +764,7 @@ fn pois(
     for (poi, mut t, mut vis) in &mut icons {
         let d = here.distance(Vec2::new(poi.pos.x, poi.pos.z));
         let a = ((POI_FADE.1 - d) / (POI_FADE.1 - POI_FADE.0)).clamp(0.0, 1.0);
+        let a = if poi.hidden || poi.covered { 0.0 } else { a * poi.alpha };
         let want = if a > 0.0 { Visibility::Inherited } else { Visibility::Hidden };
         if *vis != want {
             *vis = want;

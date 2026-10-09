@@ -107,6 +107,8 @@ struct SkidMarks {
     /// Next quad to write (ring over CHUNKS x SEGS_PER_CHUNK).
     cursor: usize,
     last: [Option<Edge>; 4],
+    /// Other players' cars (net.rs `RemoteCar`): the same per wheel, per car.
+    remote_last: std::collections::HashMap<Entity, [Option<Edge>; 4]>,
     styles: Vec<Option<SkidStyle>>,
     styles_for: String,
     gain: f32,
@@ -157,7 +159,7 @@ fn setup_skidmarks(mut commands: Commands, garage: Res<Garage>, mut meshes: ResM
         chunks.push(Chunk { mesh: handle, entity: e.id(), written: 0, positions, uvs, colors, dirty: false });
     }
     let gain = std::env::var("FH1_SKID_GAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
-    commands.insert_resource(SkidMarks { chunks, cursor: 0, last: [None; 4], styles: Vec::new(), styles_for: String::new(), gain });
+    commands.insert_resource(SkidMarks { chunks, cursor: 0, last: [None; 4], remote_last: Default::default(), styles: Vec::new(), styles_for: String::new(), gain });
 }
 
 /// treadmark.xds (copied by fh1setup's tracks group), else a stand-in with the same four column profiles.
@@ -216,21 +218,44 @@ fn surface_style(track: &Track, id: u8) -> Option<SkidStyle> {
     })
 }
 
-fn lay_skidmarks(mut commands: Commands, mut marks: ResMut<SkidMarks>, track: Res<Track>, cars: Query<&Car>, mut meshes: ResMut<Assets<Mesh>>) {
+fn lay_skidmarks(
+    mut commands: Commands,
+    mut marks: ResMut<SkidMarks>,
+    track: Res<Track>,
+    cars: Query<&Car>,
+    remotes: Query<(Entity, &crate::net::RemoteCar)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     let marks = &mut *marks;
     if marks.styles_for != track.id {
         marks.styles = (0..=255u8).map(|id| surface_style(&track, id)).collect();
         marks.styles_for = track.id.clone();
         marks.last = [None; 4];
+        marks.remote_last.clear();
     }
-    let Ok(car) = cars.single() else { return };
-    let v = &car.0;
+    if let Ok(car) = cars.single() {
+        let mut last = marks.last;
+        lay_car(marks, &mut last, &car.0);
+        marks.last = last;
+    }
+    // Other players' cars (net.rs fills their wheels; FH1_NET_FX=0 = none): gone cars drop their trail state.
+    marks.remote_last.retain(|e, _| remotes.contains(*e));
+    for (e, r) in &remotes {
+        let mut last = marks.remote_last.get(&e).copied().unwrap_or([None; 4]);
+        lay_car(marks, &mut last, &r.vehicle);
+        marks.remote_last.insert(e, last);
+    }
+    upload(&mut commands, marks, &mut meshes);
+}
+
+/// One car's four tyre trails (`last` = each wheel's previous edge).
+fn lay_car(marks: &mut SkidMarks, last_edges: &mut [Option<Edge>; 4], v: &fh1_engine::vehicle::Vehicle) {
     let speed = v.speed();
     for i in 0..4 {
         let w = &v.wheels[i];
         let style = if w.grounded { marks.styles[w.surface as usize] } else { None };
         let Some(style) = style.filter(|s| s.alpha > 0.0 && speed > 0.5) else {
-            marks.last[i] = None;
+            last_edges[i] = None;
             continue;
         };
         let rho = (w.norm_slip * w.norm_slip + w.norm_slip_angle * w.norm_slip_angle).sqrt();
@@ -243,15 +268,15 @@ fn lay_skidmarks(mut commands: Commands, mut marks: ResMut<SkidMarks>, track: Re
         let centre = hub - normal * v.data.tyre_radius[axle] + normal * LIFT;
         // Columns 0..1 = TextureIndex; the right-hand wheels use the second set (2..3) for variety (INFERRED pairing).
         let column = (style.column.min(1) + if i % 2 == 1 { 2 } else { 0 }).min(3);
-        let Some(last) = marks.last[i] else {
+        let Some(last) = last_edges[i] else {
             if alpha > 0.0 {
-                marks.last[i] = Some(edge(centre, v.velocity, normal, v.data.tyre.width_m[axle], 0.0, alpha, column));
+                last_edges[i] = Some(edge(centre, v.velocity, normal, v.data.tyre.width_m[axle], 0.0, alpha, column));
             }
             continue;
         };
         let d = centre.distance(last.centre);
         if d > MAX_SEG || alpha <= 0.0 && last.alpha <= 0.0 {
-            marks.last[i] = (alpha > 0.0).then(|| edge(centre, v.velocity, normal, v.data.tyre.width_m[axle], 0.0, alpha, column));
+            last_edges[i] = (alpha > 0.0).then(|| edge(centre, v.velocity, normal, v.data.tyre.width_m[axle], 0.0, alpha, column));
             continue;
         }
         if d < SEG_LEN {
@@ -260,8 +285,12 @@ fn lay_skidmarks(mut commands: Commands, mut marks: ResMut<SkidMarks>, track: Re
         let width = v.data.tyre.width_m[axle].max(0.1);
         let next = edge(centre, centre - last.centre, normal, width, last.v + d / width, alpha, column);
         write_quad(marks, &last, &next, style.color);
-        marks.last[i] = Some(next);
+        last_edges[i] = Some(next);
     }
+}
+
+/// Push the changed skid mark chunks to their meshes (and bounds).
+fn upload(commands: &mut Commands, marks: &mut SkidMarks, meshes: &mut Assets<Mesh>) {
     let cull = cull();
     for c in marks.chunks.iter_mut().filter(|c| c.dirty) {
         c.dirty = false;

@@ -16,6 +16,15 @@
 //!
 //! In play: STATE (motion only, 81 bytes) 20 times a second; PLAYER (name, car, paint) when it changes and every few
 //! seconds; PING/PONG once a second for liveness and the ping shown in the browser and HUD.
+//!
+//! Additive extensions (2026-10-09, "v2 ext 1", still VERSION 2): fields appended to the END of a packet. A decoder
+//! never checks that a datagram is fully read, so an older peer or server reads the old prefix and ignores the tail; a
+//! newer decoder treats a missing tail as "not sent" (defaults). The relay decodes and re-encodes, so an old server
+//! drops the tail (receivers then fall back) and a new one carries it.
+//! - STATE + [`WheelExt`] (19 bytes): per-wheel spin, normalised slip and slip angle, contact bits, boost, shift count
+//!   (tyre smoke / skid marks / surface FX and engine audio of remote cars).
+//! - PLAYER + looks (38 bytes): rim style media name, body kit Sequence per slot, look flags (roll cage). Sent with
+//!   PLAYER (on change, every 3 s, to newcomers), never per tick.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -29,6 +38,16 @@ pub const MAP_LEN: usize = 64;
 pub const CAR_LEN: usize = 96;
 pub const SERVER_NAME_LEN: usize = 48;
 pub const MOTD_LEN: usize = 64;
+/// PLAYER ext: the rim style's media name.
+pub const RIM_LEN: usize = 32;
+/// PLAYER ext: body kit slots (front bumper, rear bumper, side skirts, hood, rear wing), each a gamedb Sequence.
+pub const KIT_SLOTS: usize = 5;
+/// PLAYER ext: kit slot not set (stock).
+pub const KIT_STOCK: u8 = 0xFF;
+/// PLAYER ext look flags: the roll cage (race weight reduction) is fitted.
+pub const LOOK_CAGE: u8 = 1;
+/// Longest display name in characters (the wire field is [`NAME_LEN`] bytes).
+pub const NAME_MAX_CHARS: usize = 16;
 
 const HELLO: u8 = 1;
 const WELCOME: u8 = 2;
@@ -71,6 +90,10 @@ const MAX_RPM: f32 = 20_000.0;
 const MAX_STEER: f32 = 1.2;
 /// Angular velocity on the wire: i16 per axis in units of 1/400 rad/s (±81.9 rad/s).
 const SPIN_SCALE: f32 = 400.0;
+/// Wheel spin on the wire: i16 in units of 1/16 rad/s (±2048 rad/s).
+const OMEGA_SCALE: f32 = 16.0;
+/// Normalised slip / slip angle on the wire: i8 in units of 1/32 (±3.97).
+const SLIP_SCALE: f32 = 32.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
@@ -130,6 +153,46 @@ pub struct Snapshot {
     pub rotation: [f32; 4],
     pub velocity: [f32; 3],
     pub angular: [f32; 3],
+    /// Per-wheel state for the receivers' tyre FX (None = an older sender, or relayed by an older server).
+    pub ext: Option<WheelExt>,
+}
+
+/// STATE extension (module doc): what the tyre effects and engine audio of a remote car need beyond its motion.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct WheelExt {
+    /// Wheel spin (rad/s), LF RF LR RR.
+    pub omega: [f32; 4],
+    /// Normalised longitudinal slip (1 = the grip peak).
+    pub slip: [f32; 4],
+    /// Normalised slip angle (1 = the grip peak).
+    pub slip_angle: [f32; 4],
+    /// Bit i = wheel i on the ground.
+    pub grounded: u8,
+    /// Boost 0..1 (turbo / supercharger).
+    pub boost: f32,
+    /// Gear changes so far, wrapping (receivers play a shift on each step).
+    pub shifts: u8,
+}
+
+/// The multiplayer display name `raw` stands for: letters, digits, spaces and `- _ . '` only (others dropped), runs of
+/// spaces collapsed, trimmed, at most [`NAME_MAX_CHARS`] characters and [`NAME_LEN`] bytes. None = fewer than 2
+/// characters left (the caller falls back to a default). Same rule as the launcher's name box.
+pub fn sanitize_name(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | '\'') {
+            if out.chars().count() >= NAME_MAX_CHARS || out.len() + ch.len_utf8() > NAME_LEN {
+                break;
+            }
+            out.push(ch);
+        }
+    }
+    let out = out.trim().to_owned();
+    (out.chars().count() >= 2).then_some(out)
 }
 
 impl Snapshot {
@@ -172,6 +235,21 @@ pub struct PlayerInfo {
     pub paint_rgb: u32,
     /// FLAG_CUSTOM_PAINT | FLAG_METALLIC.
     pub paint_flags: u8,
+    /// Ext: the rim style (media name; empty = stock). Receivers only use rims their own install lists.
+    pub rim: String,
+    /// Ext: body kit Sequence per slot ([`KIT_STOCK`] = stock); receivers only use rows their install has.
+    pub kit: [u8; KIT_SLOTS],
+    /// Ext: [`LOOK_CAGE`].
+    pub look_flags: u8,
+}
+
+impl PlayerInfo {
+    /// Stock looks (no ext): what an older sender's PLAYER decodes to.
+    pub fn stock_looks(&mut self) {
+        self.rim.clear();
+        self.kit = [KIT_STOCK; KIT_SLOTS];
+        self.look_flags = 0;
+    }
 }
 
 /// What WELCOME and INFO tell a client about the server.
@@ -273,6 +351,17 @@ pub fn encode(packet: &Packet) -> Vec<u8> {
             for v in s.angular {
                 put_i16(&mut out, (v * SPIN_SCALE).round().clamp(-32767.0, 32767.0) as i16);
             }
+            if let Some(x) = &s.ext {
+                for v in x.omega {
+                    put_i16(&mut out, if v.is_finite() { (v * OMEGA_SCALE).round().clamp(-32767.0, 32767.0) as i16 } else { 0 });
+                }
+                let q8 = |v: f32| if v.is_finite() { (v * SLIP_SCALE).round().clamp(-127.0, 127.0) as i8 as u8 } else { 0 };
+                out.extend_from_slice(&x.slip.map(q8));
+                out.extend_from_slice(&x.slip_angle.map(q8));
+                out.push(x.grounded & 0x0F);
+                out.push((x.boost.clamp(0.0, 1.0) * 255.0).round() as u8);
+                out.push(x.shifts);
+            }
         }
         Packet::Player { token, info } => {
             out.push(PLAYER);
@@ -283,6 +372,9 @@ pub fn encode(packet: &Packet) -> Vec<u8> {
             out.push(info.paint_flags);
             put_str(&mut out, NAME_LEN, &info.name);
             put_str(&mut out, CAR_LEN, &info.car);
+            put_str(&mut out, RIM_LEN, &info.rim);
+            out.extend_from_slice(&info.kit);
+            out.push(info.look_flags);
         }
         Packet::Leave { id, token } => {
             out.push(LEAVE);
@@ -399,7 +491,14 @@ pub fn decode(buf: &[u8]) -> Option<Packet> {
             let rotation = if n > 0.5 { q.map(|v| v / n) } else { q };
             let velocity = [r.f32()?, r.f32()?, r.f32()?];
             let angular = [r.i16()?, r.i16()?, r.i16()?].map(|v| v as f32 / SPIN_SCALE);
-            let snap = Snapshot { id, seq, sent_ms, flags, gear, rpm, steer, throttle, brake, wheel_drop_mm, position, rotation, velocity, angular };
+            // Optional tail (module doc): absent from older senders / servers.
+            let ext = (|| {
+                let omega = [r.i16()?, r.i16()?, r.i16()?, r.i16()?].map(|v| v as f32 / OMEGA_SCALE);
+                let slip = [r.i8()?, r.i8()?, r.i8()?, r.i8()?].map(|v| v as f32 / SLIP_SCALE);
+                let slip_angle = [r.i8()?, r.i8()?, r.i8()?, r.i8()?].map(|v| v as f32 / SLIP_SCALE);
+                Some(WheelExt { omega, slip, slip_angle, grounded: r.u8()? & 0x0F, boost: r.u8()? as f32 / 255.0, shifts: r.u8()? })
+            })();
+            let snap = Snapshot { id, seq, sent_ms, flags, gear, rpm, steer, throttle, brake, wheel_drop_mm, position, rotation, velocity, angular, ext };
             if !snap.sane() {
                 return None;
             }
@@ -408,10 +507,27 @@ pub fn decode(buf: &[u8]) -> Option<Packet> {
         PLAYER => {
             let token = r.u64()?;
             let id = r.u8()?;
-            Packet::Player {
-                token,
-                info: PlayerInfo { id, paint_seq: r.u32()?, paint_rgb: r.u32()?, paint_flags: r.u8()?, name: r.str(NAME_LEN)?, car: r.str(CAR_LEN)? },
+            let mut info = PlayerInfo {
+                id,
+                paint_seq: r.u32()?,
+                paint_rgb: r.u32()?,
+                paint_flags: r.u8()?,
+                name: r.str(NAME_LEN)?,
+                car: r.str(CAR_LEN)?,
+                rim: String::new(),
+                kit: [KIT_STOCK; KIT_SLOTS],
+                look_flags: 0,
+            };
+            // Optional looks tail (module doc): absent from older senders / servers = stock looks.
+            match (|| Some((r.str(RIM_LEN)?, r.take::<KIT_SLOTS>()?, r.u8()?)))() {
+                Some((rim, kit, flags)) => {
+                    info.rim = rim;
+                    info.kit = kit;
+                    info.look_flags = flags & LOOK_CAGE;
+                }
+                None => info.stock_looks(),
             }
+            Packet::Player { token, info }
         }
         LEAVE => {
             let id = r.u8()?;
@@ -585,7 +701,48 @@ pub(crate) mod tests {
             rotation: [0.0, 0.38268343, 0.0, 0.9238795],
             velocity: [12.0, 0.0, -1.0],
             angular: [0.0, 0.4, -1.25],
+            ext: None,
         }
+    }
+
+    #[test]
+    fn state_ext_roundtrip_and_old_format() {
+        let mut s = snap();
+        s.ext = Some(WheelExt { omega: [40.0, -3.5, 120.25, 0.0], slip: [0.5, -1.25, 2.0, 0.0], slip_angle: [0.0, 0.75, -0.5, 1.0], grounded: 0b1011, boost: 0.5, shifts: 7 });
+        let bytes = encode(&Packet::State { token: 1, snap: s.clone() });
+        assert_eq!(bytes.len(), 81 + 19);
+        let Packet::State { snap: back, .. } = decode(&bytes).unwrap() else { panic!("kind") };
+        let (a, b) = (s.ext.unwrap(), back.ext.unwrap());
+        for k in 0..4 {
+            assert!((a.omega[k] - b.omega[k]).abs() < 0.04);
+            assert!((a.slip[k] - b.slip[k]).abs() < 0.02 && (a.slip_angle[k] - b.slip_angle[k]).abs() < 0.02);
+        }
+        assert_eq!((b.grounded, b.shifts), (0b1011, 7));
+        // An older peer's 81-byte STATE still decodes (no ext), and our tail is ignored by its decoder (prefix intact).
+        let Packet::State { snap: old, .. } = decode(&bytes[..81]).unwrap() else { panic!("kind") };
+        assert!(old.ext.is_none());
+        assert_eq!(old.position, s.position);
+    }
+
+    #[test]
+    fn player_looks_roundtrip_and_old_format() {
+        let info = PlayerInfo { id: 4, name: "Ada".into(), car: "VW_Corrado_95".into(), paint_seq: 2, paint_rgb: 0, paint_flags: 0, rim: "BBS_RE".into(), kit: [1, KIT_STOCK, 2, KIT_STOCK, 3], look_flags: LOOK_CAGE };
+        let bytes = encode(&Packet::Player { token: 9, info: info.clone() });
+        let Packet::Player { info: back, .. } = decode(&bytes).unwrap() else { panic!("kind") };
+        assert_eq!(back, info);
+        // Without the tail (an older sender): stock looks.
+        let Packet::Player { info: old, .. } = decode(&bytes[..bytes.len() - (RIM_LEN + KIT_SLOTS + 1)]).unwrap() else { panic!("kind") };
+        assert_eq!((old.rim.as_str(), old.kit, old.look_flags, old.car.as_str()), ("", [KIT_STOCK; KIT_SLOTS], 0, "VW_Corrado_95"));
+    }
+
+    #[test]
+    fn names_are_sanitized() {
+        assert_eq!(sanitize_name("  Ada   Lovelace "), Some("Ada Lovelace".into()));
+        assert_eq!(sanitize_name("<script>x"), Some("scriptx".into()));
+        assert_eq!(sanitize_name("a"), None);
+        assert_eq!(sanitize_name("\u{202e}\n"), None);
+        assert_eq!(sanitize_name("ABCDEFGHIJKLMNOPQRSTUVWXYZ").map(|n| n.chars().count()), Some(NAME_MAX_CHARS));
+        assert!(sanitize_name("ééééééééééééééé").is_some_and(|n| n.len() <= NAME_LEN));
     }
 
     #[test]
@@ -610,7 +767,7 @@ pub(crate) mod tests {
 
     #[test]
     fn player_roundtrip() {
-        let info = PlayerInfo { id: 4, name: "Ada".into(), car: "../imported/fm4/cars/X".into(), paint_seq: 2, paint_rgb: 0xC01020, paint_flags: FLAG_CUSTOM_PAINT };
+        let info = PlayerInfo { id: 4, name: "Ada".into(), car: "../imported/fm4/cars/X".into(), paint_seq: 2, paint_rgb: 0xC01020, paint_flags: FLAG_CUSTOM_PAINT, rim: String::new(), kit: [KIT_STOCK; KIT_SLOTS], look_flags: 0 };
         let Packet::Player { token, info: back } = decode(&encode(&Packet::Player { token: 9, info: info.clone() })).unwrap() else { panic!("kind") };
         assert_eq!((token, back), (9, info));
     }

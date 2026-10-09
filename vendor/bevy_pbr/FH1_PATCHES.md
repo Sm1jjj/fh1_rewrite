@@ -43,6 +43,40 @@ Rebase them when Bevy is upgraded (or drop them if upstream gains shadow caching
    key kept ATMOSPHERE (validation error in the static world draw). Now the first camera's copy is written: the buffer is
    global and holds the planet (one `Atmosphere` entity in FH1), identical for every camera.
 
+7. **Cached cascade leaves batching** (P16-C, 2026-10-09, docs/PERF_P16_C.md; `FH1_SHADOW_PHASE_STASH=0` = old). A cascade
+   skipped by patch 1 still went through batching, the bin buffer writes, the preprocess / bin unpacking bind groups and the
+   GPU preprocess + unpack dispatches every frame, for a pass that is not drawn. Skipping `queue_shadows` is NOT safe (its
+   retained bins take one-frame visibility / specialization deltas), so queueing stays and only what follows it is skipped:
+   - `src/render/light.rs`: new render resource `StashedShadowPhases { skipped, phases }`. `prepare_lights` first puts
+     last frame's stashed phases back into `ViewBinnedRenderPhases<Shadow>` (before its `prepare_for_new_frame` /
+     `retain`), then for each cascade in the frame's skip mask records its `RetainedViewEntity` and inserts
+     `SkipGpuPreprocess` on the cascade view (removed on other frames). New system `stash_skipped_shadow_phases`
+     (`RenderSystems::PhaseSort`, after `sort_binned_render_phase::<Shadow>`, registered in `src/lib.rs`) moves those
+     phases out of the map, so `batch_and_prepare_binned_render_phase` and `write_binned_instance_buffers` skip the view
+     (both `continue` on a missing phase) and `view_shadow_pass` finds nothing.
+   - `src/render/gpu_preprocess.rs` `prepare_preprocess_bind_groups`: views with `SkipGpuPreprocess` are filtered out (no
+     preprocess / bin unpacking bind groups; `unpack_bins` and `early_gpu_preprocess` already skip such views). Needed for
+     correctness too: `write_binned_instance_buffers` leaves a phase-less view's unpacking jobs from the frame before,
+     whose metadata indices are stale.
+   - Batch sets, work items and indirect parameters are rebuilt every frame from the bins, so the frame after a skip
+     batches the restored bins as usual (nothing to re-sync). Side effect: fh1-engine perf/draws.rs (`draws_shadow`, read
+     in `Prepare`) no longer counts the skipped cascade's batch sets on skipped frames (they were never drawn).
+
+8. **Bin unpacking bind groups cached** (P16-C, `FH1_UNPACK_BG_CACHE=0` = old). `src/render/gpu_preprocess.rs`:
+   `create_bin_unpacking_bind_group` was called for every multidraw batch set of every (view, phase) every frame.
+   `BinUnpackingBindGroupCache` (a `Local` of `prepare_preprocess_bind_groups`) keeps them keyed by (layout id, metadata
+   buffer id, metadata byte offset, the batch set's two retained buffer ids, work item buffer id, indexed). bevy_render
+   `BufferId` / `BindGroupLayoutId` are unique atomic ids, so a hit binds exactly what a new group would; a reallocated
+   buffer or a moved metadata slot is a miss. Entries unused in a frame are dropped at its end.
+
 6. **Atmosphere node re-export** (orchestrator for worker B, 2026-10-08 night, P15-B): `atmosphere/mod.rs` re-exports `node::{atmosphere_luts, render_sky}` (`pub use`) so
 fh1-render's half-res effects composite (fx_half_res.rs) can order itself `.after(bevy::pbr::render_sky)`; `resources.rs` makes `AtmosphereBindGroups`, `AtmosphereLutPipelines` and
 `RenderSkyPipelineId` `pub` (they appear in `render_sky`'s signature, else the path is a private type from outside).
+
+9. **Contact-shadow ray start offset** (orchestrator, 2026-10-09; black dots on car paint / lamps). `src/render/pbr_functions.wgsl`
+   `calculate_contact_shadow`: the march starts `clamp(eye distance x 0.004, 0.01, 0.15)` m toward the light instead of on
+   the surface. With MSAA the prepass depth is read at sample 0 only (a fraction of a pixel off the shaded point), so the
+   first jittered step often hit the surface itself on sloped panels; a shallow hit returns full shadow, i.e. scattered
+   per-pixel black dots (the car paint's sun removal then clamped them to pure black; car_paint.rs FH1_RM_PAINT_SUN_MATCH).
+   No flag (shader library patch); revert = march from `world_position` again. Contacts shorter than the offset lose
+   their contact shadow (a few cm at car distance).

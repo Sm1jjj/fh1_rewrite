@@ -399,6 +399,10 @@ impl Plugin for PbrPlugin {
                     prepare_lights
                         .in_set(RenderSystems::CreateViews)
                         .after(sort_cameras),
+                    // FH1 patch 7: skipped (cached) cascades leave the shadow phases between sorting and batching.
+                    stash_skipped_shadow_phases
+                        .in_set(RenderSystems::PhaseSort)
+                        .after(bevy_render::batching::sort_binned_render_phase::<Shadow>),
                     prepare_clusters_for_cpu_clustering
                         .in_set(RenderSystems::PrepareResources)
                         .run_if(
@@ -411,6 +415,7 @@ impl Plugin for PbrPlugin {
             .init_gpu_resource::<LightMeta>()
             .init_gpu_resource::<RenderMaterialBindings>()
             .init_resource::<RenderShadowLodOrigin>()
+            .init_resource::<StashedShadowPhases>()
             .allow_ambiguous_resource::<RenderMaterialBindings>();
 
         render_app.world_mut().add_observer(add_light_view_entities);

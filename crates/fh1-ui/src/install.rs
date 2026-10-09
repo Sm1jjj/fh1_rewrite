@@ -12,6 +12,11 @@
 //!   scene texture paths to. Single-channel textures (DXT5A/DXT3A) become white + alpha masks.
 //!   `textures/no_gamma.txt` lists the textures the 360 samples without gamma decoding (fetch
 //!   constant sign ≠ gamma; the rest are gamma-decoded on fetch).
+//! - `fonts/cjk/{cht,jp,kor}.{png,json}`: the CJK bitmap fonts decoded from `media/ui/fonts/*.abc|sbm`
+//!   (see `cjk`; schema `fh1.ui.cjk_font.v1`).
+//! - `data/{credits,colorpicker,ResPack,cameras,SHLightSettings,LoadingDefs,MapProfileFullscreen,
+//!   MapProfileMinimap}.{xml,json}` (XML byte copies + generic XML -> JSON, see `xmljson`),
+//!   `data/EventNames.txt`, `data/EventNames_ui4.txt`, `data/behaviors/*.lua`, `map/MapGameReady.jpg`.
 
 use std::path::Path;
 
@@ -19,6 +24,9 @@ use fh1_formats::xds::{self, Format};
 use fh1_formats::zip::Archive;
 
 use crate::{Error, Result};
+
+mod cjk;
+mod xmljson;
 
 pub fn build(disc: &Path, out: &Path) -> Result<()> {
     let media = disc.join("media");
@@ -36,7 +44,9 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
     failed += failed2;
     raw.sort();
     std::fs::write(out.join("textures/no_gamma.txt"), raw.join("\n"))?;
-    println!("  ui: {scenes} scene files, {fonts} fonts, {langs} languages, {pois} map POIs, {ok} textures ({failed} undecodable)");
+    let cjk = cjk::build(&media.join("ui/fonts"), &out.join("fonts/cjk"))?;
+    let data = ui_data(&media.join("UI.zip"), &media.join("ui"), out)?;
+    println!("  ui: {scenes} scene files, {fonts} fonts, {langs} languages, {pois} map POIs, {ok} textures ({failed} undecodable), {cjk} CJK glyphs, {data} data files");
     Ok(())
 }
 
@@ -142,4 +152,139 @@ fn textures(zip: &Path, out: &Path, prefix: &str, raw: &mut Vec<String>) -> Resu
         ok += 1;
     }
     Ok((ok, failed))
+}
+
+/// XML documents read from `media/UI.zip` (root level), as (zip name lower-cased, output stem).
+const ZIP_XML: [(&str, &str); 5] = [
+    ("credits.xml", "credits"),
+    ("colorpicker.xml", "colorpicker"),
+    ("respack.xml", "ResPack"),
+    ("cameras.xml", "cameras"),
+    ("shlightsettings.xml", "SHLightSettings"),
+];
+
+/// XML documents read from `media/ui/`.
+const DISC_XML: [&str; 3] = ["LoadingDefs", "MapProfileFullscreen", "MapProfileMinimap"];
+
+/// `data/*.{xml,json}`, `data/EventNames*.txt`, `data/behaviors/*.lua` and `map/MapGameReady.jpg`.
+/// Returns the number of files written.
+fn ui_data(zip: &Path, media_ui: &Path, out: &Path) -> Result<usize> {
+    let mut ar = Archive::open(zip)?;
+    let data = out.join("data");
+    let mut xml: Vec<(String, Vec<u8>)> = Vec::new();
+    let (mut n, mut lua) = (0, 0);
+    for e in ar.entries.clone() {
+        let name = norm(&e.name);
+        if let Some((_, stem)) = ZIP_XML.iter().find(|(z, _)| *z == name) {
+            xml.push((stem.to_string(), ar.read(&e)?));
+        } else if name == "scenes/eventnames.txt" {
+            write(&data.join("EventNames.txt"), &ar.read(&e)?)?;
+            n += 1;
+        } else if name == "scenes/ui4/eventnames.txt" {
+            write(&data.join("EventNames_ui4.txt"), &ar.read(&e)?)?;
+            n += 1;
+        } else if name == "new map/mapgameready.jpg" {
+            write(&out.join("map/MapGameReady.jpg"), &ar.read(&e)?)?;
+            n += 1;
+        } else if name.starts_with("behaviors/ui4/") && name.ends_with(".lua") {
+            // Keep the disc spelling ("Fire Event.lua").
+            let path = e.name.replace('\\', "/");
+            let file = path.rsplit('/').next().unwrap_or(&path).to_string();
+            write(&data.join("behaviors").join(file), &ar.read(&e)?)?;
+            n += 1;
+            lua += 1;
+        }
+    }
+    if lua != 5 || xml.len() != ZIP_XML.len() {
+        return Err(Error::Format(format!("{}: expected 5 behaviors and {} xml files, found {lua} and {}", zip.display(), ZIP_XML.len(), xml.len())));
+    }
+    for stem in DISC_XML {
+        xml.push((stem.to_string(), std::fs::read(media_ui.join(format!("{stem}.xml")))?));
+    }
+    for (stem, bytes) in xml {
+        let (json, _repaired) = xmljson::convert(&bytes).map_err(|e| Error::Format(format!("{stem}.xml: {e}")))?;
+        write(&data.join(format!("{stem}.xml")), &bytes)?;
+        write(&data.join(format!("{stem}.json")), json.as_bytes())?;
+        n += 2;
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn disc() -> Option<PathBuf> {
+        let d = std::env::var_os("FH1_DISC").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../disc"));
+        d.join("media/UI.zip").exists().then_some(d)
+    }
+
+    fn reference() -> Option<PathBuf> {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/extracted/converted/ui");
+        d.join("data").exists().then_some(d)
+    }
+
+    /// Python wrote its JSON with Windows newlines.
+    fn lf(bytes: Vec<u8>) -> String {
+        String::from_utf8(bytes).unwrap().replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn xml_json_matches_python_output() {
+        let (Some(disc), Some(refd)) = (disc(), reference()) else {
+            eprintln!("skipped: no disc or no converted/ui reference");
+            return;
+        };
+        let mut ar = Archive::open(disc.join("media/UI.zip")).unwrap();
+        let mut srcs: Vec<(String, Vec<u8>)> = Vec::new();
+        for e in ar.entries.clone() {
+            if let Some((_, stem)) = ZIP_XML.iter().find(|(z, _)| *z == norm(&e.name)) {
+                srcs.push((stem.to_string(), ar.read(&e).unwrap()));
+            }
+        }
+        for stem in DISC_XML {
+            srcs.push((stem.to_string(), std::fs::read(disc.join(format!("media/ui/{stem}.xml"))).unwrap()));
+        }
+        assert_eq!(srcs.len(), 8);
+        for (stem, bytes) in srcs {
+            let (doc, _) = xmljson::parse_bytes(&bytes).unwrap();
+            let want = lf(std::fs::read(refd.join(format!("data/{stem}.json"))).unwrap());
+            assert_eq!(doc.to_json().to_pretty(), want, "{stem}");
+        }
+    }
+
+    #[test]
+    fn cjk_jp_matches_python_output() {
+        let (Some(disc), Some(refd)) = (disc(), reference()) else {
+            eprintln!("skipped: no disc or no converted/ui reference");
+            return;
+        };
+        let raw = disc.join("media/ui/fonts");
+        if !raw.join("JPB.abc").exists() || !refd.join("fonts/cjk/jp.json").exists() {
+            eprintln!("skipped: no JPB.abc / reference jp.json");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("fh1_ui_cjk_test_{}", std::process::id()));
+        let n = cjk::convert_font(&raw, &tmp, "jp", "JPB", "JP.ini").unwrap();
+        assert_eq!(n, 7591);
+        let got = std::fs::read_to_string(tmp.join("jp.json")).unwrap();
+        let want = lf(std::fs::read(refd.join("fonts/cjk/jp.json")).unwrap());
+        assert!(got == want, "jp.json differs from the Python output");
+        assert!(got.contains("\"scale\": 0.66") && got.contains("\"baselineshift\": 0.074"));
+        // Pixels: decoded PNG == reference PNG (LA8, 3072 x 5712).
+        let load = |p: PathBuf| {
+            let dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(p).unwrap()));
+            let mut r = dec.read_info().unwrap();
+            let mut buf = vec![0; r.output_buffer_size().unwrap()];
+            let info = r.next_frame(&mut buf).unwrap();
+            assert_eq!(info.color_type, png::ColorType::GrayscaleAlpha);
+            (info.width, info.height, buf[..info.buffer_size()].to_vec())
+        };
+        let a = load(tmp.join("jp.png"));
+        let b = load(refd.join("fonts/cjk/jp.png"));
+        assert_eq!((a.0, a.1), (3072, 5712));
+        assert!(a == b, "jp.png differs from the Python output");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

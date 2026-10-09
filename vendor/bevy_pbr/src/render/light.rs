@@ -93,6 +93,43 @@ pub struct DirectionalShadowCache {
 #[derive(Resource, Clone, Copy, Default)]
 pub struct DirectionalShadowSkipThisFrame(pub u32);
 
+/// FH1 patch 7 (P16-C): the retained shadow phases of the cascades skipped this frame, held out of
+/// `ViewBinnedRenderPhases<Shadow>` from `PhaseSort` until the next frame's `prepare_lights`.
+///
+/// `queue_shadows` still runs for a skipped cascade (its bins are retained and updated from one-frame visibility /
+/// specialization deltas, so they must see every frame), but batching, the bin buffer writes, the preprocess / bin
+/// unpacking bind groups and the GPU preprocess + unpack dispatches only feed a pass that is not drawn. With the phase
+/// out of the map, `batch_and_prepare_binned_render_phase` and `write_binned_instance_buffers` skip the view (both
+/// `continue` on a missing phase), and the view carries `SkipGpuPreprocess` (honoured by `unpack_bins`,
+/// `early_gpu_preprocess` and, patched, `prepare_preprocess_bind_groups`). Nothing batching builds is kept across frames
+/// (batch sets, work items and indirect parameters are rebuilt every frame), so the resume frame batches the restored,
+/// up-to-date bins as usual. `FH1_SHADOW_PHASE_STASH=0` = old (batch every cascade every frame).
+#[derive(Resource, Default)]
+pub struct StashedShadowPhases {
+    /// Retained view entities of the cascades skipped this frame (set by `prepare_lights`).
+    pub skipped: Vec<RetainedViewEntity>,
+    pub phases: HashMap<RetainedViewEntity, BinnedRenderPhase<Shadow>>,
+}
+
+/// FH1 patch 7: `FH1_SHADOW_PHASE_STASH=0` turns the phase stash off.
+pub fn shadow_phase_stash_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_SHADOW_PHASE_STASH").map_or(true, |v| v != "0"))
+}
+
+/// FH1 patch 7: moves the skipped cascades' shadow phases out of the map after sorting (see [`StashedShadowPhases`]).
+pub fn stash_skipped_shadow_phases(
+    mut stash: ResMut<StashedShadowPhases>,
+    mut shadow_render_phases: ResMut<ViewBinnedRenderPhases<Shadow>>,
+) {
+    let StashedShadowPhases { skipped, phases } = &mut *stash;
+    for view in skipped.iter() {
+        if let Some(phase) = shadow_render_phases.remove(view) {
+            phases.insert(*view, phase);
+        }
+    }
+}
+
 #[derive(Component)]
 #[require(PointAndSpotLightViewEntities)]
 pub struct ExtractedPointLight {
@@ -1099,11 +1136,21 @@ pub fn prepare_lights(
         ResMut<SpecializedShadowMaterialPipelineCache>,
     ),
     // FH1 patch: cascade caching (see `DirectionalShadowCache`).
-    (shadow_cache, mut persistent_directional_texture): (
+    (shadow_cache, mut persistent_directional_texture, mut stash): (
         Option<Res<DirectionalShadowCache>>,
         Local<Option<(TextureDescriptor<'static>, CachedTexture)>>,
+        ResMut<StashedShadowPhases>,
     ),
 ) {
+    // FH1 patch 7: last frame's skipped cascades get their (queued, sorted, un-batched) phases back before this frame's
+    // `prepare_for_new_frame` / `retain`, so a light or view that went away drops its phase as upstream.
+    {
+        let StashedShadowPhases { skipped, phases } = &mut *stash;
+        skipped.clear();
+        for (view, phase) in phases.drain() {
+            shadow_render_phases.insert(view, phase);
+        }
+    }
     let views_iter = views.iter();
     let views_count = views_iter.len();
     let Some(mut view_gpu_lights_writer) =
@@ -1505,10 +1552,13 @@ pub fn prepare_lights(
         *persistent_directional_texture = None;
         texture_cache.get(&render_device, directional_light_depth_descriptor)
     };
-    commands.insert_resource(DirectionalShadowSkipThisFrame(match &shadow_cache {
+    let directional_skip_mask = match &shadow_cache {
         Some(c) if c.enabled && !directional_texture_created => c.skip_mask,
         _ => 0,
-    }));
+    };
+    commands.insert_resource(DirectionalShadowSkipThisFrame(directional_skip_mask));
+    // FH1 patch 7: stash the skipped cascades' phases (0 = none).
+    let stash_skip_mask = if shadow_phase_stash_on() { directional_skip_mask } else { 0 };
 
     let directional_light_depth_texture_view =
         directional_light_depth_texture
@@ -1996,6 +2046,14 @@ pub fn prepare_lights(
                 shadow_render_phases
                     .prepare_for_new_frame(retained_view_entity, gpu_preprocessing_mode);
                 live_shadow_mapping_lights.insert(retained_view_entity);
+
+                // FH1 patch 7: a cached (skipped) cascade is queued but not batched or preprocessed (StashedShadowPhases).
+                if cascade_index < 32 && stash_skip_mask & (1 << cascade_index) != 0 {
+                    stash.skipped.push(retained_view_entity);
+                    commands.entity(view_light_entity).insert(SkipGpuPreprocess);
+                } else {
+                    commands.entity(view_light_entity).remove::<SkipGpuPreprocess>();
+                }
             }
         }
 

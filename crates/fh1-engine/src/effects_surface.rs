@@ -51,9 +51,13 @@ pub struct SurfaceFx {
     /// Effect ids per system (None until FX1 has the data root, or the file is missing: retried each frame).
     ids: [Option<EffectId>; SYSTEMS.len()],
     /// Fractional particles carried to the next frame, per wheel and system.
-    carry: [[f32; SYSTEMS.len()]; 4],
+    carry: Carry,
+    /// The same for other players' cars (net.rs `RemoteCar`).
+    remote_carry: std::collections::HashMap<Entity, Carry>,
     log: Option<(f64, u32)>,
 }
+
+type Carry = [[f32; SYSTEMS.len()]; 4];
 
 pub fn surface_fx_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -96,6 +100,7 @@ pub fn emit_surface_fx(
     mut particles: Option<ResMut<FxParticles>>,
     track: Res<Track>,
     cars: Query<&Car>,
+    remotes: Query<(Entity, &crate::net::RemoteCar)>,
     fixed: Res<Time<Fixed>>,
     time: Res<Time>,
     mut frame: Local<u32>,
@@ -104,7 +109,6 @@ pub fn emit_surface_fx(
     if !surface_fx_on() || !particles.enabled() {
         return;
     }
-    let Ok(car) = cars.single() else { return };
     let fx = &mut *fx;
     if fx.table.is_none() {
         let Some(world) = &track.world else { return };
@@ -118,16 +122,49 @@ pub fn emit_surface_fx(
     }
     *frame = frame.wrapping_add(1);
     let dt = time.delta_secs().min(0.1);
-    let v = &car.0;
-    let (pos, rot) = v.render_pose(fixed.overstep_fraction());
-    let up = rot * Vec3::Y;
-
+    let alpha = fixed.overstep_fraction();
     let mut spawned = 0u32;
     let table = fx.table.as_ref().unwrap();
+    if let Ok(car) = cars.single() {
+        car_fx(particles, table, &fx.ids, &mut fx.carry, &car.0, alpha, dt, *frame, &mut spawned);
+    }
+    // Other players' cars (net.rs fills their wheels; FH1_NET_FX=0 = none), each with its own carry.
+    fx.remote_carry.retain(|e, _| remotes.contains(*e));
+    for (e, r) in &remotes {
+        let carry = fx.remote_carry.entry(e).or_insert([[0.0; SYSTEMS.len()]; 4]);
+        car_fx(particles, table, &fx.ids, carry, &r.vehicle, alpha, dt, frame.wrapping_add(e.index_u32()), &mut spawned);
+    }
+    if let Some((t, sum)) = fx.log.as_mut() {
+        *sum += spawned;
+        let now = time.elapsed_secs_f64();
+        if now - *t >= 1.0 {
+            let live: Vec<String> = SYSTEMS.iter().zip(&fx.ids).filter_map(|(s, id)| Some(format!("{} {}", s.0, particles.live((*id)?)))).collect();
+            info!("surface fx: {sum} spawned in the last second; live {live:?}");
+            *t = now;
+            *sum = 0;
+        }
+    }
+}
+
+/// One car's surface particles from its four tyre contacts (`carry` = its fractional particles per wheel and system).
+#[allow(clippy::too_many_arguments)]
+fn car_fx(
+    particles: &mut FxParticles,
+    table: &[(Vec<(usize, f32)>, f32)],
+    ids: &[Option<EffectId>; SYSTEMS.len()],
+    carry: &mut Carry,
+    v: &fh1_engine::vehicle::Vehicle,
+    alpha: f32,
+    dt: f32,
+    frame: u32,
+    spawned: &mut u32,
+) {
+    let (pos, rot) = v.render_pose(alpha);
+    let up = rot * Vec3::Y;
     for (wi, w) in v.wheels.iter().enumerate() {
         let weights = table.get(w.surface as usize).filter(|_| w.grounded);
         let Some((weights, min_intensity)) = weights.filter(|r| !r.0.is_empty()) else {
-            fx.carry[wi] = [0.0; SYSTEMS.len()];
+            carry[wi] = [0.0; SYSTEMS.len()];
             continue;
         };
         let r = v.data.tyre_radius[wi / 2];
@@ -147,32 +184,32 @@ pub fn emit_surface_fx(
         let roll = ((speed - ROLL_START) / (ROLL_FULL - ROLL_START)).clamp(0.0, 1.0);
         let intensity = slip_term.max(min_intensity * roll);
         if intensity <= 0.0 {
-            fx.carry[wi] = [0.0; SYSTEMS.len()];
+            carry[wi] = [0.0; SYSTEMS.len()];
             continue;
         }
         // Emit axis: along the tread's motion (backwards from the travel when only rolling), tipped up.
         let along = if slip > 0.5 { tread / slip } else { -v_point.normalize_or(fwd) };
         let axis = (along.reject_from(up).normalize_or(-fwd) + up * 0.6).normalize();
         for &(si, weight) in weights {
-            let Some(id) = fx.ids[si] else { continue };
+            let Some(id) = ids[si] else { continue };
             let (budget, inherit) = {
                 let d = particles.def(id);
                 (d.budget as usize, d.inherit)
             };
             // Dust is the trail behind the car: it follows speed as much as slip.
             let k = if si == DUST { intensity.max(min_intensity * roll) } else { intensity };
-            let n = particles.count(id, k * weight, dt, &mut fx.carry[wi][si]);
+            let n = particles.count(id, k * weight, dt, &mut carry[wi][si]);
             // The game's budget is per emitter (one per wheel); FX1 caps the pool at budget x 4.
             if n == 0 || particles.live(id) >= budget * 4 {
                 continue;
             }
-            let n = n.min(MAX_SPAWNS_PER_FRAME.saturating_sub(spawned));
+            let n = n.min(MAX_SPAWNS_PER_FRAME.saturating_sub(*spawned));
             if n == 0 {
                 break;
             }
-            spawned += n;
+            *spawned += n;
             // A little jitter across the tyre width.
-            let j = hash01(*frame ^ (wi as u32).wrapping_mul(7919) ^ (si as u32).wrapping_mul(104_729)) - 0.5;
+            let j = hash01(frame ^ (wi as u32).wrapping_mul(7919) ^ (si as u32).wrapping_mul(104_729)) - 0.5;
             let mut s = Spawn::new(contact + right * (j * 0.15) + up * 0.03, axis, n);
             s.inherit = v.velocity * inherit;
             s.intensity = k;
@@ -181,16 +218,6 @@ pub fn emit_surface_fx(
                 s.ground_y = contact.y;
             }
             particles.spawn(id, &s);
-        }
-    }
-    if let Some((t, sum)) = fx.log.as_mut() {
-        *sum += spawned;
-        let now = time.elapsed_secs_f64();
-        if now - *t >= 1.0 {
-            let live: Vec<String> = SYSTEMS.iter().zip(&fx.ids).filter_map(|(s, id)| Some(format!("{} {}", s.0, particles.live((*id)?)))).collect();
-            info!("surface fx: {sum} spawned in the last second; live {live:?}");
-            *t = now;
-            *sum = 0;
         }
     }
 }

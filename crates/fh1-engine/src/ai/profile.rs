@@ -91,8 +91,10 @@ impl SpeedProfile {
     pub fn compute(line: &RacingLine, car: &CarLimits, cornering: f32, braking: f32) -> Self {
         let n = line.len();
         // Curvature over ~16 m chords, then the tightest within ±3 points (conservative on short kinks).
-        let raw: Vec<f32> = (0..n).map(|i| line.curvature(i, 4).abs()).collect();
-        let kappa: Vec<f32> = (0..n).map(|i| (-3isize..=3).map(|k| raw[line.wrap(i as isize + k)]).fold(0.0, f32::max)).collect();
+        let ck: usize = std::env::var("FH1_P_CK").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let cw: isize = std::env::var("FH1_P_CW").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let raw: Vec<f32> = (0..n).map(|i| line.curvature(i, ck).abs()).collect();
+        let kappa: Vec<f32> = (0..n).map(|i| (-cw..=cw).map(|k| raw[line.wrap(i as isize + k)]).fold(0.0, f32::max)).collect();
         let v_corner: Vec<f32> = kappa
             .iter()
             .map(|&k| {

@@ -98,7 +98,7 @@ fn drive_name(id: Option<i64>) -> &'static str {
 /// Class letters in rank order (lowest first), across every game's scheme.
 const CLASS_ORDER: [&str; 16] = ["F", "E", "D", "C", "B", "A", "S", "S1", "S2", "R3", "R2", "R1", "X", "U", "P", "?"];
 
-fn class_rank(c: &str) -> usize {
+pub(super) fn class_rank(c: &str) -> usize {
     CLASS_ORDER.iter().position(|k| *k == c).unwrap_or(CLASS_ORDER.len())
 }
 

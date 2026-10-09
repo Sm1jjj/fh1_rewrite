@@ -525,8 +525,10 @@ pub(crate) struct UsageScope<'a> {
 impl<'a> Drop for UsageScope<'a> {
     fn drop(&mut self) {
         // clear vecs and push into pool
-        self.buffers.clear();
-        self.textures.clear();
+        // FH1 patch (P16-A): sparse reset (was `clear()`: the next `new_pooled` refilled every slot of the device's
+        // resource count, O(device resources) per pass).
+        self.buffers.clear_sparse();
+        self.textures.clear_sparse();
         self.pool
             .lock()
             .push((mem::take(&mut self.buffers), mem::take(&mut self.textures)));

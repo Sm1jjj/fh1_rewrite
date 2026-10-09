@@ -125,7 +125,8 @@ fn make_visible(mut windows: Query<&mut Window, With<PrimaryWindow>>, ld: Res<Lo
 /// Whether the world may be heard: false while the main menu or a loading card covers it (radio paused, car / AI /
 /// traffic engines silent). True during a cover's fade-out, so sound comes back with the picture.
 pub fn world_audio_allowed() -> bool {
-    !audio_gate_on() || !COVERED.load(Ordering::Relaxed)
+    // A full-screen movie (ui/fmv.rs) covers the world too.
+    (!audio_gate_on() || !COVERED.load(Ordering::Relaxed)) && !super::fmv::fullscreen_active()
 }
 
 /// The loading screen's images, requested at boot and kept alive (strong handles) for the whole run.
@@ -224,7 +225,8 @@ fn watch_ui_pipeline(cache: Res<bevy::render::render_resource::PipelineCache>) {
 
 /// True while a cover blocks driving input and the pause menu (read by `ui::driving` and `menu_input`).
 pub fn blocking() -> bool {
-    BLOCK.load(Ordering::Relaxed)
+    // Also while a full-screen movie plays (ui/fmv.rs; story movies in free roam).
+    BLOCK.load(Ordering::Relaxed) || super::fmv::fullscreen_active()
 }
 
 /// Whether loading covers are on this run (`FH1_LOADING`).
@@ -849,8 +851,10 @@ fn draw_overlay(
         let (ww, wh) = (w.width().max(1.0), w.height().max(1.0));
         let s = (ww / 1280.0).max(wh / 720.0);
         let (pw, ph) = (1280.0 * s / ww * 100.0, 720.0 * s / wh * 100.0);
+        // The title movie (ui/fmv.rs, PressStart loop) replaces the still while it has a frame.
+        let video = super::fmv::backdrop();
         for (_, mut img, mut node) in &mut backdrop {
-            if let Some(h) = ld.backdrop.as_ref() {
+            if let Some(h) = video.as_ref().or(ld.backdrop.as_ref()) {
                 if img.image != *h {
                     img.image = h.clone();
                 }
@@ -889,7 +893,7 @@ fn draw_overlay(
     for (f, mut i) in &mut imgs {
         i.color = Color::WHITE.with_alpha(f.0 * a);
     }
-    let has_img = ld.backdrop.as_ref().is_some_and(|h| assets.is_loaded_with_dependencies(h.id()));
+    let has_img = super::fmv::backdrop().is_some() || ld.backdrop.as_ref().is_some_and(|h| assets.is_loaded_with_dependencies(h.id()));
     for (f, mut i, _) in &mut backdrop {
         i.color = Color::WHITE.with_alpha(if has_img { f.0 * a } else { 0.0 });
     }

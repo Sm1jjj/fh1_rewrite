@@ -71,13 +71,14 @@ pub fn build(disc: &Path, out: &Path) -> Result<()> {
         std::fs::write(dir.join(&file), &c.dds)?;
         files.insert(t, file);
     }
-    let objects_json: Vec<_> = objects
+    let mut objects_json: Vec<_> = objects
         .iter()
         .map(|(name, tex, file)| {
             let slots: serde_json::Map<String, serde_json::Value> = tex.iter().enumerate().filter_map(|(i, t)| Some((i.to_string(), json!(files.get(t)?)))).collect();
             json!({ "name": name, "file": file, "textures": slots })
         })
         .collect();
+    crate::airborne_objects::append(disc, &dir, &mut objects_json)?;
     // Instances from the scenes.
     let anim = props::track_anim(&mut ar)?;
     let mut instances = Vec::new();

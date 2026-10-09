@@ -7,6 +7,7 @@ publish.workspace = true
 description = "FH1 UI data: Anark scenes, string tables, vector fonts (owned by the UI session)"
 
 [dependencies]
+flate2 = "1"
 fh1-formats = { path = "../fh1-formats" }
 thiserror = "2"
 png = "0.18"

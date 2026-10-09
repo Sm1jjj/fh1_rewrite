@@ -13,8 +13,8 @@ mod relay;
 
 pub use client::{Client, Event, InfoQuery, LOST_AFTER};
 pub use proto::{
-    clean, decode, encode, password_proof, peek_version, resolve, Packet, PlayerInfo, RejectReason, ServerInfo, Snapshot, FLAG_BRAKE, FLAG_CUSTOM_PAINT, FLAG_METALLIC,
-    FLAG_REVERSE, MAX_PLAYERS, VERSION,
+    clean, decode, encode, password_proof, peek_version, resolve, sanitize_name, Packet, PlayerInfo, RejectReason, ServerInfo, Snapshot, WheelExt, FLAG_BRAKE,
+    FLAG_CUSTOM_PAINT, FLAG_METALLIC, FLAG_REVERSE, KIT_SLOTS, KIT_STOCK, LOOK_CAGE, MAX_PLAYERS, NAME_MAX_CHARS, RIM_LEN, VERSION,
 };
 pub use browser::{BrowserRow, ServerBrowser};
 pub use registry::{Heartbeat, Registry, ENTRY_MS, HEARTBEAT_MS};

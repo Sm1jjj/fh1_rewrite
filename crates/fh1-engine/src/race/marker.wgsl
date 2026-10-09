@@ -5,6 +5,7 @@
 // HDR x2, a travelling pulse at 1.2 Hz, near / far distance fades.
 //
 // styles: 0 beam (vertical cylinder: bright core, fades up, rising bands)   1 ground ring (annulus, rotating dashes)
+//         7 laser column (checkpoint / finish)   8 laser emitter lens   9 laser light cone
 //         2 ripple (expanding ground ring)   3 gate curtain (edges + rising scan sweep, see-through middle)
 //         4 floor chevron (pointing +v, pulse travels along the row)   5 finish curtain (chequer)   6 bar (glowing tube)
 //
@@ -169,6 +170,34 @@ fn fragment(i: Out) -> @location(0) vec4<f32> {
         let run = fract(t * i.k.x - i.shape.y * 0.18);
         let travel = 0.35 + 0.65 * exp(-pow((run - 0.5) * 4.0, 2.0));
         a = (body + glow) * mask * travel;
+    } else if (style == 7 || style == 9) {
+        // The game's checkpoint laser (ANIM_GPLY_Laser_Checkpoint: crossed ribbons, streaky additive GR_Laser_* texture,
+        // ~600 m tall) and its light cone (OBJ_LightLaser_DIFF, widening along the beam). u across, w up (0..1 = 600 m).
+        let ym = w * 600.0;
+        let across = 1.0 - abs(2.0 * u - 1.0);
+        let hfade = 0.12 + 0.88 * exp(-ym / 220.0);
+        let top = 1.0 - smoothstep(0.85, 1.0, w);
+        // Streaks along the beam (the texture's horizontal bands), drifting upwards.
+        let streak = 0.72 + 0.28 * sin(ym * 0.21 - t * 2.2) * sin(ym * 0.067 + t * 0.9 + 1.3);
+        if (style == 7) {
+            let prof = pow(across, 2.4) * 0.75 + pow(across, 9.0) * 1.1;
+            a = prof * hfade * streak * top;
+            col = mix(col, vec3<f32>(1.0, 1.0, 1.0) * i.colour.a, 0.35 * pow(across, 12.0) * hfade);
+            // Far away the ribbon is sub-pixel: keep it readable as a thin line.
+            a = a * (1.0 + clamp(dist / 500.0, 0.0, 3.5));
+        } else {
+            a = pow(across, 1.6) * 0.8 * hfade * top * (0.85 + 0.15 * pulse);
+            a = a * (1.0 + clamp(dist / 800.0, 0.0, 2.0));
+        }
+    } else if (style == 8) {
+        // Laser emitter plate (checkpoint_laser: a round lens with two pads; _EMIS = the lit disc): a hot lens, a thin
+        // housing ring and a soft ground glow. w = radius 0..1.
+        let r = w;
+        let lens = 1.0 - smoothstep(0.12, 0.2, r);
+        let ring = band(r, 0.28, 0.035) * 0.45;
+        let halo = exp(-r * 5.5) * 0.55;
+        a = (lens * 1.6 + ring + halo) * (0.85 + 0.15 * pulse);
+        col = mix(col, vec3<f32>(1.0, 1.0, 1.0) * i.colour.a, 0.6 * lens);
     } else {
         // Bar: a tube glowing along its length.
         let facing = abs(dot(i.normal, vdir));

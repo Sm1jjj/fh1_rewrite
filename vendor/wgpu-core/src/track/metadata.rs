@@ -39,6 +39,16 @@ impl<T: Clone> ResourceMetadata<T> {
         self.owned.fill(false);
     }
 
+    /// FH1 patch (P16-A): empties the set in O(owned + size/64) and keeps the length, so a pooled usage scope does not
+    /// drop and refill arrays as long as every resource on the device for each pass (`clear` + `set_size`).
+    pub(super) fn clear_sparse(&mut self) {
+        for index in iterate_bitvec_indices(&self.owned) {
+            // SAFETY: owned indices are < resources.len() (set_size keeps both the same length).
+            unsafe { *self.resources.get_unchecked_mut(index) = None };
+        }
+        self.owned.fill(false);
+    }
+
     /// Ensures a given index is in bounds for all arrays and does
     /// sanity checks of the presence of a refcount.
     ///

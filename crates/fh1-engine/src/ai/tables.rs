@@ -92,6 +92,27 @@ pub struct Player {
     pub rubberband_modifier: i32,
 }
 
+/// TrackStartingMerges row (keyed by the route number = Tracks.RouteId, VERIFIED against the gamedb): how the grid cars
+/// leave their lane and merge onto the line, in racing-line waypoints (docs/AI.md "P17").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StartMerge {
+    pub waypoints_to_first_merge: f32,
+    /// Negative = before the first corner.
+    pub waypoints_before_corner: f32,
+    pub waypoints_between_merges: f32,
+    /// Metres a car may be off the line when it reaches the corner.
+    pub max_offline: f32,
+}
+
+/// The Tracks columns the start uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrackInfo {
+    pub id: u32,
+    /// Tracks.RouteId: the number of the TrackRouteNNN.xml / route_NNN.owt of this track.
+    pub route_id: u32,
+    pub grid_id: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AiTables {
     pub skills: HashMap<u32, Skill>,
@@ -100,6 +121,12 @@ pub struct AiTables {
     pub players: HashMap<u32, Player>,
     /// AILineChoices: skill id -> (LineID, RelativeFrequency).
     pub line_choices: HashMap<u32, Vec<(u32, f32)>>,
+    /// TrackStartingMerges: route number (Tracks_id) -> row. Empty with an ai_tables.json from before ailines-2.
+    pub merges: HashMap<u32, StartMerge>,
+    /// StartGridPositions: grid id -> slots (back from the start line m, right of the centre line m, yaw) by StartIndex.
+    pub grids: HashMap<u32, Vec<(f32, f32, f32)>>,
+    /// Tracks: Tracks.id -> columns.
+    pub tracks: HashMap<u32, TrackInfo>,
 }
 
 /// One driver's resolved parameters.
@@ -175,7 +202,55 @@ impl AiTables {
         for r in rows("AILineChoices") {
             t.line_choices.entry(id(&r, "AISkills_id")).or_default().push((id(&r, "LineID"), f(&r, "RelativeFrequency")));
         }
+        // ailines-2 tables (absent in older files).
+        let num = |r: &Value, k: &str| r[k].as_i64().or_else(|| r[k].as_f64().map(|x| x as i64));
+        for r in rows("TrackStartingMerges") {
+            let Some(route) = num(&r, "Tracks_id") else { continue };
+            t.merges.insert(
+                route as u32,
+                StartMerge {
+                    waypoints_to_first_merge: f(&r, "WaypointsToFirstMerge"),
+                    waypoints_before_corner: f(&r, "WaypointsBeforeCorner"),
+                    waypoints_between_merges: f(&r, "WaypointsBetweenMerges"),
+                    max_offline: f(&r, "MaxStartOfflineDistance"),
+                },
+            );
+        }
+        let mut grid_rows: HashMap<u32, Vec<(i64, (f32, f32, f32))>> = HashMap::new();
+        for r in rows("StartGridPositions") {
+            let (Some(g), Some(i)) = (num(&r, "id").or_else(|| num(&r, "Id")), num(&r, "StartIndex")) else { continue };
+            grid_rows.entry(g as u32).or_default().push((i, (f(&r, "MetersBackFromStartLine"), f(&r, "MetersRightOfCenterLine"), f(&r, "Yaw"))));
+        }
+        for (g, mut slots) in grid_rows {
+            slots.sort_by_key(|s| s.0);
+            t.grids.insert(g, slots.into_iter().map(|s| s.1).collect());
+        }
+        for r in rows("Tracks") {
+            let Some(tid) = num(&r, "id").or_else(|| num(&r, "Id")) else { continue };
+            t.tracks.insert(
+                tid as u32,
+                TrackInfo { id: tid as u32, route_id: num(&r, "RouteId").unwrap_or(-1).max(0) as u32, grid_id: num(&r, "DefaultStartGridPositionsId").map(|g| g as u32) },
+            );
+        }
         t
+    }
+
+    /// The TrackStartingMerges row of a route (None = P9 lane hold / merge rate).
+    pub fn start_merge(&self, route: u32) -> Option<StartMerge> {
+        self.merges.get(&route).copied()
+    }
+
+    /// StartGridPositions of a track (Tracks.id): (metres back from the start line, metres right of the centre line, yaw)
+    /// per grid slot, slot 0 = pole.
+    pub fn grid_offsets(&self, track_id: u32) -> Option<Vec<(f32, f32, f32)>> {
+        let g = self.tracks.get(&track_id)?.grid_id?;
+        self.grids.get(&g).filter(|v| !v.is_empty()).cloned()
+    }
+
+    /// `grid_offsets` for the track that owns route number `route` (lowest Tracks.id when several do).
+    pub fn grid_offsets_for_route(&self, route: u32) -> Option<Vec<(f32, f32, f32)>> {
+        let id = self.tracks.values().filter(|t| t.route_id == route && t.grid_id.is_some()).map(|t| t.id).min()?;
+        self.grid_offsets(id)
     }
 
     /// Resolve a driver: skill / temperament / rubber band ids (0 = defaults) plus the AIPlayers row's modifiers.

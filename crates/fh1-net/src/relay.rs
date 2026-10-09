@@ -12,7 +12,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::proto::{clean, password_proof, Packet, PlayerInfo, RejectReason, ServerInfo, Snapshot, MAP_LEN, MAX_PLAYERS, MOTD_LEN, NAME_LEN, SERVER_NAME_LEN, VERSION};
+use crate::proto::{clean, password_proof, sanitize_name, Packet, PlayerInfo, RejectReason, ServerInfo, Snapshot, MAP_LEN, MAX_PLAYERS, MOTD_LEN, NAME_LEN, SERVER_NAME_LEN, VERSION};
 
 /// Drop a slot that has been silent this long (clients ping every second).
 pub const TIMEOUT_MS: u64 = 10_000;
@@ -221,7 +221,8 @@ impl Relay {
         let Some(i) = self.slots.iter().position(|s| s.is_none()) else { return reply(Packet::Full) };
         self.tokens_made += 1;
         let token = self.secret.hash_one((self.tokens_made, now_ms, from.ip(), from.port(), 0xF1u8)).max(1);
-        let name = { let n = clean(&name, NAME_LEN); if n.trim().is_empty() { format!("Driver {}", i + 1) } else { n } };
+        // The server's name rule (proto `sanitize_name`, same as the launcher's): a newer client already sends it clean.
+        let name = sanitize_name(&clean(&name, NAME_LEN)).unwrap_or_else(|| format!("Driver {}", i + 1));
         self.slots[i] = Some(Slot { addr: from, token, name: name.clone(), info: None, last_ms: now_ms, last_state_ms: None, last_player_ms: None, position: None, sent_to: [None; MAX_PLAYERS] });
         let mut packets = vec![(from, self.welcome(i, token, now_ms))];
         // The newcomer learns who is already here.
@@ -416,7 +417,7 @@ mod tests {
     fn players_learn_each_other_and_names_are_the_servers() {
         let mut r = Relay::new(Config::default());
         let a = join(&mut r, addr(1), 0);
-        let info = PlayerInfo { id: 9, name: "Impostor".into(), car: "VW".into(), paint_seq: 1, paint_rgb: 0, paint_flags: 0 };
+        let info = PlayerInfo { id: 9, name: "Impostor".into(), car: "VW".into(), paint_seq: 1, paint_rgb: 0, paint_flags: 0, rim: String::new(), kit: [crate::proto::KIT_STOCK; crate::proto::KIT_SLOTS], look_flags: 0 };
         r.handle(addr(1), Packet::Player { token: a, info }, 10);
         // The second player gets the first one's PLAYER with the WELCOME, under the server's name and id.
         let h = r.handle(addr(2), hello(0, 0), 20);

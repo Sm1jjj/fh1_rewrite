@@ -11,6 +11,7 @@ pub mod assist;
 pub mod driver;
 pub mod line;
 pub mod profile;
+pub mod start;
 pub mod tables;
 
 use bevy::prelude::*;
@@ -63,6 +64,21 @@ pub struct SpawnRaceAi {
     pub circuit: bool,
     /// Combo_Colors Sequence (EventParticipants colour), 0 = picked from the slot.
     pub paint: u32,
+    /// Tune this car to the event's class band (src/ai/upgrade.rs; None = the stock car).
+    pub tune: Option<AiTuneReq>,
+}
+
+/// What the race asks of an opponent's car (raw PI 0..1; built by race/field.rs from the event's TargetClass, the
+/// EventParticipants.TuningLevel and the slot): the class band the field races in and the PI to tune towards.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AiTuneReq {
+    /// Class floor (MaxPerformanceIndex of the class below) and cap (of the class itself).
+    pub lo: f32,
+    pub hi: f32,
+    /// The PI to tune to (lo..=hi).
+    pub target: f32,
+    /// EventParticipants.TuningLevel (1 = tuned entrant: tuned whenever below `target`).
+    pub tuning_level: u32,
 }
 
 /// Race -> AI: despawn every race AI car.

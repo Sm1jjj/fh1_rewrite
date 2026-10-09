@@ -8,7 +8,7 @@
 //! <root>/bin/fh1-engine.exe     the game
 //! <root>/bin/fh1setup.exe       asset converter (built with --features fh2,fm4)
 //! <root>/bin/extract-xiso.exe   ISO extraction (fh1setup finds it next to itself)
-//! <root>/bin/ffmpeg.exe         XMA audio decoding during setup (FH1_FFMPEG)
+//! <root>/bin/ffmpeg.exe         XMA audio decoding during setup, FMV playback in the game (FH1_FFMPEG)
 //! <root>/data/                  converted assets (installation.json, installations/<id>/...), launcher.json, logs/
 //! ```
 //! Only FH1 is required. Games that are not imported stay locked (greyed) in the game's menus.
@@ -92,7 +92,9 @@ impl Paths {
 }
 
 /// The user's choices, kept in `<data>/launcher.json` so "Update" can re-run setup without asking again.
+/// `serde(default)`: a launcher.json from an older launcher (no `name`) still loads.
 #[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 struct Saved {
     fh1: String,
     own_fh2: bool,
@@ -102,6 +104,33 @@ struct Saved {
     fm4_content: String,
     /// Release whose setup last finished (empty = never).
     release: String,
+    /// Multiplayer display name (the game's `FH1_NAME`, docs/MULTIPLAYER.md "Player name"); empty = the game's default.
+    name: String,
+}
+
+/// Longest display name in characters (the wire field is 24 UTF-8 bytes, fh1-net `NAME_LEN`).
+const NAME_MAX_CHARS: usize = 16;
+
+/// The multiplayer display name `raw` stands for (same rule as fh1-net `proto::sanitize_name`): letters, digits, spaces
+/// and `- _ . '` only (others dropped), runs of spaces collapsed, trimmed, at most 16 characters and 24 bytes. None = fewer
+/// than 2 characters left.
+fn sanitize_name(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        let ok = ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | '\'');
+        if ch.is_whitespace() {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else if ok {
+            if out.chars().count() >= NAME_MAX_CHARS || out.len() + ch.len_utf8() > 24 {
+                break;
+            }
+            out.push(ch);
+        }
+    }
+    let out = out.trim().to_owned();
+    (out.chars().count() >= 2).then_some(out)
 }
 
 enum Msg {
@@ -291,6 +320,15 @@ impl Launcher {
         hide_console(cmd.arg("--data").arg(&self.paths.data).current_dir(&self.paths.root));
         if std::env::var_os("FH1_WINDOW").is_none() {
             cmd.env("FH1_WINDOW", "borderless");
+        }
+        // The name typed on the home screen is the multiplayer name (the game validates it again).
+        if let Some(name) = sanitize_name(&self.saved.name) {
+            cmd.env("FH1_NAME", name);
+        }
+        // The engine decodes the intro / FMV movies with the bundled ffmpeg (fh1-video).
+        let ffmpeg = self.paths.bin.join(format!("ffmpeg{EXE}"));
+        if ffmpeg.is_file() && std::env::var_os("FH1_FFMPEG").is_none() {
+            cmd.env("FH1_FFMPEG", &ffmpeg);
         }
         match log.try_clone() {
             Ok(err) => {
@@ -562,6 +600,8 @@ impl Launcher {
 
     fn ui_home(&mut self, ui: &mut egui::Ui) {
         self.ui_update(ui);
+        self.name_row(ui);
+        ui.add_space(6.0);
         let play_text = if self.game_running { "Running..." } else { "Play" };
         if style::menu_item(ui, play_text, 52.0, !self.game_running, !self.game_running).clicked() {
             self.play(ui.ctx());
@@ -584,6 +624,29 @@ impl Launcher {
 }
 
 impl Launcher {
+    /// The multiplayer name box (saved in launcher.json when it loses focus; passed to the game as FH1_NAME).
+    fn name_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Online name").color(style::DIM));
+            let edit = egui::TextEdit::singleline(&mut self.saved.name).hint_text("Driver").char_limit(32).desired_width(220.0);
+            if ui.add_enabled(!self.game_running, edit).lost_focus() {
+                // Store what the game will show (the sanitized name), or nothing.
+                self.saved.name = sanitize_name(&self.saved.name).unwrap_or_default();
+                self.save();
+            }
+        });
+        let typed = self.saved.name.trim();
+        let note = match sanitize_name(typed) {
+            Some(n) if n == typed => None,
+            Some(n) => Some((format!("Shown online as \"{n}\" (letters, digits, spaces and - _ . ' only; up to {NAME_MAX_CHARS})"), style::ORANGE)),
+            None if typed.is_empty() => Some(("Empty: the game uses your computer's user name, else \"Driver\"".to_owned(), style::DIM)),
+            None => Some(("Too short: at least 2 letters or digits".to_owned(), style::BAD)),
+        };
+        if let Some((text, color)) = note {
+            ui.label(RichText::new(text).size(12.0).color(color));
+        }
+    }
+
     /// Installed games card (bottom right of the home screen).
     fn games_card(&self, ui: &mut egui::Ui) {
         style::panel(ui, |ui| {

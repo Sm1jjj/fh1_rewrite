@@ -272,7 +272,14 @@ const SLIP_FULL: f32 = 6.0;
 /// Path spacing of puffs at full smoke (m); thinner smoke spaces them further apart.
 const SPACING: f32 = 0.3;
 
-fn emit(mut smoke: ResMut<Smoke>, track: Res<Track>, cars: Query<(Entity, Option<&Car>, Option<&AiCar>)>, fixed: Res<Time<Fixed>>, time: Res<Time>) {
+fn emit(
+    mut smoke: ResMut<Smoke>,
+    track: Res<Track>,
+    cars: Query<(Entity, Option<&Car>, Option<&AiCar>)>,
+    remotes: Query<(Entity, &crate::net::RemoteCar)>,
+    fixed: Res<Time<Fixed>>,
+    time: Res<Time>,
+) {
     let smoke = &mut *smoke;
     let dt = time.delta_secs().min(0.1);
     if smoke.weights.is_none() {
@@ -305,6 +312,7 @@ fn emit(mut smoke: ResMut<Smoke>, track: Res<Track>, cars: Query<(Entity, Option
         let hulls: Vec<(Vec3, Vec3, Vec3, f32, [(Vec3, Quat, Vec3); 2])> = cars
             .iter()
             .filter_map(|(_, c, a)| c.map(|c| &c.0).or(a.map(|a| &a.0)))
+            .chain(remotes.iter().map(|(_, r)| &r.vehicle))
             .map(|v| {
                 let (pos, _) = v.render_pose(alpha);
                 let reach = (v.data.bbox[1] - v.data.bbox[0]).length() * 0.5 + 0.3;
@@ -342,6 +350,10 @@ fn emit(mut smoke: ResMut<Smoke>, track: Res<Track>, cars: Query<(Entity, Option
     for (e, car, ai) in &cars {
         let Some(v) = car.map(|c| &c.0).or(if ai_too { ai.map(|a| &a.0) } else { None }) else { continue };
         emit_car(smoke, e, v, &weights, alpha, dt, t);
+    }
+    // Other players' cars (net.rs fills their wheels from the STATE ext, or derives them; FH1_NET_FX=0 = none).
+    for (e, r) in &remotes {
+        emit_car(smoke, e, &r.vehicle, &weights, alpha, dt, t);
     }
 }
 
@@ -643,6 +655,7 @@ fn draw(
     mut materials: ResMut<Assets<SmokeMaterial>>,
     mut vis: Query<(&mut Visibility, &mut Transform, &mut GlobalTransform), (Without<fh1_render::post::FxPostCamera>, Without<DirectionalLight>)>,
     cars: Query<(Option<&Car>, Option<&AiCar>)>,
+    remotes: Query<&crate::net::RemoteCar>,
     fixed: Res<Time<Fixed>>,
     time: Res<Time>,
     (mut half, assets): (Option<ResMut<fh1_render::fx_half_res::FxHalfRes>>, Res<AssetServer>),
@@ -674,6 +687,7 @@ fn draw(
         let mut near: Vec<(f32, &Vehicle)> = cars
             .iter()
             .filter_map(|(c, a)| c.map(|c| &c.0).or(a.map(|a| &a.0)))
+            .chain(remotes.iter().map(|r| &r.vehicle))
             .map(|v| (v.position.distance_squared(cam), v))
             .filter(|(d, _)| *d < 80.0 * 80.0)
             .collect();

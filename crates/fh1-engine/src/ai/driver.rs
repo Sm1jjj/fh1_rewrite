@@ -26,11 +26,12 @@ use bevy::math::Vec3;
 
 use super::line::{Projection, RacingLine};
 use super::profile::{CarLimits, SpeedProfile};
-use super::tables::DriverParams;
+use super::start::{self, BoostInput};
+use super::tables::{DriverParams, StartMerge};
 use crate::vehicle::{Controls, Vehicle};
 
 /// The game's built-in braking / cornering margins on top of the skill factors (VERIFIED).
-const MARGIN: f32 = 0.94;
+pub const MARGIN: f32 = 0.94;
 /// AIRacing.xml (default set).
 const CURB_MARGIN_INNER: f32 = 2.0;
 const CURB_MARGIN_OUTER: f32 = -1.0;
@@ -38,6 +39,12 @@ const CHI_VARIANCE: f32 = 0.1;
 const EXTRA_CAR_WIDTH_AI: f32 = 0.2;
 const LOOK_SLIDE_MAX: f32 = 4.0;
 const LOOK_SLIDE_MIN_DOT: f32 = 0.98;
+/// Pace3: the skill's cornering factor (x margin) is capped here: above ~1.15 the car is past its front tyres' peak (steering at lock,
+/// up to 8 m off the line) and gains nothing; the yaw-rate damping gain of the pursuit (was 0.06: 2-5 m of line error).
+const CORNER_CAP: f32 = 1.15;
+const YAW_DAMP: f32 = 0.4;
+const MAX_LEADER_CUT: f32 = 0.15;
+const CATCH_UP_RAMP_M: f32 = 300.0;
 const RESET_FELL_BELOW: f32 = -50.0;
 const RESET_UPSIDE_DOWN_S: f32 = 3.0;
 const RESET_SLOW_S: f32 = 25.0;
@@ -70,6 +77,39 @@ pub fn ai_aware() -> bool {
     *V.get_or_init(|| std::env::var("FH1_AI_AWARE").map_or(true, |v| v != "0"))
 }
 
+/// FH1_AI_AVOID=0: no extra car-avoidance margins (wider clearance, earlier / larger braking room, longer side caps).
+pub fn ai_avoid() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_AVOID").map_or(true, |v| v != "0"))
+}
+
+/// FH1_AI_SOFT_RECOVERY=0: the old reverse-out when stuck instead of a rate-limited reset onto the line.
+pub fn soft_recovery() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_SOFT_RECOVERY").map_or(true, |v| v != "0"))
+}
+
+/// FH1_AI_PACE2=0: the old pace (margins 0.94, uniform skill draw, early lift at the front slip peak).
+fn pace2() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_PACE2").map_or(true, |v| v != "0"))
+}
+
+/// FH1_AI_PACE3=0: the P18 driver (no gearbox hysteresis against the limiter, P18 rubber band: unlimited torque cut for a
+/// leader, flat +30% catch-up).
+pub fn pace3() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_PACE3").map_or(true, |v| v != "0"))
+}
+
+/// Margin on the skill factors: the game's 0.94, or 0.97 with the pace rule.
+fn margin() -> f32 {
+    if pace2() { 0.97 } else { MARGIN }
+}
+
+/// Minimum seconds between two soft resets of one car.
+const SOFT_RESET_GAP_S: f32 = 3.0;
+
 /// FH1_AI_LANE_HOLD=m: metres after the start an AI keeps its grid lane (120; 0 = old: straight for the racing line).
 fn lane_hold_m() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -81,6 +121,21 @@ fn merge_rate() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("FH1_AI_MERGE_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8f32).max(0.1))
 }
+
+/// FH1_AI_GAME_MERGE=0: the P9 lane hold / merge rate instead of the TrackStartingMerges schedule (docs/AI.md "P17").
+fn game_merge() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_GAME_MERGE").map_or(true, |v| v != "0"))
+}
+
+/// FH1_AI_START_BOOST=0: no RaceStartBoost torque at the start (docs/AI.md "P17").
+fn start_boost_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_AI_START_BOOST").map_or(true, |v| v != "0"))
+}
+
+/// Fastest lateral speed (m/s) the start merge may need to be within MaxStartOfflineDistance at the first corner.
+const MERGE_RATE_MAX: f32 = 3.0;
 
 /// Deceleration (m/s²) the follow rule plans with when closing on a car ahead (FH1_AI_FOLLOW_DECEL, 6).
 fn follow_decel() -> f32 {
@@ -161,6 +216,8 @@ pub struct Situation<'a> {
     /// Race positions ahead of the player (+) or behind (-) this car is, for the catch-up gap per position.
     pub positions_from_player: i32,
     pub obstacles: &'a [Obstacle],
+    /// Distance to the player's car (m); soft resets wait while the player is this close (None = unknown / no player).
+    pub player_distance: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +287,24 @@ pub struct Driver {
     /// Grid lane (m left of the road centre) kept after the start, and the progress where keeping it ends (P9).
     launch_lane: Option<f32>,
     lane_until: f64,
+    /// Grid position (0 = pole) and cars on the grid, player included (`set_grid`); None = no start boost / stagger.
+    grid: Option<(u32, u32)>,
+    /// This route's TrackStartingMerges row (`set_start_merge`).
+    start_merge: Option<StartMerge>,
+    /// MaxStartOfflineDistance while the game's merge schedule is active, else None (P9 merge).
+    merge_plan: Option<f32>,
+    /// Progress by which the merge must be within `merge_plan` metres of the line.
+    merge_by: f64,
+    /// Metres from the grid to the first corner (cached; the outer None = not looked up yet).
+    start_corner: Option<Option<f32>>,
+    /// Progress at the last tick of the hold (= the start line), for the metres driven since GO.
+    go_progress: Option<f64>,
+    /// Soft recovery: seconds the car has been hit / spun / stuck, the clock of the last soft reset, last tick's velocity.
+    bad_timer: f32,
+    last_soft_reset: f32,
+    prev_vel: Vec3,
+    hit_at: f32,
+    moved_once: bool,
 }
 
 /// The driver's decision for one tick.
@@ -245,14 +320,20 @@ pub struct Decision {
 impl Driver {
     /// A driver for `v` on the route `line` (the raw .owt line), starting where the car is. `seed` varies the draws.
     pub fn new(line: &RacingLine, v: &Vehicle, params: DriverParams, seed: u32) -> Self {
+        Self::with_margin(line, v, params, seed, margin())
+    }
+
+    /// `new` with an explicit skill margin (the player's assist keeps the game's 0.94).
+    pub fn with_margin(line: &RacingLine, v: &Vehicle, params: DriverParams, seed: u32, margin: f32) -> Self {
         let mut rng = Rng(seed.wrapping_mul(2_654_435_761).max(1) ^ 0x9E37_79B9);
         let shift = (rng.next() * 2.0 - 1.0) * CHI_VARIANCE;
         let line = Arc::new(line.limited(CURB_MARGIN_INNER, CURB_MARGIN_OUTER, shift));
         let limits = CarLimits::new(v);
-        let k = grip_base() * MARGIN;
+        let k = grip_base() * margin;
         let sk = params.skill;
-        let profile_min = SpeedProfile::compute(&line, &limits, sk.cornering[0] * k, sk.braking[0] * k);
-        let profile_max = SpeedProfile::compute(&line, &limits, sk.cornering[1] * k, sk.braking[1] * k);
+        let ccap = if pace3() && margin == self::margin() { CORNER_CAP } else { f32::MAX };
+        let profile_min = SpeedProfile::compute(&line, &limits, (sk.cornering[0] * k).min(ccap), sk.braking[0] * k);
+        let profile_max = SpeedProfile::compute(&line, &limits, (sk.cornering[1] * k).min(ccap), sk.braking[1] * k);
         let proj = line.project(v.position, None);
         let draw = rng.next();
         Self {
@@ -289,7 +370,41 @@ impl Driver {
             launch_grace: 0.0,
             launch_lane: None,
             lane_until: 0.0,
+            grid: None,
+            start_merge: None,
+            merge_plan: None,
+            merge_by: 0.0,
+            start_corner: None,
+            go_progress: None,
+            bad_timer: 0.0,
+            last_soft_reset: -100.0,
+            prev_vel: Vec3::ZERO,
+            hit_at: -100.0,
+            moved_once: false,
         }
+    }
+
+    /// The race start (docs/AI.md "P17"): this car's grid position (0 = pole; the player is slot 0 in AiRacer, so an AI
+    /// car passes its slot) and the number of cars on the grid, player included. Call it at spawn or every tick of the
+    /// hold; enables the staggered merge and the RaceStartBoost. Without it neither applies.
+    pub fn set_grid(&mut self, index: u32, count: u32) {
+        self.grid = Some((index, count.max(index + 1)));
+    }
+
+    /// The route's TrackStartingMerges row (`AiTables::start_merge`); None = the P9 lane hold.
+    pub fn set_start_merge(&mut self, merge: Option<StartMerge>) {
+        self.start_merge = merge;
+    }
+
+    /// RaceStartBoost for this tick (torque scale added to the driver's multiplier): 0 without a grid, a GO, or when
+    /// FH1_AI_START_BOOST=0.
+    fn start_boost(&self, sit: &Situation, speed: f32) -> f32 {
+        if !start_boost_on() || self.assist_only {
+            return 0.0;
+        }
+        let (Some((index, count)), Some(go)) = (self.grid, self.go_progress) else { return 0.0 };
+        let behind_player = sit.player_progress.is_some_and(|pp| pp - self.progress > start::GAP_PER_CAR as f64);
+        start::start_boost(&BoostInput { index, count, skill_id: self.params.skill.id, driven: (self.progress - go) as f32, behind_player, speed })
     }
 
     /// Profile speed at `s` for the current performance.
@@ -319,12 +434,16 @@ impl Driver {
         self.proj = p;
     }
 
+    fn eff_draw(&self) -> f32 {
+        if pace2() && !self.assist_only { 0.5 + 0.5 * self.draw } else { self.draw }
+    }
+
     /// Skill draw + rubber band for this tick; returns the torque multiplier.
     fn skill_and_rubberband(&mut self, sit: &Situation) -> f32 {
         let sk = self.params.skill;
         let rb = self.params.rubberband;
         let Some(pp) = sit.player_progress else {
-            self.performance = self.draw;
+            self.performance = self.eff_draw();
             return sk.nominal_torque_scale.max(0.1);
         };
         // + = the AI is behind the player.
@@ -339,11 +458,17 @@ impl Driver {
             self.gap_zone = zone;
             self.draw = self.rng.next();
         }
-        self.performance = if gap > sk.dist_behind_for_max { 1.0 } else { self.draw };
+        // Pace rule: the uniform draw lands on the better half of the skill's range on average (0.5 -> 0.75).
+        let draw = self.eff_draw();
+        self.performance = if gap > sk.dist_behind_for_max { 1.0 } else { draw };
         let mut torque = sk.nominal_torque_scale.max(0.1);
         // Torque cut while ahead (0x82B93A18).
         if rb.max_torque_cut > rb.start_torque_cut {
-            let cut = ((ahead - rb.start_torque_cut) / (rb.max_torque_cut - rb.start_torque_cut)).clamp(0.0, 1.0) * rb.torque_cut_factor;
+            let mut cut = ((ahead - rb.start_torque_cut) / (rb.max_torque_cut - rb.start_torque_cut)).clamp(0.0, 1.0) * rb.torque_cut_factor;
+            // Pace3: a leader is never throttled hard (the event rows go to 0.8 = a car crawling 100 m ahead of the player).
+            if pace3() && !self.assist_only {
+                cut = cut.min(MAX_LEADER_CUT);
+            }
             torque *= 1.0 - cut;
         }
         // Torque boost while behind (FarBehindTorqueBoost beyond DistBehindForTorqueBoost, lerping back to 1 at 0).
@@ -360,7 +485,9 @@ impl Driver {
             self.catching_up = false;
         }
         if self.catching_up {
-            torque *= 1.0 + 0.3 * rb.catch_up_factor;
+            // Pace3: the boost grows with the gap (+30% at the start distance, up to +90% 300 m further back).
+            let ramp = if pace3() && !self.assist_only { 1.0 + 2.0 * ((gap - rb.start_catch_up - allowance) / CATCH_UP_RAMP_M).clamp(0.0, 1.0) } else { 1.0 };
+            torque *= 1.0 + 0.3 * rb.catch_up_factor * ramp;
         }
         torque
     }
@@ -399,6 +526,43 @@ impl Driver {
             || self.stuck_attempts >= 3
     }
 
+    /// Soft recovery (FH1_AI_SOFT_RECOVERY): true when the car has been hit and is facing the wrong way / spun, upside down,
+    /// off the road and slow, or stuck for 1.5 s, and a reset is allowed: >= 3 s since the last one, not while the player is
+    /// within 12 m or another car sits on the spot (both wait at most 6 / 8 s). The reset is `reset_on_line`: the nearest
+    /// line point, facing along it.
+    fn soft_reset_due(&mut self, v: &Vehicle, sit: &Situation, dt: f32) -> bool {
+        let speed = v.speed();
+        if (v.velocity - self.prev_vel).length() > 1.0 && self.launch_grace <= 0.0 {
+            self.hit_at = self.clock;
+        }
+        self.prev_vel = v.velocity;
+        let p = self.proj;
+        let fwd = v.rotation * Vec3::NEG_Z;
+        let heading = fwd.dot(self.line.tangent_at(p.s));
+        let up = v.rotation * Vec3::Y;
+        let recently_hit = self.clock - self.hit_at < 3.0;
+        let wrong_way = heading < 0.0 && speed < 12.0;
+        let spun = recently_hit && heading < 0.5 && speed < 15.0;
+        let off_slow = p.lateral.abs() > p.half_width + 1.0 && speed < 3.0;
+        // Not before it has first driven off (a standing start / the grid hold is not stuck).
+        self.moved_once |= speed > 4.0;
+        let stuck = self.moved_once && speed < 1.5 && self.target_speed > 3.0;
+        let flipped = up.y < 0.5 && speed < 5.0;
+        let bad = self.launch_grace <= 0.0 && (wrong_way || spun || off_slow || stuck || flipped);
+        self.bad_timer = if bad { self.bad_timer + dt } else { 0.0 };
+        if self.bad_timer < 1.5 || self.clock - self.last_soft_reset < SOFT_RESET_GAP_S {
+            return false;
+        }
+        if self.bad_timer < 6.0 && sit.player_distance.is_some_and(|d| d < 12.0) {
+            return false;
+        }
+        let spot = self.line.point_at(p.s);
+        if self.bad_timer < 8.0 && sit.obstacles.iter().any(|o| o.position.distance(spot) < 7.0) {
+            return false;
+        }
+        true
+    }
+
     pub fn update(&mut self, v: &mut Vehicle, sit: Situation, dt: f32) -> Decision {
         self.track_progress(v);
         let speed = v.forward_speed();
@@ -417,11 +581,30 @@ impl Driver {
             }
             self.mode = Mode::Drive;
             self.launch_grace = 3.0;
-            // P9: remember the grid lane; it is kept for the first FH1_AI_LANE_HOLD m, then merged onto the line.
-            if ai_aware() && lane_hold_m() > 0.0 && !self.assist_only {
+            self.go_progress = Some(self.progress);
+            // P9: remember the grid lane; it is kept for the first FH1_AI_LANE_HOLD m, then merged onto the line. P17: with
+            // the route's TrackStartingMerges row the lane is kept per the row's schedule instead (start::merge_schedule).
+            let plan = if game_merge() { self.start_merge } else { None };
+            if ai_aware() && (plan.is_some() || lane_hold_m() > 0.0) && !self.assist_only {
                 self.launch_lane = Some(p.lateral);
-                self.lane_until = self.progress + lane_hold_m() as f64;
                 self.lateral_now = Some(p.lateral);
+                match plan {
+                    Some(m) => {
+                        if self.start_corner.is_none() {
+                            self.start_corner = Some(start::first_corner(&self.line, &self.profile_max.v_corner, p.s));
+                        }
+                        let spacing = (self.line.length / self.line.len().max(1) as f32).clamp(0.5, 10.0);
+                        let index = self.grid.map_or(0, |g| g.0);
+                        let sch = start::merge_schedule(&m, index, spacing, self.start_corner.flatten());
+                        self.lane_until = self.progress + sch.from as f64;
+                        self.merge_by = self.progress + sch.by as f64;
+                        self.merge_plan = Some(m.max_offline);
+                    }
+                    None => {
+                        self.lane_until = self.progress + lane_hold_m() as f64;
+                        self.merge_plan = None;
+                    }
+                }
             }
             self.stuck_timer = 0.0;
             self.slow_timer = 0.0;
@@ -431,6 +614,9 @@ impl Driver {
             return out;
         }
 
+        // RaceStartBoost (P17): added to the torque scale of the rubber band (the keys are "scale boosts", 0 = none).
+        out.torque_mult += self.start_boost(&sit, speed);
+
         // ---- recovery ----
         let off_road = p.lateral.abs() > p.half_width + 1.0;
         if off_road && !self.was_off {
@@ -438,6 +624,15 @@ impl Driver {
         }
         self.was_off = off_road;
         if !self.assist_only && self.needs_reset(v, dt) {
+            self.reset_on_line(v);
+            out.reset = true;
+            out.controls = Controls { tcs: true, abs: true, ..Default::default() };
+            self.last = out.controls;
+            return out;
+        }
+
+        // ---- soft recovery: hit / spun / stuck -> a rate-limited reset onto the line (no reversing) ----
+        if soft_recovery() && !self.assist_only && self.soft_reset_due(v, &sit, dt) {
             self.reset_on_line(v);
             out.reset = true;
             out.controls = Controls { tcs: true, abs: true, ..Default::default() };
@@ -455,6 +650,10 @@ impl Driver {
         let my_half_width = me.half_width + EXTRA_CAR_WIDTH_AI * 0.5;
         let tm = self.params.temperament;
         let aware = ai_aware();
+        let avoid = aware && ai_avoid() && !self.assist_only;
+        // Avoidance: keep at least 0.5 m between bodies and treat cars up to 3 m past our length as alongside.
+        let clear = if avoid { tm.car_clearance.max(0.5) } else { tm.car_clearance };
+        let side_slack = if avoid { 3.0 } else { 1.0 };
         let mut follow_speed = f32::MAX;
         let mut want_lateral: Option<f32> = None;
         let path_lat = self.lateral_now.unwrap_or(line_lat);
@@ -470,6 +669,12 @@ impl Driver {
                 holding_lane = true;
             } else {
                 rate = merge_rate();
+                // P17: fast enough to be within MaxStartOfflineDistance of the line by the first corner.
+                if let Some(max_off) = self.merge_plan {
+                    let left = (self.merge_by - self.progress).max(10.0) as f32;
+                    let need = ((path_lat - line_lat).abs() - max_off).max(0.0);
+                    rate = rate.max(need * speed.max(5.0) / left).min(MERGE_RATE_MAX.max(merge_rate()));
+                }
                 if (path_lat - line_lat).abs() < 0.1 {
                     self.launch_lane = None;
                 }
@@ -482,8 +687,8 @@ impl Driver {
                 let rel = o.position - v.position;
                 let along = rel.dot(tangent);
                 let o_lat = p.lateral + rel.dot(lat_unit);
-                let need = my_half_width + o.half_width + tm.car_clearance;
-                if along.abs() < me.half_length + o.half_length + 1.0 && (o_lat - p.lateral).abs() < need + 3.0 {
+                let need = my_half_width + o.half_width + clear;
+                if along.abs() < me.half_length + o.half_length + side_slack && (o_lat - p.lateral).abs() < need + 3.0 {
                     if o_lat > p.lateral {
                         lat_max = lat_max.min(o_lat - need);
                     } else {
@@ -501,7 +706,7 @@ impl Driver {
                 let rel = o2.position - v.position;
                 let along = rel.dot(tangent);
                 let lat = p.lateral + rel.dot(lat_unit);
-                !(along > 0.0 && along < max_along && (lat - l).abs() < my_half_width + o2.half_width + tm.car_clearance)
+                !(along > 0.0 && along < max_along && (lat - l).abs() < my_half_width + o2.half_width + clear)
             })
         };
         for (i, o) in sit.obstacles.iter().enumerate() {
@@ -512,7 +717,7 @@ impl Driver {
             }
             let o_lat = p.lateral + rel.dot(lat_unit);
             let o_speed = o.velocity.dot(tangent);
-            let need = my_half_width + o.half_width + tm.car_clearance;
+            let need = my_half_width + o.half_width + clear;
             let gap_len = along - o.half_length - if aware { me.half_length } else { 2.2 };
             if along > 0.0 && (!aware || gap_len > -1.0) {
                 let closing = speed - o_speed;
@@ -535,8 +740,10 @@ impl Driver {
                     }
                 }
                 // Not clear of it yet (P9): never arrive faster than a braking car could still stop behind it.
-                if aware && in_path && closing > 0.0 {
-                    let room = (gap_len - 1.5 - 0.15 * speed.max(0.0)).max(0.0);
+                // Avoidance: also a car that is under our nose right now (not only on the planned path), and more room.
+                let in_front = avoid && (o_lat - p.lateral).abs() < need;
+                if aware && (in_path || in_front) && closing > 0.0 {
+                    let room = (gap_len - 1.5 - if avoid { 0.3 } else { 0.15 } * speed.max(0.0)).max(0.0);
                     let o_fwd = o_speed.max(0.0);
                     follow_speed = follow_speed.min((o_fwd * o_fwd + 2.0 * follow_decel() * room).sqrt());
                 }
@@ -586,7 +793,7 @@ impl Driver {
         let mut delta = (2.0 * wb * alpha.sin() / ld).atan();
         // Yaw damping: desired yaw rate of the pursuit arc (+ = left in engine space; steering + = right).
         let yaw_des = -speed * 2.0 * alpha.sin() / ld;
-        delta += 0.06 * (v.angular_velocity.y - yaw_des);
+        delta += if pace3() && !self.assist_only { YAW_DAMP } else { 0.06 } * (v.angular_velocity.y - yaw_des);
         let lock = v.steer_lock_at(speed.abs()).max(0.05);
         c.steer = (delta / lock).clamp(-1.0, 1.0);
 
@@ -609,7 +816,11 @@ impl Driver {
         }
         // Fronts past their peak (understeer): lift.
         let front_slip = 0.5 * (v.wheels[0].norm_slip_angle.abs() + v.wheels[1].norm_slip_angle.abs());
-        if front_slip > 0.95 && speed > 10.0 {
+        if pace2() && !self.assist_only {
+            if front_slip > 1.05 && speed > 10.0 {
+                c.throttle = c.throttle.min(0.35);
+            }
+        } else if front_slip > 0.95 && speed > 10.0 {
             c.throttle = c.throttle.min(0.2);
         }
 
@@ -625,7 +836,10 @@ impl Driver {
                     self.stuck_timer = 0.0;
                     self.stuck_attempts = 0;
                 }
-                if self.stuck_timer > 2.0 {
+                if self.stuck_timer > 2.0 && soft_recovery() {
+                    // The soft recovery resets the car instead of reversing out.
+                    self.stuck_timer = 0.0;
+                } else if self.stuck_timer > 2.0 {
                     self.mode = Mode::Reverse;
                     self.mode_timer = 0.0;
                     self.stuck_timer = 0.0;
@@ -640,6 +854,12 @@ impl Driver {
                     self.mode = Mode::Drive;
                 }
             }
+        }
+        // Waiting for a soft reset: coast, never drive (or back) on.
+        if soft_recovery() && !self.assist_only && self.bad_timer > 0.0 {
+            c.throttle = 0.0;
+            c.handbrake = 0.0;
+            c.brake = if v.speed() > 1.0 { 0.4 } else { 0.0 };
         }
         if !self.assist_only {
             self.gearbox(v, dt);
@@ -674,10 +894,15 @@ impl Driver {
             let d = &v.data;
             let now = gear_force(v, v.gear, v.forward_speed());
             let lower = gear_force(v, want, v.forward_speed());
-            if lower > now * 1.03 || road_rpm(v, v.gear, v.forward_speed()) < 0.4 * d.redline_rpm { -1 } else { 0 }
+            // Pace3: not into a gear that would sit at the limiter (it shifted straight back up: 1st <-> 2nd for seconds).
+            let bounce = pace3() && road_rpm(v, want, v.forward_speed()) > 0.9 * rev_limit(d);
+            if !bounce && (lower > now * 1.03 || road_rpm(v, v.gear, v.forward_speed()) < 0.4 * d.redline_rpm) { -1 } else { 0 }
         } else {
             0
         };
+        // Pace rule: the model's road rpm is slightly under the engine's, so the "best gear" can sit in a gear bouncing off
+        // the limiter for seconds (Corrado: 1st at 18.7 m/s for 7 s). Upshift on the engine's own rpm.
+        let request = if request <= 0 && pace2() && v.gear >= 1 && v.gear < v.data.gears.len() && v.rpm > 0.95 * rev_limit(&v.data) { 1 } else { request };
         if request != 0 {
             v.shift_request = request;
             self.shift_wait = 0.0;
@@ -703,6 +928,10 @@ impl Driver {
         self.slow_timer = 0.0;
         self.history.clear();
         self.lateral_now = None;
+        self.bad_timer = 0.0;
+        self.last_soft_reset = self.clock;
+        self.prev_vel = v.velocity;
+        self.hit_at = -100.0;
         self.resets += 1;
     }
 }

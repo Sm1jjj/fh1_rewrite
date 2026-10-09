@@ -16,6 +16,15 @@
 //! in the shader from `globals.time`, so nothing is rewritten per frame. The mesh is padded to power-of-two vertex /
 //! triangle capacities (as fh1-render particles `pad_quad_mesh`) so the mesh allocator reuses the freed range.
 //! Gameplay (gate crossing in race.rs) never reads these entities.
+//!
+//! Checkpoint / finish look (2026-10-09, `FH1_RACE_LASERS=0` = the posts + curtain + chevrons above): the game's own
+//! gameplay objects are `ANIM_GPLY_Laser_Checkpoint` (blue) and `ANIM_GPLY_Final_Laser` (green) in
+//! media/animatedobjects.zip (docs/RACES.md "Original marker data"): per gate a pair of road-level laser emitters (a
+//! flat lens plate, textures `checkpoint_laser` / `_EMIS`) that each shoot a tall laser straight up (two crossed
+//! ribbons, streaky `GR_Laser_Checkpoint` / `_End` additive texture, ~613 m long) wrapped in a widening light cone
+//! (`OBJ_LightLaser_DIFF`, ~757 m). The next gate is lit, the one after is the dim "_Off" state; the finish is the
+//! green set. Reproduced procedurally in marker.wgsl styles 7 (laser), 9 (cone) and 8 (emitter lens), with the
+//! colours of the game's textures (blue 0,0,158 / green 14,158,0 average, HDR so bloom catches them).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -41,6 +50,13 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FH1_RACE_FX").map_or(true, |v| v != "0"))
 }
 
+/// `FH1_RACE_LASERS=0`: the old posts / curtain / chevron gates (merged path only; the lasers are the game's own
+/// checkpoint look, see the module docs).
+pub fn lasers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_RACE_LASERS").map_or(true, |v| v != "0") && merge_on())
+}
+
 /// `FH1_MARKER_MERGE=0`: one entity / draw per marker piece (the path before P14) instead of one merged mesh.
 pub fn merge_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -63,6 +79,16 @@ const FLASH_LIFE: f32 = 0.9;
 fn pink() -> LinearRgba {
     Color::srgb_u8(250, 0, 100).to_linear() * 2.0
 }
+/// The game's checkpoint laser (GR_Laser_Checkpoint average rgb 0,0,158, bright cores near 40,80,255) and the finish
+/// laser (GR_Laser_Final_DIFF 14,158,0), x2.4 HDR.
+fn laser_blue() -> LinearRgba {
+    Color::srgb_u8(30, 60, 255).to_linear() * 2.4
+}
+fn laser_green() -> LinearRgba {
+    Color::srgb_u8(40, 255, 20).to_linear() * 2.4
+}
+/// Length of the game's laser meshes (613 m beams; the shader fades them out well before).
+const LASER_LEN: f32 = 600.0;
 fn street_blue() -> LinearRgba {
     Color::srgb_u8(56, 167, 255).to_linear() * 2.0
 }
@@ -168,6 +194,9 @@ const CURTAIN: u8 = 3;
 const CHEVRON: u8 = 4;
 const FINISH: u8 = 5;
 const BAR: u8 = 6;
+const LASER: u8 = 7;
+const EMITTER: u8 = 8;
+const CONE: u8 = 9;
 
 struct Builder {
     pos: Vec<[f32; 3]>,
@@ -257,6 +286,22 @@ fn curtain_b(style: u8) -> Builder {
     b
 }
 
+/// The laser: two crossed ribbons (X plane and Z plane) of width 1 and height 1; uv = (across, up).
+fn laser_b() -> Builder {
+    let mut b = Builder::new();
+    b.grid(1, 24, LASER, 0.0, |u, w| (Vec3::new(u - 0.5, w, 0.0), Vec3::Z));
+    b.grid(1, 24, LASER, 0.0, |u, w| (Vec3::new(0.0, w, u - 0.5), Vec3::X));
+    b
+}
+
+/// The laser's light cone: crossed ribbons widening from 0.3 to 2.0 over the height.
+fn cone_b() -> Builder {
+    let mut b = Builder::new();
+    b.grid(1, 24, CONE, 0.0, |u, w| (Vec3::new((u - 0.5) * (0.3 + 1.7 * w), w, 0.0), Vec3::Z));
+    b.grid(1, 24, CONE, 0.0, |u, w| (Vec3::new(0.0, w, (u - 0.5) * (0.3 + 1.7 * w)), Vec3::X));
+    b
+}
+
 /// Floor quad (X -0.5..0.5, forward = -Z 0..1); uv.y grows forwards.
 fn floor_quad(style: u8, phase: f32) -> Mesh {
     floor_quad_b(style, phase).build()
@@ -285,6 +330,7 @@ fn build_meshes(mut v: ResMut<Visuals>, mut meshes: ResMut<Assets<Mesh>>, merged
         // Merged path: CPU templates only (indexed by the T_* constants), baked into the merged mesh.
         m.templates = vec![cylinder_b(BEAM), cylinder_b(BAR), annulus_b(0.7, RING), annulus_b(0.05, RIPPLE), curtain_b(CURTAIN), curtain_b(FINISH)];
         m.templates.extend((0..5).map(|k| floor_quad_b(CHEVRON, k as f32)));
+        m.templates.extend([laser_b(), cone_b(), annulus_b(0.0, EMITTER)]);
         return;
     }
     v.meshes.insert("beam", meshes.add(cylinder(BEAM)));
@@ -349,6 +395,7 @@ fn event_markers(
     events: Res<Events>,
     rs: Res<RaceState>,
     cat: Option<Res<EventCatalog>>,
+    states: Option<Res<super::states::MarkerStates>>,
     track: Res<crate::track::Track>,
     cars: Query<&Car>,
     mut vis: Query<&mut Visibility>,
@@ -377,7 +424,9 @@ fn event_markers(
     for (i, root, key) in markers.iter_mut() {
         let r = &events.races[*i];
         let near = r.marker.0.distance(pos) < MARKER_SHOW_M;
-        let want = if idle && near { Visibility::Inherited } else { Visibility::Hidden };
+        let emits = super::states::state_visible(cat.as_ref().and_then(|c| c.events.get(*i)).filter(|e| e.race == *i).map(|e| e.state))
+            && super::states::icon_visible(states.as_ref().and_then(|s| s.get(*i)));
+        let want = if idle && near && emits { Visibility::Inherited } else { Visibility::Hidden };
         if let Ok(mut vv) = vis.get_mut(*root) {
             if *vv != want {
                 *vv = want;
@@ -389,7 +438,11 @@ fn event_markers(
         let info = cat.as_ref().and_then(|c| c.events.get(*i)).filter(|e| e.race == *i);
         let street = r.kind.starts_with("Street") || r.hub > 0;
         let (k, colour, intensity, emph, ripple, height) =
-            marker_look(info.map(|e| e.state), info.map_or(crate::progression::event_tier(r), |e| e.tier), street, info.is_some_and(|e| e.recommended), rs.prompt == Some(*i));
+            super::states::restyle(
+                marker_look(info.map(|e| e.state), info.map_or(crate::progression::event_tier(r), |e| e.tier), street, info.is_some_and(|e| e.recommended), rs.prompt == Some(*i)),
+                states.as_ref().and_then(|s| s.get(*i)),
+                rs.prompt == Some(*i),
+            );
         if *key == k {
             continue;
         }
@@ -600,6 +653,9 @@ const T_RIPPLE: usize = 3;
 const T_CURTAIN: usize = 4;
 const T_FINISH: usize = 5;
 const T_CHEVRON: usize = 6;
+const T_LASER: usize = 11;
+const T_CONE: usize = 12;
+const T_EMITTER: usize = 13;
 
 /// Marks the one merged marker entity.
 #[derive(Component)]
@@ -631,6 +687,7 @@ struct Flash {
     centre: Vec3,
     /// Start scale (the gate's clamped half width).
     scale: f32,
+    colour: LinearRgba,
     /// Birth on the wrapped clock (`globals.time` in the shader).
     birth: f32,
     /// End on the elapsed clock.
@@ -684,6 +741,10 @@ fn gate_pieces(def: &super::RaceDef, done: u32, track: &crate::track::Track) -> 
         let g = *gate(def, n);
         let last = n + 1 == total;
         let strength = if k == 0 { 1.0 } else { 0.35 };
+        if lasers_on() {
+            laser_gate(&mut out, &g, last, strength, track);
+            continue;
+        }
         let colour = if last { LinearRgba::rgb(1.8, 1.8, 1.8) } else { pink() };
         let hw = g.half_width.clamp(6.0, 18.0);
         let base = ground(track, g.centre);
@@ -716,6 +777,24 @@ fn gate_pieces(def: &super::RaceDef, done: u32, track: &crate::track::Track) -> 
         }
     }
     out
+}
+
+/// One gate as the game draws it: a laser emitter at each end of the gate line, each shooting a laser (+ cone) up.
+/// `strength` 1 = the lit next gate, < 1 = the dim one after it (the game's `_Off` object).
+fn laser_gate(out: &mut Vec<Piece>, g: &super::Gate, last: bool, strength: f32, track: &crate::track::Track) {
+    let colour = if last { laser_green() } else { laser_blue() };
+    let hw = g.half_width.clamp(6.0, 18.0);
+    let right = Vec3::new(-g.forward.y, 0.0, g.forward.x);
+    for s in [-1.0f32, 1.0] {
+        let p = ground(track, g.centre + right * (s * hw));
+        let at = Affine3A::from_translation(p);
+        let core = Transform::from_scale(Vec3::new(0.9, LASER_LEN, 0.9));
+        out.push(Piece::new(T_LASER, at * tf(core), colour, 1.5 * strength, [1.5, 6.0, 2600.0, 3800.0], 0.0));
+        let cone = Transform::from_scale(Vec3::new(3.0, LASER_LEN, 3.0));
+        out.push(Piece::new(T_CONE, at * tf(cone), colour, 0.55 * strength, [2.0, 8.0, 2600.0, 3800.0], 0.0));
+        let lens = Transform::from_xyz(0.0, 0.1, 0.0).with_scale(Vec3::splat(2.6));
+        out.push(Piece::new(T_EMITTER, at * tf(lens), colour, 1.3 * strength, [1.0, 4.0, 500.0, 900.0], 0.0));
+    }
 }
 
 /// The pieces of one event marker standing at ground point `p` (same layout and parameters as [`event_markers`]).
@@ -809,6 +888,7 @@ fn merged_markers(
     events: Res<Events>,
     rs: Res<RaceState>,
     cat: Option<Res<EventCatalog>>,
+    states: Option<Res<super::states::MarkerStates>>,
     track: Res<crate::track::Track>,
     time: Res<Time>,
     cars: Query<&Car>,
@@ -838,9 +918,16 @@ fn merged_markers(
                 continue;
             }
             let info = cat.as_ref().and_then(|c| c.events.get(i)).filter(|e| e.race == i);
+            if !super::states::state_visible(info.map(|e| e.state)) || !super::states::icon_visible(states.as_ref().and_then(|s| s.get(i))) {
+                continue;
+            }
             let street = r.kind.starts_with("Street") || r.hub > 0;
             let (key, colour, intensity, emph, ripple, height) =
-                marker_look(info.map(|e| e.state), info.map_or(crate::progression::event_tier(r), |e| e.tier), street, info.is_some_and(|e| e.recommended), rs.prompt == Some(i));
+                super::states::restyle(
+                marker_look(info.map(|e| e.state), info.map_or(crate::progression::event_tier(r), |e| e.tier), street, info.is_some_and(|e| e.recommended), rs.prompt == Some(i)),
+                states.as_ref().and_then(|s| s.get(i)),
+                rs.prompt == Some(i),
+            );
             (i, key).hash(&mut sig);
             m.grounds[i].to_array().map(f32::to_bits).hash(&mut sig);
             shown.push((i, colour, intensity, emph, ripple, height));
@@ -859,7 +946,8 @@ fn merged_markers(
                 if let Some(def) = events.races.get(i) {
                     let g = gate(def, done);
                     let centre = ground(&track, g.centre) + Vec3::Y * 0.2;
-                    m.flashes.push(Flash { centre, scale: g.half_width.clamp(6.0, 18.0), birth: time.elapsed_secs_wrapped(), until: now + FLASH_LIFE });
+                    let colour = if lasers_on() { laser_blue() } else { pink() };
+                    m.flashes.push(Flash { centre, scale: g.half_width.clamp(6.0, 18.0), colour, birth: time.elapsed_secs_wrapped(), until: now + FLASH_LIFE });
                 }
             }
         }
@@ -890,7 +978,7 @@ fn merged_markers(
     let smax = (FLASH_GROW * FLASH_LIFE).exp();
     for f in &m.flashes {
         let xf = Affine3A::from_scale_rotation_translation(Vec3::splat(f.scale * smax), Quat::IDENTITY, f.centre);
-        let mut p = Piece::new(T_RIPPLE, xf, pink(), 1.2, [1.0, 4.0, 400.0, 600.0], 0.0);
+        let mut p = Piece::new(T_RIPPLE, xf, f.colour, 1.2, [1.0, 4.0, 400.0, 600.0], 0.0);
         p.flash = Some(f.birth);
         pieces.push(p);
     }

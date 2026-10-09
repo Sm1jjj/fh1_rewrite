@@ -112,6 +112,11 @@ pub struct CareerData {
     /// Sponsor challenges (SponsorshipChallenges.xml), events-5; empty before (popularity sponsor = built-in copy).
     pub sponsors: Vec<Sponsor>,
     pub economy: Economy,
+    /// Rewards_EventUnlock (events-7): event id -> events that must be completed before it opens (Darius 169 <- Headline 167).
+    /// Empty on older installs. Rows whose required event does not exist are dropped at load.
+    pub unlocked_by: HashMap<u32, Vec<u32>>,
+    /// Required event id -> (profile key = HorizonEventID, display name), for `unlocked_by`.
+    pub unlock_refs: HashMap<u32, (String, String)>,
 }
 
 /// gamedb CareerWristbandLevels (XP, name) x WristbandScoring (points per place).
@@ -191,6 +196,19 @@ impl CareerData {
                 initial: h["initial_events"].as_array().into_iter().flatten().map(|x| u(x) as u32).collect(),
             })
             .collect();
+        for row in p["event_unlocks"].as_array().into_iter().flatten() {
+            let (by, unlocks) = (u(&row["by"]) as u32, u(&row["unlocks"]) as u32);
+            let Some(key) = row["by_horizon"].as_str().filter(|k| !k.is_empty()) else {
+                bevy::log::debug!("progression: Rewards_EventUnlock {by} -> {unlocks}: event {by} does not exist, ignored");
+                continue;
+            };
+            let name = row["by_name"].as_str().filter(|n| !n.is_empty()).unwrap_or(key);
+            d.unlock_refs.insert(by, (key.to_owned(), name.to_owned()));
+            let list = d.unlocked_by.entry(unlocks).or_default();
+            if !list.contains(&by) {
+                list.push(by);
+            }
+        }
         if let Some(c) = p["classes"].as_array().filter(|a| !a.is_empty()) {
             d.classes = c.iter().map(|c| CarClass { name: s(&c["name"]), max_pi: u(&c["max_pi"]) as u32 }).collect();
         }
@@ -294,6 +312,8 @@ impl CareerData {
             wristband_cars: Vec::new(),
             sponsors: Vec::new(),
             economy: Economy::default(),
+            unlocked_by: HashMap::new(),
+            unlock_refs: HashMap::new(),
         }
     }
 

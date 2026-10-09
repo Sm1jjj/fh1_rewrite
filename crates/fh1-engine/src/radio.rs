@@ -42,7 +42,7 @@ struct Radio {
     pending: Vec<(HudPost, f32)>,
     /// The card on screen and when it appeared.
     shown: Option<(String, f32)>,
-    paused_snapshot: bool,
+    snapshot: &'static str,
     /// Mod station index -> its logo (None = no logo.png).
     logos: Vec<(usize, Option<Handle<Image>>)>,
     silent: usize,
@@ -96,7 +96,7 @@ fn start_radio(mut commands: Commands, garage: Res<Garage>, font: Res<UiFont>, m
     for s in &mods {
         info!("radio: mod station \"{}\" ({} tracks)", s.display, player.with(|m| m.data().radio.stations[s.index].playlist.items.len()));
     }
-    commands.insert_resource(Radio { player, env_volume, pending: Vec::new(), shown: None, paused_snapshot: false, logos, silent, gated, applied_volume: -1.0 });
+    commands.insert_resource(Radio { player, env_volume, pending: Vec::new(), shown: None, snapshot: "FreeRoam", logos, silent, gated, applied_volume: -1.0 });
     commands.spawn((
         RadioLogo,
         ImageNode::default(),
@@ -152,21 +152,20 @@ fn radio_gate(radio: Option<ResMut<Radio>>) {
 fn radio_volume(radio: Option<ResMut<Radio>>, settings: Res<Settings>) {
     let _watch = crate::perf::watch("radio_volume");
     let Some(mut radio) = radio else { return };
-    let v = settings.radio_volume * radio.env_volume;
+    let v = if crate::ui::intro::radio_off() { 0.0 } else { settings.radio_volume * radio.env_volume };
     if v != radio.applied_volume && radio.player.try_with(|m| m.volume = v).is_some() {
         radio.applied_volume = v;
     }
 }
 
 /// Gameplay mixer snapshot: `Paused` while the pause menu is open, else `FreeRoam`.
-fn radio_mix(radio: Option<ResMut<Radio>>, menu: Res<Menu>) {
+fn radio_mix(radio: Option<ResMut<Radio>>, menu: Res<Menu>, duck: Option<Res<crate::vo::VoDuck>>) {
     let _watch = crate::perf::watch("radio_mix");
     let Some(mut radio) = radio else { return };
-    if menu.open != radio.paused_snapshot {
-        let name = if menu.open { "Paused" } else { "FreeRoam" };
-        if radio.player.try_with(|m| m.set_snapshot(name)).is_some() {
-            radio.paused_snapshot = menu.open;
-        }
+    // VO ducks the radio (vo.rs VoDuck, the game's VOPlaying snapshot).
+    let name = if menu.open { "Paused" } else if duck.is_some_and(|d| d.0) { "VOPlaying" } else { "FreeRoam" };
+    if name != radio.snapshot && radio.player.try_with(|m| m.set_snapshot(name)).is_some() {
+        radio.snapshot = name;
     }
 }
 

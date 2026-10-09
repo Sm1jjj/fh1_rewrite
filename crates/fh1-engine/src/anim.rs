@@ -61,6 +61,23 @@ struct Piece {
     bone: Option<u32>,
     mesh: Handle<Mesh>,
     material: PieceMaterial,
+    /// Casts into the sun's cascades: false for blended draws (additive / light shaft / alpha pass), see `casts`.
+    cast: bool,
+}
+
+/// Shadow casting rules (`FH1_ANIM_SHADOW_RULES=0` = old: every piece casts): blended pieces (the main / sub stage
+/// light shafts, lasers, strobes, fireworks) are light, not geometry; the hot-air balloons and birds fly far above
+/// the ground, and their cascade shadows read as large dark blobs sweeping the festival (user report 2026-10-09).
+fn shadow_rules_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("FH1_ANIM_SHADOW_RULES").is_ok_and(|v| v == "0"))
+}
+
+/// Objects that never cast (by name part, lower case).
+const NO_SHADOW_OBJECTS: [&str; 4] = ["hotairballoon", "birds_flying", "firework", "showcase_event"];
+
+fn casts(d: Option<&DrawSpec>) -> bool {
+    !shadow_rules_on() || d.is_none_or(|d| d.flags[1] == 0 && !d.light_shaft && d.pass == 0)
 }
 
 /// StandardMaterial, or its FxRawStandard copy while the FH1 post chain expects sqrt-encoded colour
@@ -130,6 +147,7 @@ struct AnimWorld {
     /// Per object: texture slot -> file.
     textures: Vec<HashMap<usize, String>>,
     instances: Vec<Instance>,
+    drive_inst: Option<usize>,
     objects: HashMap<usize, Arc<Loaded>>,
     pending: HashMap<usize, Task<Option<Built>>>,
     images: HashMap<String, (Handle<Image>, bool)>,
@@ -502,6 +520,7 @@ fn stream(
     mut fx: FxParams,
     mut store: ResMut<AnimStore>,
     mut view: ResMut<AnimView>,
+    drive: Option<Res<crate::race::airborne::AirborneDrive>>,
 ) {
     // Colorado only (FH2's Anthem has no converted crowd/animated-object data).
     if !scenery.as_ref().is_some_and(|s| s.colorado) {
@@ -546,9 +565,10 @@ fn stream(
         let bp = bindposes.add(SkinnedMeshInverseBindposes::from(vec![Mat4::IDENTITY; max_bones]));
         let mut pieces = Vec::new();
         for (model, lod, bone, mesh, slot, spec) in b.pieces {
+            let cast = casts(spec.as_ref());
             if let Some(d) = spec {
                 if let Some(m) = fx_material(&d, &w.dir, &w.textures[k], &mut w.fx_images, &mut b.pre_fx, &mut images, &mut fx) {
-                    pieces.push(Piece { model, lod, bone, mesh: meshes.add(mesh), material: PieceMaterial::Fx(m) });
+                    pieces.push(Piece { model, lod, bone, mesh: meshes.add(mesh), material: PieceMaterial::Fx(m), cast });
                     continue;
                 }
                 // StandardMaterial fallback: first-list draws only.
@@ -584,16 +604,31 @@ fn stream(
             } else {
                 PieceMaterial::Std(materials.add(base))
             };
-            pieces.push(Piece { model, lod, bone, mesh: meshes.add(mesh), material });
+            pieces.push(Piece { model, lod, bone, mesh: meshes.add(mesh), material, cast });
         }
         let lights = light_sources(&b.object, &w.dir, &w.textures[k]);
         w.objects.insert(k, Arc::new(Loaded { granny: b.object.granny, pieces, bindposes: bp, lights }));
     }
 
+    let driven = drive.as_ref().filter(|d| d.visible).and_then(|d| {
+        let name = d.object.as_deref()?;
+        Some((w.names.iter().position(|n| n.eq_ignore_ascii_case(name))?, d.clip_t))
+    });
+    if w.drive_inst.is_none() {
+        w.instances.push(Instance { object: 0, place: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], at: here, distances: [f32::MAX; 3] });
+        w.drive_inst = Some(w.instances.len() - 1);
+    }
+    let di = w.drive_inst.unwrap();
+    w.instances[di].at = here;
+    if let Some((o, _)) = driven {
+        if !w.spawned.contains_key(&di) {
+            w.instances[di].object = o;
+        }
+    }
     // Spawn / despawn instances by distance.
     for (i, inst) in w.instances.iter().enumerate() {
         let d = inst.at.distance(here);
-        let want = d <= inst.distances[2] + if w.spawned.contains_key(&i) { KEEP } else { 0.0 };
+        let want = if w.drive_inst == Some(i) { driven.is_some_and(|(o, _)| o == inst.object) } else { d <= inst.distances[2] + if w.spawned.contains_key(&i) { KEEP } else { 0.0 } };
         match (want, w.spawned.contains_key(&i)) {
             (false, true) => {
                 let s = w.spawned.remove(&i).unwrap();
@@ -619,6 +654,8 @@ fn stream(
                     }
                     continue;
                 };
+                let name = w.names.get(inst.object).map(|n| n.to_ascii_lowercase()).unwrap_or_default();
+                let object_casts = !shadow_rules_on() || !NO_SHADOW_OBJECTS.iter().any(|n| name.contains(n));
                 let root = commands.spawn((Transform::default(), Visibility::default(), crate::ui::world_load::WorldEntity)).id();
                 let joints: Vec<Vec<Entity>> = obj.granny.models.iter().map(|m| m.bones.iter().map(|_| commands.spawn((Transform::default(), Visibility::default(), crate::ui::world_load::WorldEntity)).id()).collect()).collect();
                 let mut ents = Vec::new();
@@ -629,6 +666,9 @@ fn stream(
                         PieceMaterial::Raw(m) => e.insert(MeshMaterial3d(m.clone())),
                         PieceMaterial::Fx(m) => e.insert(MeshMaterial3d(m.clone())),
                     };
+                    if !(object_casts && p.cast) {
+                        e.insert(bevy::light::NotShadowCaster);
+                    }
                     if p.bone.is_none() {
                         let mut js = joints.get(p.model).cloned().unwrap_or_default();
                         let n = bindposes.get(&obj.bindposes).map_or(0, |b| b.len());
@@ -648,7 +688,7 @@ fn stream(
         let inst = &w.instances[*i];
         let Some(obj) = w.objects.get(&inst.object) else { continue };
         let d = inst.at.distance(here);
-        store.0.push(Live { place: inst.place, lod_distance: d, distances: inst.distances, object: obj.clone(), joints: s.joints.clone(), meshes: s.meshes.clone() });
+        store.0.push(Live { place: inst.place, lod_distance: d, distances: inst.distances, object: obj.clone(), joints: s.joints.clone(), meshes: s.meshes.clone(), clock: (w.drive_inst == Some(*i)).then(|| driven.map_or(0.0, |d| d.1)) });
     }
 }
 
@@ -749,6 +789,7 @@ struct Live {
     object: Arc<Loaded>,
     joints: Vec<Vec<Entity>>,
     meshes: Vec<(usize, Entity)>,
+    clock: Option<f32>,
 }
 
 #[derive(Resource, Default)]
@@ -782,14 +823,14 @@ fn animate(
     *frame = frame.wrapping_add(1);
     let rate_on = anim_rate_on();
     for (k, live) in store.0.iter().enumerate() {
-        if rate_on && (eye.is_none() || live.object.lights.is_empty()) {
+        if rate_on && live.clock.is_none() && (eye.is_none() || live.object.lights.is_empty()) {
             let every = if live.lod_distance < ANIM_NEAR { 1 } else if live.lod_distance < ANIM_MID { 2 } else { 4 };
             if (*frame + k as u64) % every != 0 {
                 continue;
             }
         }
         let g = &live.object.granny;
-        let poses: Vec<Vec<Mat4>> = (0..g.models.len()).map(|mi| g.pose(mi, t).iter().map(|p| to_engine(&granny::mat_mul(&live.place, p))).collect()).collect();
+        let poses: Vec<Vec<Mat4>> = (0..g.models.len()).map(|mi| g.pose(mi, live.clock.unwrap_or(t)).iter().map(|p| to_engine(&granny::mat_mul(&live.place, p))).collect()).collect();
         // Light attachments: local (left-handed) -> engine through the bone's engine-space pose.
         for src in &live.object.lights {
             let (Some(eye), Some(m)) = (eye, poses.get(src.model).and_then(|p| p.get(src.bone as usize))) else { continue };

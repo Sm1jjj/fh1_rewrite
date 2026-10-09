@@ -316,8 +316,13 @@ fn calculate_contact_shadow(
 
     let depth_size = vec2<f32>(textureDimensions(view_bindings::depth_prepass_texture));
     var rm = raymarch::depth_ray_march_new_from_depth(depth_size);
-    raymarch::depth_ray_march_from_cs(&rm, position_world_to_ndc(world_position));
-    raymarch::depth_ray_march_to_ws(&rm, world_position + light_dir * view_bindings::contact_shadows_settings.length);
+    // FH1 patch 9: start the march a few pixel footprints toward the light. Under MSAA the depth prepass is read at
+    // sample 0 only, a fraction of a pixel off the shaded point, so on sloped surfaces the very first jittered step
+    // "hit" the surface itself: shallow penetration = full shadow = scattered black / dark pixels (car paint, lamps).
+    let fh1_eye_dist = distance(view_bindings::view.world_position, world_position);
+    let fh1_start = world_position + light_dir * clamp(fh1_eye_dist * 0.004, 0.01, 0.15);
+    raymarch::depth_ray_march_from_cs(&rm, position_world_to_ndc(fh1_start));
+    raymarch::depth_ray_march_to_ws(&rm, fh1_start + light_dir * view_bindings::contact_shadows_settings.length);
     rm.linear_steps = contact_shadow_steps;
     rm.depth_thickness_linear_z = view_bindings::contact_shadows_settings.thickness;
     rm.march_behind_surfaces = true;

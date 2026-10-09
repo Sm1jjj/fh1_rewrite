@@ -86,6 +86,7 @@ impl AiLink<'_, '_> {
             route_file: def.route_file.clone(),
             circuit: def.circuit,
             paint: e.color_seq,
+            tune: e.tune,
             ..Default::default()
         });
         self.last.remove(&slot);

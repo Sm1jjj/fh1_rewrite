@@ -8,8 +8,12 @@
 //! tyre width / rim size keeping the stock outer diameter, ChassisStiffness friction scales. Here only what replaces whole
 //! blocks: the camshaft's torque curve, spring / damper and anti-roll bar rows, the tyre compound.
 //! `FH1_UPG_RULES=0` = the old INFERRED reading (chosen / stock ratios applied here).
-//! Not offered yet: engine swaps (need the new engine's part set exported), front bumper / rear wing aero elements (the
-//! sim has no aero elements yet; body-kit slots are 15's customize.rs), sell-back.
+//! Engine swaps are the `List_UpgradeEngine` row; the body kit rows (front bumper / rear wing aero, skirts, hood) are
+//! customize.rs kit slots and go through here as `upgrades` rows too. The rim style is the pseudo-table
+//! [`RIM_TABLE`] (List_Wheels.ID): its mass joins the MassDiff sum as `Mass(fitted) - Mass(stock wheel)` (82BF4FB0).
+//! No sell-back (the game keeps no refund rule). The garage API for the menus is [`garage_api`] (P17).
+
+pub mod garage_api;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -54,6 +58,25 @@ const BARS: [(&str, &str, &str); 2] = [("Platform", "List_UpgradeAntiSwayFront",
 
 const BOOST: [&str; 5] = ["List_UpgradeEngineTurboSingle", "List_UpgradeEngineTurboTwin", "List_UpgradeEngineTurboQuad", "List_UpgradeEngineCSC", "List_UpgradeEngineDSC"];
 
+/// The rim style in `upgrades` (garage.json): List_Wheels.ID of the fitted aftermarket rim (ui/customize.rs `rim` is its
+/// media name; the garage API keeps both). Not a part table of the doc.
+pub const RIM_TABLE: &str = "List_Wheels";
+
+/// Rim style mass in the sums (`FH1_UPG_RIM_MASS=0` = old: the rim style was visual only).
+pub fn rim_mass_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_UPG_RIM_MASS").map_or(true, |v| v != "0"))
+}
+
+/// Body kit slots: (garage.json `kit` key, gamedb table, label, carbin section stems). Same as customize.rs KIT_SLOTS.
+pub const KIT_SLOTS: [(&str, &str, &str, &[&str]); 5] = [
+    ("front_bumper", "List_UpgradeCarBodyFrontBumper", "Front bumper", &["bumperf"]),
+    ("rear_bumper", "List_UpgradeCarBodyRearBumper", "Rear bumper", &["bumperr"]),
+    ("side_skirts", "List_UpgradeCarBodySideSkirt", "Side skirts", &["skirtl", "skirtr"]),
+    ("hood", "List_UpgradeCarBodyHood", "Hood", &["hood"]),
+    ("rear_wing", "List_UpgradeRearWing", "Rear wing", &["wing"]),
+];
+
 /// A car's bought parts: gamedb table -> row Ids (garage.json `owned_parts`; row Ids repeat across tables).
 pub type OwnedParts = BTreeMap<String, Vec<i64>>;
 
@@ -67,11 +90,19 @@ pub fn enabled() -> bool {
 #[derive(Clone, Debug)]
 pub struct Part {
     pub table: &'static str,
+    /// "Area · Label" (the old menu row).
     pub label: String,
+    /// Category ("Engine", "Aspiration", "Drivetrain", "Platform", "Tyres") and the short part name.
+    pub area: &'static str,
+    pub name: &'static str,
     /// (row Id, option name, short effect vs stock).
     pub options: Vec<(i64, String, String)>,
     /// Shop price of each option (gamedb `Price`, credits), index-aligned with `options`; 0 for stock / "None".
     pub prices: Vec<u32>,
+    /// gamedb `Level` of each option (index-aligned; -1 = "None").
+    pub levels: Vec<i64>,
+    /// Index-aligned: the stock row (or "None").
+    pub stock: Vec<bool>,
 }
 
 impl Part {
@@ -131,7 +162,25 @@ pub fn record_owned(part: &Part, i: usize, owned: &mut OwnedParts) {
 }
 
 pub fn read_doc(assets: &Path, car: &str) -> Value {
-    std::fs::read(assets.join("upgrades/cars").join(format!("{car}.json"))).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let mut doc: Value = std::fs::read(assets.join("upgrades/cars").join(format!("{car}.json"))).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    // The aftermarket rims' masses (List_Wheels.ID -> Mass) for the rim style's MassDiff (`fit`).
+    if doc.is_object() {
+        doc["_rim_mass"] = rim_masses(assets).clone();
+    }
+    doc
+}
+
+/// `upgrades/rims.json` as {"<List_Wheels.ID>": Mass}, read once.
+fn rim_masses(assets: &Path) -> &'static Value {
+    static V: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let rims: Value = std::fs::read(assets.join("upgrades/rims.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let map: serde_json::Map<String, Value> = rims
+            .as_array()
+            .map(|a| a.iter().filter_map(|r| Some((r["id"].as_i64()?.to_string(), r["mass"].clone()))).collect())
+            .unwrap_or_default();
+        Value::Object(map)
+    })
 }
 
 fn rows<'a>(doc: &'a Value, table: &str) -> &'a [Value] {
@@ -189,10 +238,14 @@ pub fn catalog(doc: &Value) -> Vec<Part> {
             let stock = stock_row(doc, table);
             let mut options: Vec<(i64, String, String)> = Vec::new();
             let mut prices: Vec<u32> = Vec::new();
+            let mut levels: Vec<i64> = Vec::new();
+            let mut stocks: Vec<bool> = Vec::new();
             // A car without the part (e.g. no turbo): an implicit "None" option first.
             if stock.is_none() {
                 options.push((-1, "None".into(), String::new()));
                 prices.push(0);
+                levels.push(-1);
+                stocks.push(true);
             }
             for r in rows {
                 let Some(id) = r["Id"].as_i64() else { continue };
@@ -209,8 +262,10 @@ pub fn catalog(doc: &Value) -> Vec<Part> {
                 let name = if options.iter().any(|o| o.1 == name) { format!("{name} {}", options.len()) } else { name };
                 options.push((id, name, effect(r, stock)));
                 prices.push(if is_stock { 0 } else { num(r, "Price").unwrap_or(0.0).max(0.0) as u32 });
+                levels.push(r["Level"].as_i64().unwrap_or(0));
+                stocks.push(is_stock);
             }
-            (options.len() > 1).then(|| Part { table, label: format!("{area} · {label}"), options, prices })
+            (options.len() > 1).then(|| Part { table, label: format!("{area} · {label}"), area, name: label, options, prices, levels, stock: stocks })
         })
         .collect()
 }
@@ -283,6 +338,7 @@ fn fit(p: &mut Value, doc: &Value, chosen: &BTreeMap<String, i64>) {
                     p["stock_parts"][t.as_str()] = clean;
                     if t == "List_UpgradeEngineCamshaft" && !stock["_torque_curve"].is_null() {
                         p["torque_curve"] = stock["_torque_curve"].clone();
+                        p["_curve_changed"] = serde_json::json!(true);
                     }
                 }
             }
@@ -297,6 +353,15 @@ fn fit(p: &mut Value, doc: &Value, chosen: &BTreeMap<String, i64>) {
         }
     }
     for (table, &id) in chosen {
+        if table == RIM_TABLE {
+            // The rim style (82BF4FB0): MassDiff = List_Wheels.Mass(fitted) - Mass(stock wheel); data.rs also takes the
+            // fitted Mass for the wheel inertia (82D33530 reads a wheel row: INFERRED that it is the fitted one).
+            let stock = p["wheel"]["Mass"].as_f64();
+            if let (true, Some(mass), Some(stock)) = (rim_mass_on() && id >= 0, doc["_rim_mass"][id.to_string()].as_f64(), stock) {
+                p["stock_parts"][RIM_TABLE] = serde_json::json!({ "Id": id, "Mass": mass, "MassDiff": mass - stock });
+            }
+            continue;
+        }
         if table == SWAP_TABLE && id >= 0 {
             // The swap row itself (MassDiff / WeightDistDiff / DragScale join the sums).
             if let Some(row) = rows(doc, table).iter().find(|r| r["Id"].as_i64() == Some(id)) {
@@ -321,7 +386,13 @@ fn fit(p: &mut Value, doc: &Value, chosen: &BTreeMap<String, i64>) {
         }
         p["stock_parts"][table.as_str()] = clean;
         match table.as_str() {
-            "List_UpgradeEngineCamshaft" if !row["_torque_curve"].is_null() => p["torque_curve"] = row["_torque_curve"].clone(),
+            "List_UpgradeEngineCamshaft" if !row["_torque_curve"].is_null() => {
+                p["torque_curve"] = row["_torque_curve"].clone();
+                // Not the stock curve: data.rs re-derives the peak-power rpm from it (SimPeakAngVel is the stock car's).
+                if row["IsStock"].as_i64() != Some(1) {
+                    p["_curve_changed"] = serde_json::json!(true);
+                }
+            }
             "List_UpgradeSpringDamper" => {
                 if !row["_front"].is_null() {
                     p["suspension"]["front"] = row["_front"].clone();
@@ -391,7 +462,13 @@ pub fn patch(p: &mut Value, doc: &Value, chosen: &BTreeMap<String, i64>) {
         }
         p["stock_parts"][table.as_str()] = clean;
         match table.as_str() {
-            "List_UpgradeEngineCamshaft" if !row["_torque_curve"].is_null() => p["torque_curve"] = row["_torque_curve"].clone(),
+            "List_UpgradeEngineCamshaft" if !row["_torque_curve"].is_null() => {
+                p["torque_curve"] = row["_torque_curve"].clone();
+                // Not the stock curve: data.rs re-derives the peak-power rpm from it (SimPeakAngVel is the stock car's).
+                if row["IsStock"].as_i64() != Some(1) {
+                    p["_curve_changed"] = serde_json::json!(true);
+                }
+            }
             "List_UpgradeSpringDamper" => {
                 if !row["_front"].is_null() {
                     p["suspension"]["front"] = row["_front"].clone();

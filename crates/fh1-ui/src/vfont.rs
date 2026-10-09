@@ -157,6 +157,14 @@ impl Font {
         self.glyphs.get(&c).or_else(|| self.glyphs.get(&char::from_u32(self.default_char as u32)?))
     }
 
+    /// Width of a single line in em, as the engine lays it out: glyph advances (spaces use the font's space width) plus
+    /// `track` em after each character.
+    pub fn text_width(&self, s: &str, track: f32) -> f32 {
+        s.chars()
+            .map(|c| track + if c == ' ' { self.metrics.space_width } else { self.glyph(c).map_or(0.0, |g| g.advance) })
+            .sum()
+    }
+
     /// Line height in em: (winAscent + winDescent) / EM (GUESS).
     pub fn line_height(&self) -> f32 {
         let m = &self.metrics;

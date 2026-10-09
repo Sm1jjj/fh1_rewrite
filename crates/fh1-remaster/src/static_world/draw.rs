@@ -45,7 +45,7 @@ use bevy::render::mesh::{MeshVertexBufferLayoutRef, MeshVertexBufferLayouts};
 use bevy::render::render_resource::binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer};
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer, BufferDescriptor, BufferUsages, CachedComputePipelineId,
-    CachedRenderPipelineId, CompareFunction, ComputePassDescriptor, ComputePipelineDescriptor, DepthBiasState, DepthStencilState, DynamicUniformBuffer,
+    CachedRenderPipelineId, CompareFunction, ComputePass, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, DepthBiasState, DepthStencilState, DynamicUniformBuffer,
     Face, FragmentState, IndexFormat, PipelineCache, PrimitiveState, RenderPassDescriptor, RenderPipelineDescriptor, ShaderStages, ShaderType,
     SpecializedMeshPipeline, SpecializedRenderPipeline, SpecializedRenderPipelines, StencilState, StoreOp, VertexState,
 };
@@ -121,6 +121,23 @@ fn shadow_nomat_on() -> bool {
     *V.get_or_init(|| flag_on("FH1_SW_SHADOW_NOMAT"))
 }
 
+/// P16-A: fewer compute passes. The cascades' culls run as one compute pass (one dispatch per cascade), and the Hi-Z
+/// pyramid + the phase-2 cull run as one compute pass with cached bind groups. wgpu-core resets a usage scope sized to
+/// every buffer / texture alive on the device for each pass, so a pass costs the render thread more than its dispatches.
+/// Dispatches inside a compute pass get their own barriers, so the results are the same.
+fn pass_merge_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| flag_on("FH1_SW_PASS_MERGE"))
+}
+
+/// P16-A: the main view's pre-pass (and its cull, in the cascades' cull pass) is recorded by `draw_static_shadows`, so
+/// both share one command buffer (each buffer costs a wgpu submit-time walk of every bind group it used plus an internal
+/// transition buffer). The pre-pass then runs just before the main pass set instead of at its start.
+fn enc_merge_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| flag_on("FH1_SW_ENC_MERGE"))
+}
+
 fn env_f32(k: &str, default: f32) -> f32 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -174,7 +191,8 @@ pub(super) fn plugin(ra: &mut SubApp) {
         .add_systems(Render, (resolve_materials, build_lists).chain().in_set(RenderSystems::PrepareResources).after(super::apply_ops))
         .add_systems(Render, (init_pipelines, specialize_views).chain().in_set(RenderSystems::Queue))
         .add_systems(Render, (prepare_views, prepare_bind_groups).chain().in_set(RenderSystems::PrepareBindGroups))
-        .add_systems(Core3d, draw_static_shadows.after(bevy::pbr::per_view_shadow_pass::<true>).before(Core3dSystems::MainPass))
+        // After Bevy's prepass too: with FH1_SW_ENC_MERGE it also records the main view's pre-pass.
+        .add_systems(Core3d, draw_static_shadows.after(bevy::pbr::per_view_shadow_pass::<true>).after(Core3dSystems::Prepass).before(Core3dSystems::MainPass))
         // P15-A pre-pass: after Bevy's own prepass (contact shadows' DepthPrepass copies the depth at its end, so their
         // input is unchanged), before the main opaque pass.
         .add_systems(Core3d, draw_static_prepass.after(draw_static_shadows).before(main_opaque_pass_3d).in_set(Core3dSystems::MainPass))
@@ -427,7 +445,8 @@ pub(super) struct SwViewPipelines {
     pre: HashMap<Variant, CachedRenderPipelineId>,
 }
 
-/// The main view runs the P15-A pre-pass this frame (prepare_views): its first cull is dispatched by draw_static_prepass.
+/// The main view runs the P15-A pre-pass this frame (prepare_views): its first cull is dispatched by draw_static_prepass
+/// (by draw_static_shadows with FH1_SW_ENC_MERGE).
 #[derive(Component, Clone, Copy)]
 pub(super) struct SwPrepass;
 
@@ -1029,18 +1048,43 @@ fn cull_ready(cache: &PipelineCache, cull: &CullPipeline, uniforms: &ViewUniform
 
 /// Culls the view's candidates into its args region.
 fn dispatch_cull(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipeline, uniforms: &ViewUniforms, lists: &DrawLists, view: &SwCullView, count: u32) -> bool {
-    let (Some(p), Some(bg)) = (cache.get_compute_pipeline(cull.id), uniforms.cull_bind_group.as_ref()) else { return false };
+    dispatch_culls(ctx, cache, cull, uniforms, lists, &[*view], count)
+}
+
+/// Clears the draw counts of `views` (compaction), before the pass that culls them. False = the cull can't run.
+fn clear_counts(ctx: &mut RenderContext, cull: &CullPipeline, lists: &DrawLists, views: &[SwCullView]) -> bool {
     if cull.compact {
         let Some(counts) = lists.counts.as_ref() else { return false };
-        ctx.command_encoder().clear_buffer(counts, view.counts as u64 * 4, Some(lists.bins_cap as u64 * 4));
+        for v in views {
+            ctx.command_encoder().clear_buffer(counts, v.counts as u64 * 4, Some(lists.bins_cap as u64 * 4));
+        }
+    }
+    true
+}
+
+/// One cull dispatch per view, in the current compute pass (each view writes its own args / counts region).
+fn cull_in_pass(pass: &mut ComputePass<'_>, p: &ComputePipeline, bg: &BindGroup, views: &[SwCullView], count: u32) {
+    pass.set_pipeline(p);
+    for v in views {
+        pass.set_bind_group(0, bg, &[v.offset]);
+        pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+    }
+}
+
+/// Culls every view of `views` in one compute pass (P16-A; one view = the old per-view pass).
+fn dispatch_culls(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipeline, uniforms: &ViewUniforms, lists: &DrawLists, views: &[SwCullView], count: u32) -> bool {
+    let (Some(p), Some(bg)) = (cache.get_compute_pipeline(cull.id), uniforms.cull_bind_group.as_ref()) else { return false };
+    if views.is_empty() {
+        return true;
+    }
+    if !clear_counts(ctx, cull, lists, views) {
+        return false;
     }
     let recorder = ctx.diagnostic_recorder();
     let diagnostics = recorder.as_deref();
     let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor { label: Some("static world cull"), timestamp_writes: None });
     let span = diagnostics.pass_span(&mut pass, "static_world_cull");
-    pass.set_pipeline(p);
-    pass.set_bind_group(0, bg, &[view.offset]);
-    pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+    cull_in_pass(&mut pass, p, bg, views, count);
     span.end(&mut pass);
     true
 }
@@ -1121,7 +1165,8 @@ fn draw_static_world(
     }
     // Culled: this view's region (+ its draw counts when compacted).
     let (Some(cv), Some(cull)) = (cull_view, cull.as_ref()) else { return };
-    // With the P15-A pre-pass, draw_static_prepass already culled this view (same readiness test).
+    // With the P15-A pre-pass, draw_static_prepass (draw_static_shadows with FH1_SW_ENC_MERGE) already culled this view
+    // (same readiness test).
     if prepassed {
         if !cull_ready(&cache, cull, &uniforms) {
             return;
@@ -1133,9 +1178,22 @@ fn draw_static_world(
     // Hi-Z phase 2 (main view): pyramid from the depth so far, occlusion-tested cull, the newly visible.
     if let (Some(SwCullViewHiz(cv2)), Some(pipes)) = (hiz_view, hiz_pipes.as_ref()) {
         if hiz.active {
-            hiz.build(&mut ctx, &cache, pipes, &device, depth.view());
-            if dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv2, lists.count) {
+            // P16-A (FH1_SW_PASS_MERGE): pyramid + phase-2 cull in one compute pass.
+            let mut merged = false;
+            if pass_merge_on() {
+                if let (Some(p), Some(bg)) = (cache.get_compute_pipeline(cull.id), uniforms.cull_bind_group.as_ref()) {
+                    if clear_counts(&mut ctx, cull, &lists, &[*cv2]) {
+                        merged = hiz.build_with(&mut ctx, &cache, pipes, &device, depth.view(), &mut |pass: &mut ComputePass<'_>| cull_in_pass(pass, p, bg, &[*cv2], lists.count));
+                    }
+                }
+            }
+            if merged {
                 draw(&mut ctx, cv2.base, compact.then_some(cv2.counts));
+            } else {
+                hiz.build(&mut ctx, &cache, pipes, &device, depth.view());
+                if dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv2, lists.count) {
+                    draw(&mut ctx, cv2.base, compact.then_some(cv2.counts));
+                }
             }
         }
     }
@@ -1144,6 +1202,7 @@ fn draw_static_world(
 /// P15-A partial depth pre-pass (main view, before Bevy's main opaque pass): culls the main view (phase 1 with Hi-Z) and
 /// draws the occluder class depth-only, position-only, into the main depth. The lit pass then shades those pixels once
 /// and depth-rejects what they hide (ECS opaque included); the Hi-Z pyramid is reduced from the same depth later.
+/// With FH1_SW_ENC_MERGE (default) `draw_static_shadows` records it instead and this system records nothing.
 #[allow(clippy::too_many_arguments)]
 fn draw_static_prepass(
     view: ViewQuery<(&ExtractedCamera, &ViewDepthTexture, Option<&SwViewPipelines>, Option<&SwCullView>), With<SwPrepass>>,
@@ -1155,12 +1214,33 @@ fn draw_static_prepass(
     allocators: Res<MaterialBindGroupAllocators>,
     mut ctx: RenderContext,
 ) {
+    if enc_merge_on() {
+        return;
+    }
     let (camera, depth, pipelines, cull_view) = view.into_inner();
     let (Some(cv), Some(cull)) = (cull_view, cull.as_ref()) else { return };
     // The cull runs here whatever else is missing: draw_static_world relies on it for this view.
     if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
         return;
     }
+    record_prepass(&mut ctx, camera, depth, pipelines, cv, &arena, &lists, &uniforms, cull, &cache, &allocators);
+}
+
+/// The pre-pass's depth-only draws (its cull already dispatched).
+#[allow(clippy::too_many_arguments)]
+fn record_prepass(
+    ctx: &mut RenderContext,
+    camera: &ExtractedCamera,
+    depth: &ViewDepthTexture,
+    pipelines: Option<&SwViewPipelines>,
+    cv: &SwCullView,
+    arena: &Arena,
+    lists: &DrawLists,
+    uniforms: &ViewUniforms,
+    cull: &CullPipeline,
+    cache: &PipelineCache,
+    allocators: &MaterialBindGroupAllocators,
+) {
     let (Some(pipelines), Some((_, arena_bg)), Some(args), Some(ib), Some(view_bg), Some(counts)) =
         (pipelines, lists.arena_bind_group.as_ref(), lists.args.as_ref(), arena.index_buffer(), uniforms.shadow_view_bind_group.as_ref(), lists.counts.as_ref())
     else {
@@ -1213,9 +1293,15 @@ fn draw_bin<'a>(pass: &mut bevy::render::render_phase::TrackedRenderPass<'a>, ar
 }
 
 /// Static scenery into the main camera's directional cascades (after Bevy's shadow pass, same depth attachments).
+/// P16-A: with FH1_SW_PASS_MERGE the cascades are culled in one compute pass; with FH1_SW_ENC_MERGE the main view's
+/// pre-pass (cull included) is recorded here too, after the cascades, so they share one command buffer.
 #[allow(clippy::too_many_arguments)]
 fn draw_static_shadows(
-    view: ViewQuery<&ViewLightEntities>,
+    view: ViewQuery<(
+        Option<&ViewLightEntities>,
+        Option<(&ExtractedCamera, &ViewDepthTexture, Option<&SwViewPipelines>, &SwCullView)>,
+        Has<SwPrepass>,
+    )>,
     lights: Query<(&ShadowView, Option<&SwCullView>)>,
     arena: Res<Arena>,
     lists: Res<DrawLists>,
@@ -1226,58 +1312,93 @@ fn draw_static_shadows(
     allocators: Res<MaterialBindGroupAllocators>,
     mut ctx: RenderContext,
 ) {
-    if !shadows_on() || !cull_on() || lists.bins.is_empty() {
+    if !cull_on() || lists.bins.is_empty() {
         return;
     }
-    let view_lights = view.into_inner();
-    let (Some(cull), Some((_, arena_bg)), Some(args), Some(ib), Some(view_bg)) =
-        (cull.as_ref(), lists.arena_bind_group.as_ref(), lists.args.as_ref(), arena.index_buffer(), uniforms.shadow_view_bind_group.as_ref())
-    else {
-        return;
+    let Some(cull) = cull.as_ref() else { return };
+    let (view_lights, pre_view, prepassed) = view.into_inner();
+    let pre = if enc_merge_on() && prepassed { pre_view } else { None };
+    // Only the cascades prepare_views gave a slot (skipped / cached cascades have none).
+    let cascades: Vec<(&ShadowView, SwCullView)> = match view_lights {
+        Some(vl) if shadows_on() => vl
+            .lights
+            .iter()
+            .filter_map(|&le| match lights.get(le) {
+                Ok((sv, Some(cv))) => Some((sv, *cv)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     };
-    let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
-    let Some(shadow) = shadow else { return };
-    let counts = if cull.compact { lists.counts.as_ref() } else { None };
-    let recorder = ctx.diagnostic_recorder();
-    let diagnostics = recorder.as_deref();
-    for &le in &view_lights.lights {
-        // Only the cascades prepare_views gave a slot (skipped / cached cascades have none).
-        let Ok((shadow_view, Some(cv))) = lights.get(le) else { continue };
-        if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
-            continue;
+    if cascades.is_empty() && pre.is_none() {
+        return;
+    }
+    let batched = pass_merge_on();
+    if batched {
+        let mut views: Vec<SwCullView> = cascades.iter().map(|c| c.1).collect();
+        views.extend(pre.map(|p| *p.3));
+        if !dispatch_culls(&mut ctx, &cache, cull, &uniforms, &lists, &views, lists.count) {
+            return;
         }
-        let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("static_world_shadow"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(shadow_view.depth_attachment.get_attachment(StoreOp::Store)),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_bind_group(0, view_bg, &[cv.offset]);
-        pass.set_bind_group(1, arena_bg, &[]);
-        pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-        let span = diagnostics.pass_span(&mut pass, "static_world_shadow");
-        for &b in &lists.shadow_order {
-            let bin = &lists.bins[b as usize];
-            // Cascades: far = all casters, near = the in-band (dithered) ones (P15-A fade mode 1); no occluder class.
-            let dithered = match bin.class {
-                CLASS_FAR => false,
-                CLASS_NEAR if lists.split && shadow_dither_on() => true,
-                _ => continue,
-            };
-            let Some(id) = lists.shadow_pipelines.get(&(bin.variant, dithered)) else { continue };
-            let Some(p) = cache.get_render_pipeline(*id) else { continue };
-            // Same rule as ShadowPipeline::specialize: only alpha-tested (bindless) cutouts read the material table.
-            if !(shadow_nomat_on() && !(bin.variant.mask && shadow.bindless)) {
-                let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
-                let Some(material_bg) = slab.bind_group() else { continue };
-                pass.set_bind_group(2, material_bg, &[]);
+    }
+    'cascades: {
+        if cascades.is_empty() {
+            break 'cascades;
+        }
+        let (Some((_, arena_bg)), Some(args), Some(ib), Some(view_bg)) =
+            (lists.arena_bind_group.as_ref(), lists.args.as_ref(), arena.index_buffer(), uniforms.shadow_view_bind_group.as_ref())
+        else {
+            break 'cascades;
+        };
+        let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { break 'cascades };
+        let Some(shadow) = shadow.as_ref() else { break 'cascades };
+        let counts = if cull.compact { lists.counts.as_ref() } else { None };
+        let recorder = ctx.diagnostic_recorder();
+        let diagnostics = recorder.as_deref();
+        for (shadow_view, cv) in &cascades {
+            if !batched && !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
+                continue;
             }
-            pass.set_render_pipeline(p);
-            draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, b, bin);
+            let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("static_world_shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(shadow_view.depth_attachment.get_attachment(StoreOp::Store)),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, view_bg, &[cv.offset]);
+            pass.set_bind_group(1, arena_bg, &[]);
+            pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+            let span = diagnostics.pass_span(&mut pass, "static_world_shadow");
+            for &b in &lists.shadow_order {
+                let bin = &lists.bins[b as usize];
+                // Cascades: far = all casters, near = the in-band (dithered) ones (P15-A fade mode 1); no occluder class.
+                let dithered = match bin.class {
+                    CLASS_FAR => false,
+                    CLASS_NEAR if lists.split && shadow_dither_on() => true,
+                    _ => continue,
+                };
+                let Some(id) = lists.shadow_pipelines.get(&(bin.variant, dithered)) else { continue };
+                let Some(p) = cache.get_render_pipeline(*id) else { continue };
+                // Same rule as ShadowPipeline::specialize: only alpha-tested (bindless) cutouts read the material table.
+                if !(shadow_nomat_on() && !(bin.variant.mask && shadow.bindless)) {
+                    let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
+                    let Some(material_bg) = slab.bind_group() else { continue };
+                    pass.set_bind_group(2, material_bg, &[]);
+                }
+                pass.set_render_pipeline(p);
+                draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, b, bin);
+            }
+            span.end(&mut pass);
         }
-        span.end(&mut pass);
+    }
+    // The main view's pre-pass (FH1_SW_ENC_MERGE); draw_static_world relies on its cull for this view.
+    if let Some((camera, depth, pipelines, cv)) = pre {
+        if !batched && !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
+            return;
+        }
+        record_prepass(&mut ctx, camera, depth, pipelines, cv, &arena, &lists, &uniforms, cull, &cache, &allocators);
     }
 }
 

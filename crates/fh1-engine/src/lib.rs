@@ -9,3 +9,5 @@ pub mod ai;
 pub mod traffic;
 pub mod vehicle;
 pub mod world;
+#[path = "sfx_world/queue.rs"]
+pub mod sfx_queue;

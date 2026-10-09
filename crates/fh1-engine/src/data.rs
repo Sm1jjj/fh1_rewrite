@@ -611,6 +611,33 @@ pub fn upgrade_rules_on() -> bool {
     *V.get_or_init(|| std::env::var("FH1_UPG_RULES").map_or(true, |v| v != "0"))
 }
 
+/// P17 per-axle unsprung delta (docs/CUSTOMIZE.md "Sums"): front = 0.5 x (MassDiff of RimSizeFront + TireWidthFront) +
+/// 0.25 x (fitted - stock List_Wheels.Mass), rear likewise. The game stores it in the spring block (+0x84, 82BF4FB0) but
+/// its consumer is not traced, so adding it to the unsprung mass is INFERRED. Stock cars get 0.
+/// `FH1_UPG_UNSPRUNG=0` = old (unsprung is UNSPRUNG_KG on every car).
+fn upg_unsprung_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_UPG_UNSPRUNG").map_or(true, |v| v != "0"))
+}
+
+/// P17: an upgraded torque curve (non-stock camshaft or an engine swap, customize_upgrades.rs `_curve_changed`) gets its
+/// peak-power rpm from the curve (argmax of torque x rpm up to the redline) instead of the stock car's SimPeakAngVel
+/// (the zero-throttle drag knee, `engine_drag`). INFERRED (the game's source of that rpm on an upgraded car is not
+/// traced). `FH1_UPG_PEAK_RPM=0` = old (always SimPeakAngVel).
+fn upg_peak_rpm_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_UPG_PEAK_RPM").map_or(true, |v| v != "0"))
+}
+
+/// rpm of peak (unboosted) power on `samples` (0..=max_rpm), searched up to `redline`.
+fn curve_peak_power_rpm(samples: &[f32], max_rpm: f32, redline: f32) -> Option<f32> {
+    if samples.len() < 2 || max_rpm <= 0.0 {
+        return None;
+    }
+    let top = redline.min(max_rpm).max(1000.0);
+    (0..=200).map(|i| top * i as f32 / 200.0).map(|rpm| (rpm, sample(samples, rpm / max_rpm) * rpm)).max_by(|a, b| a.1.total_cmp(&b.1)).map(|(rpm, _)| rpm).filter(|&r| r > 900.0)
+}
+
 /// The fitted boost system's RobScale lowers S (stock turbo / SC cars: S = 0.89-0.94 in the game). `FH1_ROBSCALE=0` =
 /// ignore it (before 2026-10-08).
 fn robscale_on() -> bool {
@@ -787,12 +814,21 @@ impl CarData {
         // deflection delta is fitted to the live Viper (front 8.47 mm, rear 10.53 mm) as 0.0973 x sidewall height
         // (+-1.6% on that car): the writer of wheel+0x3B0 and the game's own rule are not located (UNVERIFIED rule).
         let mut suspension = [susp("front", "anti_sway_front")?, susp("rear", "anti_sway_rear")?];
+        // P17 per-axle unsprung delta (INFERRED consumer, `upg_unsprung_on`).
+        if rules && upg_unsprung_on() {
+            let md = |t: &str| parts[t]["MassDiff"].as_f64().unwrap_or(0.0) as f32;
+            let wheel = parts["List_Wheels"]["MassDiff"].as_f64().unwrap_or(0.0) as f32;
+            let front = 0.5 * (md("List_UpgradeRimSizeFront") + md("List_UpgradeCarBodyTireWidthFront")) + 0.25 * wheel;
+            let rear = 0.5 * (md("List_UpgradeRimSizeRear") + md("List_UpgradeCarBodyTireWidthRear")) + 0.25 * wheel;
+            suspension[0].unsprung = (UNSPRUNG_KG + front).max(5.0);
+            suspension[1].unsprung = (UNSPRUNG_KG + rear).max(5.0);
+        }
         {
             let share = (f(weight, "CMBackFront")? + dist_diff).clamp(0.01, 0.99);
             let mass = f(weight, "Mass")? + mass_diff;
             for (axle, end) in ["Front", "Rear"].iter().enumerate() {
                 let sidewall = f(car, &format!("{end}TireWidthMM"))? * 0.001 * f(car, &format!("{end}TireAspect"))? * 0.01;
-                let corner = mass * if axle == 0 { share } else { 1.0 - share } * 0.5 + UNSPRUNG_KG;
+                let corner = mass * if axle == 0 { share } else { 1.0 - share } * 0.5 + suspension[axle].unsprung;
                 let delta = (TYRE_DEFLECTION_PER_SIDEWALL * sidewall).max(0.003);
                 suspension[axle].tyre_k = corner * 9.81 / delta;
             }
@@ -870,7 +906,8 @@ impl CarData {
             // WheelInertiaAdd (0.25), WheelInertiaMinClamp (1.82)) kg·m² (live Corrado 1.82 on all four wheels). The
             // tyre compound's MomentInertia is not used on this path. One value for all wheels: the larger axle's.
             wheel_inertia: {
-                let quarter = f(&p["wheel"], "Mass").unwrap_or(40.0) * 0.25;
+                // The fitted rim style's List_Wheels.Mass when one is fitted (customize_upgrades.rs RIM_TABLE).
+                let quarter = f(&parts["List_Wheels"], "Mass").or_else(|_| f(&p["wheel"], "Mass")).unwrap_or(40.0) * 0.25;
                 let r = tyre("FrontTireWidthMM", "FrontTireAspect", "FrontWheelDiameterIN")?
                     .max(tyre("RearTireWidthMM", "RearTireAspect", "RearWheelDiameterIN")?);
                 (0.5 * quarter * r * r + 0.25).max(1.82)
@@ -883,7 +920,14 @@ impl CarData {
             torque_scale: f(tc, "torque_scale_nm")? * f(car, "GameTorqueScale").unwrap_or(1.0).clamp(0.5, 1.5) * engine_s,
             zero_throttle_nm: f(tc, "zero_throttle_nm").unwrap_or_else(|_| 0.46 * f(tc, "torque_scale_nm").unwrap_or(300.0))
                 * f(car, "GameTorqueScale").unwrap_or(1.0).clamp(0.5, 1.5),
-            peak_power_rpm: f(car, "SimPeakAngVel").map(|w| w * 60.0 / std::f32::consts::TAU).unwrap_or(0.0),
+            peak_power_rpm: {
+                let stock = f(car, "SimPeakAngVel").map(|w| w * 60.0 / std::f32::consts::TAU).unwrap_or(0.0);
+                let curve: Vec<f32> = tc["samples"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default();
+                match p["_curve_changed"].as_bool() {
+                    Some(true) if upg_peak_rpm_on() => curve_peak_power_rpm(&curve, f(tc, "max_rpm").unwrap_or(0.0), f(cam, "RedlineRPM").unwrap_or(7000.0)).unwrap_or(stock),
+                    _ => stock,
+                }
+            },
             offroad_power_scale: f(car, "OffRoadEnginePowerScale").unwrap_or(1.0),
             torque_curve_max_rpm: f(tc, "max_rpm")?,
             redline_rpm: f(cam, "RedlineRPM")?,

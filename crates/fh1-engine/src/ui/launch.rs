@@ -402,8 +402,10 @@ pub fn main_menu(
     (mut actions, mut switch): (MessageWriter<super::GameAction>, ResMut<super::world_load::MapSwitch>),
     (mut typed, mut net_join): (MessageReader<bevy::input::keyboard::KeyboardInput>, ResMut<crate::net::NetConnect>),
     profile: Option<Res<crate::progression::Profile>>,
+    mut snd: MessageWriter<super::sfx::UiSfx>,
 ) {
-    if !ld.on_launch() {
+    // A boot movie is up, or its skip press was just swallowed (ui/intro.rs).
+    if !ld.on_launch() || super::intro::blocking() || crate::cutscene::swallowing() {
         return;
     }
     let now = time.elapsed_secs();
@@ -437,18 +439,22 @@ pub fn main_menu(
     match &mut menu.screen {
         Screen::Title => {
             if pressed(&keys, &mouse, &pads) {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::ACCEPT));
                 menu.screen = Screen::Modes { cursor: 0 };
                 menu.dirty = true;
             }
         }
         Screen::Modes { cursor } => {
             if input.vertical != 0 {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::VSCROLL));
                 *cursor = (*cursor as i32 + input.vertical).rem_euclid(modes.len() as i32) as usize;
                 menu.dirty = true;
             } else if input.back {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::CANCEL));
                 menu.screen = Screen::Title;
                 menu.dirty = true;
             } else if input.confirm {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::ACCEPT));
                 match modes.get(*cursor).map(|m| m.0) {
                     Some("HORIZON") => {
                         // Greyed worlds count too: without FH2 the list still opens to show it.
@@ -477,7 +483,13 @@ pub fn main_menu(
                 menu.dirty = true;
             }
         }
-        Screen::Worlds(b) => match b.step(input) {
+        Screen::Worlds(b) => match {
+            let p = b.step(input);
+            if let Some(s) = super::sfx::pick(&p) {
+                snd.write(s);
+            }
+            p
+        } {
             Pick::Browsing { changed } => menu.dirty |= changed,
             Pick::Leave => {
                 menu.screen = Screen::Modes { cursor: 0 };
@@ -486,7 +498,13 @@ pub fn main_menu(
             Pick::Map(id) => start = Some(WorldChoice { track: id, car: Some(car_now), mode: Mode::Horizon, start: None }),
             Pick::Car(_) => {}
         },
-        Screen::Tracks(b) => match b.step(input) {
+        Screen::Tracks(b) => match {
+            let p = b.step(input);
+            if let Some(s) = super::sfx::pick(&p) {
+                snd.write(s);
+            }
+            p
+        } {
             Pick::Browsing { changed } => menu.dirty |= changed,
             Pick::Leave => {
                 menu.screen = Screen::Modes { cursor: modes.iter().position(|m| m.0 == "MOTORSPORT").unwrap_or(0) };
@@ -501,7 +519,13 @@ pub fn main_menu(
             }
             Pick::Car(_) => {}
         },
-        Screen::Cars(b) => match b.step(input) {
+        Screen::Cars(b) => match {
+            let p = b.step(input);
+            if let Some(s) = super::sfx::pick(&p) {
+                snd.write(s);
+            }
+            p
+        } {
             Pick::Browsing { changed } => menu.dirty |= changed,
             Pick::Leave => {
                 let current = menu.track.as_ref().map_or_else(String::new, |t| t.0.clone());
@@ -518,13 +542,16 @@ pub fn main_menu(
         },
         Screen::Sessions { cursor, list } => {
             if input.vertical != 0 {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::VSCROLL));
                 *cursor = (*cursor as i32 + input.vertical).rem_euclid(list.len().max(1) as i32) as usize;
                 menu.dirty = true;
             } else if input.back {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::CANCEL));
                 let cat = owned_catalog(menu.catalog.clone().unwrap_or_else(|| catalog_for(&garage.assets, &garage.cars)));
                 menu.screen = Screen::Cars(CarBrowser::new(cat, menu.car.unwrap_or(car_now)));
                 menu.dirty = true;
             } else if input.confirm {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::ACCEPT));
                 if let (Some(s), Some((id, _))) = (list.get(*cursor), menu.track.as_ref()) {
                     if s.kind.as_deref() != Some("ai") {
                         start = Some(WorldChoice { track: id.clone(), car: menu.car, mode: Mode::Motorsport, start: s.kind.clone() });
@@ -532,7 +559,22 @@ pub fn main_menu(
                 }
             }
         }
-        Screen::Online(o) => match o.step(&input, &typed, &keys, &menu.horizon) {
+        Screen::Online(o) => match {
+            let p = o.step(&input, &typed, &keys, &menu.horizon);
+            match &p {
+                OnlinePick::Browsing { changed: true } => {
+                    snd.write(super::sfx::UiSfx::play(super::sfx::keys::VSCROLL));
+                }
+                OnlinePick::Leave => {
+                    snd.write(super::sfx::UiSfx::play(super::sfx::keys::CANCEL));
+                }
+                OnlinePick::Join { .. } => {
+                    snd.write(super::sfx::UiSfx::play(super::sfx::keys::ACCEPT));
+                }
+                _ => {}
+            }
+            p
+        } {
             OnlinePick::Browsing { changed } => menu.dirty |= changed,
             OnlinePick::Leave => {
                 menu.screen = Screen::Modes { cursor: modes.iter().position(|m| m.0 == "ONLINE").unwrap_or(0) };

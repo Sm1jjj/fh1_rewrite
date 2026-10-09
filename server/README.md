@@ -29,6 +29,13 @@ journalctl -u fh1-server@colorado -f
 More maps = more config files and instances (each with its own `bind` port), e.g. `fh1-server@anthem` with
 `map = fh2/anthem` and `bind = 0.0.0.0:7778`.
 
+### Updating (2026-10-09: looks / tyre FX ext)
+
+Same protocol version (2): old and new clients still join each other's servers. Puppets show rims, body kits and
+tyre smoke only through an updated server (an old one relays the packets without the new fields). On the dev machine
+`server/server.sh pack`, copy `dist/fh1-server.tar.gz` to the box, unpack over the old folder, `./server.sh setup`
+(rebuilds), then `sudo systemctl restart fh1-server@<name>`.
+
 ## Windows
 
 `server.bat` (repo root): uses `server\server.cfg` when present; `server.bat --registry` runs the list.

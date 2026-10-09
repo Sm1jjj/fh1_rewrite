@@ -81,6 +81,9 @@ pub struct PropCollision {
     colliders: Option<Colliders>,
     loading: Option<Task<Option<Colliders>>>,
     broken: HashSet<u32>,
+    /// Generated edge walls switched off along a running race's path, and the race they were computed for.
+    edge_off: HashSet<u32>,
+    edge_off_race: Option<usize>,
     /// Smashed this tick (collider, car velocity at impact), consumed by [`update`].
     pending: Vec<(u32, Vec3)>,
     /// Time spent in prop sphere queries (ns) and their count, for `FH1_SMASH_STATS=1`.
@@ -93,7 +96,7 @@ impl PropCollision {
     pub fn start(&mut self, dir: &Path, world: Option<std::sync::Arc<fh1_engine::world::WorldGround>>) {
         let dir = dir.to_path_buf();
         self.loading = Some(AsyncComputeTaskPool::get().spawn(async move {
-            let mut cols = load(&dir);
+            let mut cols = load(&dir, world.as_deref());
             // Edge walls work without a prop table too.
             if let Some(w) = world.filter(|_| edge_walls_enabled()) {
                 let t0 = std::time::Instant::now();
@@ -118,7 +121,7 @@ impl PropCollision {
             .filter_map(move |k| cols.and_then(|c| c.grid.get(&k)))
             .flatten()
             .copied()
-            .filter(|i| !self.broken.contains(i))
+            .filter(|i| !self.broken.contains(i) && !self.edge_off.contains(i))
     }
 
     /// After the car's physics substeps: the smashed objects take their share of the car's momentum.
@@ -152,15 +155,66 @@ impl PropCollision {
         self.colliders.is_some()
     }
 
+    /// Switches the generated edge walls off within 10 m of a race's racing line (None = back on): races run on roads whose
+    /// verges and event ground the free-roam edge rule knows nothing about, so a wall there is an invisible trap.
+    pub fn set_edge_suppress(&mut self, race: Option<usize>, path: &[Vec3]) {
+        self.edge_off.clear();
+        self.edge_off_race = race;
+        let Some(cols) = self.colliders.as_ref().filter(|_| race.is_some()) else { return };
+        const R: f32 = 10.0;
+        let mut seen = HashSet::new();
+        let mut visit = |p: Vec3| {
+            let (x0, x1) = (((p.x - R) / CELL).floor() as i32, ((p.x + R) / CELL).floor() as i32);
+            let (z0, z1) = (((p.z - R) / CELL).floor() as i32, ((p.z + R) / CELL).floor() as i32);
+            for x in x0..=x1 {
+                for z in z0..=z1 {
+                    for &i in cols.grid.get(&(x, z)).into_iter().flatten() {
+                        let c = &cols.list[i as usize];
+                        if c.key.0 != i32::MIN || c.key.1 != 0 || !seen.insert(i) {
+                            continue;
+                        }
+                        if let Some(Shape::Box { centre, .. }) = c.shapes.first() {
+                            if (centre.x - p.x).hypot(centre.z - p.z) <= R {
+                                self.edge_off.insert(i);
+                            }
+                            // Not within range of this sample: may be of the next.
+                            else {
+                                seen.remove(&i);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        for w in path.windows(2) {
+            let n = ((w[0].distance(w[1]) / 4.0).ceil() as usize).max(1);
+            for k in 0..n {
+                visit(w[0].lerp(w[1], k as f32 / n as f32));
+            }
+        }
+        if let Some(&p) = path.last() {
+            visit(p);
+        }
+    }
+
+    pub fn edge_suppress_race(&self) -> Option<usize> {
+        self.edge_off_race
+    }
+
     /// Adds a solid box per object: (template, placement matrix, template-space bounds). Never breaks (the race
     /// objects are drawn outside the props path, so a smash couldn't remove them). Returns the ids for [`Self::remove`].
-    pub fn add_solid_boxes(&mut self, objects: &[(u16, Mat4, Vec3, Vec3)]) -> Vec<u32> {
+    pub fn add_solid_boxes(&mut self, objects: &[(u16, Mat4, Vec3, Vec3)], keep_clear: &[Vec3]) -> Vec<u32> {
         let Some(cols) = self.colliders.as_mut() else { return Vec::new() };
         let mut ids = Vec::with_capacity(objects.len());
         for (k, &(template, m, lo, hi)) in objects.iter().enumerate() {
             let (scale, rot, _) = m.to_scale_rotation_translation();
             let half = (hi - lo) * scale.abs() * 0.5;
             let centre = m.transform_point3((lo + hi) * 0.5);
+            // A box standing over the car or a grid / gate point would wedge the car inside it: skip it.
+            let axes = Mat3::from_quat(rot);
+            if keep_clear.iter().any(|p| (axes.transpose() * (*p - centre)).abs().cmplt(half + Vec3::splat(1.5)).all()) {
+                continue;
+            }
             let id = cols.list.len() as u32;
             let r = half.length();
             let (x0, x1) = (((centre.x - r) / CELL).floor() as i32, ((centre.x + r) / CELL).floor() as i32);
@@ -254,7 +308,7 @@ fn edge_walls(w: &fh1_engine::world::WorldGround) -> Vec<Shape> {
         let mut left = depth + 3.0;
         while left > 0.0 {
             let Some(h) = world.raycast(o, [0.0, -1.0, 0.0], left) else { return false };
-            if is_ground(h.tri) && world.tris[h.tri as usize].routes & FREE != 0 {
+            if is_ground(h.tri) && world.tris[h.tri as usize].routes != 0 {
                 return true;
             }
             let step = h.t + 0.01;
@@ -313,7 +367,9 @@ fn edge_walls(w: &fh1_engine::world::WorldGround) -> Vec<Shape> {
 /// Minimum half thickness of a wall collider (m): fences are 0.1-0.2 m thick, the car's contact spheres ~0.3 m.
 const WALL_MIN_HALF: f32 = 0.2;
 
-fn load(dir: &Path) -> Option<Colliders> {
+fn load(dir: &Path, track: Option<&fh1_engine::world::WorldGround>) -> Option<Colliders> {
+    let fence_break = track.filter(|_| std::env::var("FH1_FENCE_BREAK").map_or(true, |v| v != "0"));
+    let mut free_standing_walls = 0usize;
     let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("index.json")).ok()?).ok()?;
     let col = &idx["props"]["collision"];
     let v3 = |v: &serde_json::Value| Some(Vec3::new(v[0].as_f64()? as f32, v[1].as_f64()? as f32, v[2].as_f64()? as f32));
@@ -389,11 +445,14 @@ fn load(dir: &Path) -> Option<Colliders> {
             let (scale, rot, pos) = m.to_scale_rotation_translation();
             let scale = scale.abs();
             let size = (hi - lo) * scale;
+            let mut free_wall = false;
             let shape = if !smash && walls.contains(&template) {
                 let mut half = size * 0.5;
                 half.x = half.x.max(WALL_MIN_HALF);
                 half.z = half.z.max(WALL_MIN_HALF);
-                Shape::Box { centre: m.transform_point3((lo + hi) * 0.5), axes: Mat3::from_quat(rot), half }
+                let centre = m.transform_point3((lo + hi) * 0.5);
+                free_wall = fence_break.is_some_and(|w| free_standing(&w.world, centre, Mat3::from_quat(rot), half));
+                Shape::Box { centre, axes: Mat3::from_quat(rot), half }
             } else if !smash && solid.get(&template).copied().unwrap_or(false) {
                 // Trunk: thin relative to the canopy (UNVERIFIED radius).
                 Shape::Trunk { base: pos + rot * (Vec3::new(0.0, lo.y, 0.0) * scale), height: size.y, radius: (0.03 * size.y).clamp(0.15, 0.45) }
@@ -416,6 +475,13 @@ fn load(dir: &Path) -> Option<Colliders> {
             if !smash {
                 break_speed = f32::INFINITY;
             }
+            // A fence / wall of ours standing on drivable ground with ground on both sides and no `.fiz` wall behind it has no
+            // collision in the game (props are only solid through the mesh or CollObjs): it breaks on contact instead.
+            if free_wall {
+                free_standing_walls += 1;
+                mass = Some(FREE_WALL_MASS);
+                break_speed = FREE_WALL_BREAK_SPEED;
+            }
             let id = out.list.len() as u32;
             let (c, r) = match shape {
                 Shape::Box { centre, half, .. } => (centre, half.length()),
@@ -432,7 +498,60 @@ fn load(dir: &Path) -> Option<Colliders> {
             out.list.push(Collider { shapes, break_speed, key: (tx, tz, i as u32), template, matrix: m, mass });
         }
     }
+    if free_standing_walls > 0 {
+        info!("smash: {free_standing_walls} free-standing fence / wall colliders break on contact (FH1_FENCE_BREAK=0 = solid)");
+    }
     Some(out)
+}
+
+/// Mass (kg) and break speed (m/s) of a free-standing fence / wall (see [`free_standing`]): light, breaks at a crawl.
+const FREE_WALL_MASS: f32 = 6.0;
+const FREE_WALL_BREAK_SPEED: f32 = 0.3;
+
+/// Whether a wall-prop box (engine space) is a fence in the open: no free-roam `.fiz` wall behind it (probed at three points along
+/// it) and free-roam ground within 2 m of its base 2 m beyond each face at all three points. The game has no collision for such a
+/// prop (fences are solid only through the mesh, or as CollObjs smashables), so a driver can pass; where the ground ends on one
+/// side (a road edge above the void) the box stays solid. Barn finds sit behind such fences (docs/SMASH.md "Barn finds").
+fn free_standing(world: &fh1_world::World, centre: Vec3, axes: Mat3, half: Vec3) -> bool {
+    const FREE: u16 = fh1_engine::world::FREE_ROAM;
+    let col = |v: Vec3| [v.x, v.y, if fh1_engine::world::MIRROR_Z { -v.z } else { v.z }];
+    let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).normalize_or_zero();
+    let (long, thin, hl, ht) = if half.x >= half.z { (flat(axes.x_axis), flat(axes.z_axis), half.x, half.z) } else { (flat(axes.z_axis), flat(axes.x_axis), half.z, half.x) };
+    if long == Vec3::ZERO || thin == Vec3::ZERO {
+        return false;
+    }
+    let base = centre.y - half.y;
+    let normal_y = |ti: u32| {
+        let p = world.tri_points(ti);
+        let (a, b, c) = (Vec3::from(p[0]), Vec3::from(p[1]), Vec3::from(p[2]));
+        (b - a).cross(c - a).normalize_or_zero().y.abs()
+    };
+    let ground_at = |p: Vec3| {
+        let mut o = [col(p)[0], base + 2.5, col(p)[2]];
+        let mut left = 4.5;
+        while left > 0.0 {
+            let Some(h) = world.raycast(o, [0.0, -1.0, 0.0], left) else { return false };
+            if world.tris[h.tri as usize].routes & FREE != 0 && normal_y(h.tri) >= 0.5 {
+                return (h.point[1] - base).abs() <= 2.0;
+            }
+            let step = h.t + 0.01;
+            o[1] -= step;
+            left -= step;
+        }
+        false
+    };
+    let mut contacts = Vec::new();
+    for f in [-0.7f32, 0.0, 0.7] {
+        let p = centre + long * (hl * f);
+        world.sphere_contacts(col(Vec3::new(p.x, base + 0.8, p.z)), 1.5, &mut contacts);
+        if contacts.iter().any(|c| world.tris[c.tri as usize].routes & FREE != 0 && normal_y(c.tri) < 0.5) {
+            return false;
+        }
+        if ![1.0f32, -1.0].iter().all(|s| ground_at(p + thin * (ht + 2.0) * *s)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// A template-space shape placed by the placement matrix `m` (= translation * rotation * scale).
@@ -635,6 +754,7 @@ pub fn update(
         let mut rng = fastrand_seed(time.elapsed_secs_f64());
         for (i, v) in hits {
             let c = &cols.list[i as usize];
+            fh1_engine::sfx_queue::smash(c.template, c.matrix.w_axis.truncate(), v.length());
             sc.break_prop(&mut commands, c.key);
             let (scale, rot, pos) = c.matrix.to_scale_rotation_translation();
             for &s in cols.shards.get(&c.template).into_iter().flatten() {

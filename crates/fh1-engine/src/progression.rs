@@ -229,7 +229,7 @@ pub struct ProgressionPlugin {
 
 impl Plugin for ProgressionPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((crate::race::visuals::RaceVisualsPlugin, crate::race::anark_hud::RaceUiPlugin))
+        app.add_plugins((crate::race::visuals::RaceVisualsPlugin, crate::race::anark_hud::RaceUiPlugin, crate::race::states::MarkerStatesPlugin))
             .insert_resource(Profile::load(self.path.clone(), enabled()))
             .init_resource::<EventCatalog>()
             .init_resource::<LastRewards>()
@@ -298,10 +298,33 @@ pub fn event_tier(def: &RaceDef) -> u8 {
     def.level.clamp(0, 6) as u8
 }
 
+/// `FH1_EVENT_UNLOCKS=0`: ignore gamedb Rewards_EventUnlock (old behaviour: Darius opens at Gold without the Headline).
+fn event_unlocks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_EVENT_UNLOCKS").map_or(true, |v| v != "0"))
+}
+
+/// Rewards_EventUnlock: the first required event of `event_id` the profile has not completed yet, as lock text
+/// ("Complete <name> first"); None = nothing outstanding. "Completed" = a recorded finish (best place > 0), the same
+/// notion as [`event_state`]'s Completed (INFERRED: FH1 may require a win; the plan only says "complete 167, then 169").
+fn unlock_block(event_id: u32, p: &profile::ProfileData, c: &data::CareerData) -> Option<String> {
+    c.unlocked_by.get(&event_id)?.iter().find_map(|by| {
+        let (key, name) = c.unlock_refs.get(by)?;
+        let done = p.events.get(key).is_some_and(|r| r.best_place > 0);
+        (!done).then(|| format!("Complete {name} first"))
+    })
+}
+
 /// Why `def` is locked for this profile (None = open).
 pub fn lock_reason(def: &RaceDef, p: &profile::ProfileData, c: &data::CareerData) -> Option<String> {
     if !enabled() {
         return None;
+    }
+    if event_unlocks_on() {
+        // Overrides the event's own XP / wristband rule (Darius stays locked at Gold until the Headline is done).
+        if let Some(r) = unlock_block(def.event_id, p, c) {
+            return Some(r);
+        }
     }
     let xp = p.xp;
     let tier = c.tier(xp);
@@ -422,6 +445,9 @@ fn apply_results(
 ) {
     for f in finished.read() {
         let Some(def) = events.races.get(f.race) else { continue };
+        if crate::race::airborne_link::outside_career(def) {
+            continue;
+        }
         let c = &events.career;
         *last = LastRewards { race: Some(f.race), ..default() };
         if !enabled() {
@@ -433,6 +459,7 @@ fn apply_results(
         };
         let p = &mut profile.data;
         let tier_before = c.tier(p.xp);
+        let prev_rec = p.events.get(&def.horizon_id).cloned();
         let rec = p.events.entry(def.horizon_id.clone()).or_default();
         let improved = rec.best_place == 0 || place < rec.best_place as u32;
         let first_win = place == 1 && rec.wins == 0;
@@ -499,10 +526,20 @@ fn apply_results(
             }
         }
         // Newly opened events.
-        let before = profile::ProfileData { xp: p.xp - xp, ..p.clone() };
+        // (`before` also rolls this event's record back, so events it unlocks via Rewards_EventUnlock show up as opened.)
+        let mut before = profile::ProfileData { xp: p.xp - xp, ..p.clone() };
+        match prev_rec {
+            Some(r) => before.events.insert(def.horizon_id.clone(), r),
+            None => before.events.remove(&def.horizon_id),
+        };
         let opened: Vec<&str> = events.races.iter().filter(|r| lock_reason(r, &before, c).is_some() && lock_reason(r, p, c).is_none()).map(|r| r.name.as_str()).collect();
         if !opened.is_empty() {
             last.lines.push(format!("Unlocked: {}", opened.join(", ")));
+            // Events opened by Rewards_EventUnlock (Darius after the Headline) get the showcase-style unlock notice.
+            for r in events.races.iter().filter(|r| c.unlocked_by.contains_key(&r.event_id) && opened.contains(&r.name.as_str())) {
+                banners.push(format!("EVENT UNLOCKED  {}", r.name));
+                banners.1.push(CareerNotice::EventUnlocked { name: r.name.clone() });
+            }
         }
         if let Some(w) = c.wristbands.get(tier + 1) {
             last.lines.push(format!("{} XP to {}", fmt_num((w.xp - p.xp) as i64), w.name));
@@ -614,4 +651,37 @@ pub fn pay_rank_milestones(profile: &mut Profile, c: &data::CareerData, rank: u3
         wallet::apply(profile, paid, "Popularity sponsor");
     }
     profile.data.rank_paid = profile.data.rank_paid.min(rank);
+}
+
+#[cfg(test)]
+mod event_unlock_tests {
+    use super::*;
+
+    fn career() -> data::CareerData {
+        let rows = serde_json::json!({"event_unlocks": [
+            {"by": 167, "unlocks": 169, "by_horizon": "HEADLINE_EVENT", "by_name": "The Horizon Headline"},
+            {"by": 91, "unlocks": 92, "by_horizon": null, "by_name": null}
+        ]});
+        data::CareerData::from_json(&rows, std::path::Path::new("."))
+    }
+
+    #[test]
+    fn darius_waits_for_headline() {
+        let c = career();
+        let mut p = profile::ProfileData::default();
+        assert_eq!(unlock_block(169, &p, &c).as_deref(), Some("Complete The Horizon Headline first"));
+        assert_eq!(unlock_block(92, &p, &c), None, "dangling row is ignored");
+        assert_eq!(unlock_block(5, &p, &c), None);
+        p.events.insert("HEADLINE_EVENT".into(), profile::EventRecord { best_place: 0, runs: 1, ..Default::default() });
+        assert!(unlock_block(169, &p, &c).is_some(), "a DNF does not count");
+        p.events.insert("HEADLINE_EVENT".into(), profile::EventRecord { best_place: 3, runs: 2, ..Default::default() });
+        assert_eq!(unlock_block(169, &p, &c), None);
+    }
+
+    #[test]
+    fn old_install_has_no_unlocks() {
+        let c = data::CareerData::from_json(&serde_json::json!({"hubs": []}), std::path::Path::new("."));
+        assert!(c.unlocked_by.is_empty());
+        assert_eq!(unlock_block(169, &profile::ProfileData::default(), &c), None);
+    }
 }

@@ -16,6 +16,7 @@ mod drivetrain;
 mod steering;
 mod tyre;
 
+pub use steering::TcsParams;
 pub use tyre::{tyre_scales_enabled, TyreSurface};
 
 use bevy::math::{Quat, Vec3};
@@ -159,6 +160,18 @@ pub struct Wheel {
     instability: tyre::Instability,
 }
 
+/// Aerodynamic scales on drag and per-axle downforce (drafting, ai/race_physics.rs). `ONE` = the car's own numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AeroScale {
+    pub drag: f32,
+    /// Front, rear.
+    pub down: [f32; 2],
+}
+
+impl AeroScale {
+    pub const ONE: Self = Self { drag: 1.0, down: [1.0; 2] };
+}
+
 #[derive(Debug, Clone)]
 pub struct Vehicle {
     pub data: CarData,
@@ -221,6 +234,10 @@ pub struct Vehicle {
     pub clutch_pedal: f32,
     /// Engine torque multiplier (1 = stock): the AI's rubber band torque cut / catch-up boost (ai/, docs/AI.md).
     pub torque_mult: f32,
+    /// Drafting scales on drag / downforce, set every tick by the race code (ai/race_physics.rs); `AeroScale::ONE` otherwise.
+    pub aero_scale: AeroScale,
+    /// Race-AI traction-control numbers; `None` = the player's (steering.rs).
+    pub tcs_params: Option<steering::TcsParams>,
     /// Stats-harness lateral test: clutch pedal held in (gearbox state 9, car+0x137C = 1; docs/HANDLING_PARITY.md §1).
     pub clutch_in: bool,
     /// Grounded wheels on an off-road surface (OffRoadness > 0) last tick (car+0x5031, 82D35B90).
@@ -296,6 +313,8 @@ impl Vehicle {
             shift_request: 0,
             clutch_pedal: 0.0,
             torque_mult: 1.0,
+            aero_scale: AeroScale::ONE,
+            tcs_params: None,
             offroad_wheels: 0,
             clutch_in: false,
             rng: 0x9E37_79B9,
@@ -505,10 +524,10 @@ impl Vehicle {
 
         // Aerodynamics: drag at the centre of mass, downforce at each axle.
         let d = &self.data;
-        force -= self.velocity * self.velocity.length() * d.drag_k;
+        force -= self.velocity * self.velocity.length() * (d.drag_k * self.aero_scale.drag);
         let v_fwd = self.forward_speed();
         for axle in 0..2 {
-            let df = down * d.downforce_k[axle] * v_fwd * v_fwd;
+            let df = down * (d.downforce_k[axle] * self.aero_scale.down[axle]) * v_fwd * v_fwd;
             let at = self.position + self.rotation * (0.5 * (self.anchors[axle * 2] + self.anchors[axle * 2 + 1]));
             force += df;
             torque += (at - self.position).cross(df);
@@ -702,6 +721,7 @@ impl Vehicle {
             let r = ct.point - self.position;
             let v = self.velocity + self.angular_velocity.cross(r);
             let vn = v.dot(ct.normal);
+            crate::sfx_queue::wall(ct.point, ct.normal, -vn, (v - ct.normal * vn).length(), ct.surface);
             if vn >= 0.0 {
                 continue;
             }

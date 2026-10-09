@@ -28,7 +28,7 @@ use bevy_ecs::{
     query::{Has, Or, With, Without},
     resource::Resource,
     schedule::{common_conditions::any_match_filter, IntoScheduleConfigs as _},
-    system::{Commands, Query, Res, ResMut},
+    system::{Commands, Local, Query, Res, ResMut},
     world::{FromWorld, World},
 };
 use bevy_log::warn_once;
@@ -51,7 +51,7 @@ use bevy_render::{
     render_resource::{
         binding_types::{storage_buffer, storage_buffer_read_only, texture_2d, uniform_buffer},
         BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        BindingResource, Buffer, BufferBinding, BufferVec, CachedComputePipelineId,
+        BindGroupLayoutId, BindingResource, Buffer, BufferBinding, BufferId, BufferVec, CachedComputePipelineId,
         ComputePassDescriptor, ComputePipelineDescriptor, DynamicBindGroupLayoutEntries,
         PartialBufferVec, PipelineCache, RawBufferVec, ShaderStages, ShaderType,
         SparseBufferUpdateBindGroups, SparseBufferUpdateJobs, SparseBufferUpdatePipelines,
@@ -1797,7 +1797,10 @@ impl BinUnpackingPipeline {
 )]
 pub fn prepare_preprocess_bind_groups(
     mut commands: Commands,
-    views: Query<(Entity, &ExtractedView)>,
+    // FH1 patch 7: views that skip GPU preprocessing (a cached shadow cascade, light.rs `StashedShadowPhases`) get no
+    // preprocess or bin unpacking bind groups: nothing dispatches them, and a skipped view's bin unpacking jobs are last
+    // frame's (write_binned_instance_buffers skips a view without a phase), so their metadata indices are stale.
+    views: Query<(Entity, &ExtractedView), Without<SkipGpuPreprocess>>,
     view_depth_pyramids: Query<(&ViewDepthPyramid, &PreviousViewUniformOffset)>,
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
@@ -1810,7 +1813,10 @@ pub fn prepare_preprocess_bind_groups(
     previous_view_uniforms: Res<PreviousViewUniforms>,
     pipelines: Res<PreprocessPipelines>,
     mut bin_unpacking_bind_groups: ResMut<BinUnpackingBindGroups>,
+    mut unpack_cache: Local<BinUnpackingBindGroupCache>,
 ) {
+    // FH1 patch 8: last frame's bin unpacking bind groups become the lookup set; whatever isn't reused is dropped below.
+    unpack_cache.begin_frame();
     // Grab the `BatchedInstanceBuffers`.
     let BatchedInstanceBuffers {
         current_input_buffer: current_input_buffer_vec,
@@ -1951,7 +1957,52 @@ pub fn prepare_preprocess_bind_groups(
             phase_instance_buffers,
             &bin_unpacking_buffers,
             &view.retained_view_entity,
+            &mut unpack_cache,
         );
+    }
+    unpack_cache.end_frame();
+}
+
+/// FH1 patch 8 (P16-C): bin unpacking bind groups reused across frames. Upstream creates one bind group per batch set per
+/// (view, phase) every frame, although its four bindings (metadata buffer + this batch set's offset in it, the batch
+/// set's two retained bin buffers, the view's work item buffer) only change when a buffer is reallocated or the batch set
+/// order moves its metadata slot. A bevy_render `BufferId` is a unique atomic id (never reused), so a bind group cached
+/// under (buffer ids, offset, indexed-ness) binds exactly what a new one would. Entries not used in a frame are dropped
+/// at its end (they would otherwise keep reallocated buffers alive). `FH1_UNPACK_BG_CACHE=0` = old (create every frame).
+#[derive(Default)]
+pub struct BinUnpackingBindGroupCache {
+    current: HashMap<BinUnpackingBindGroupKey, BindGroup>,
+    previous: HashMap<BinUnpackingBindGroupKey, BindGroup>,
+}
+
+/// (layout, metadata buffer, metadata byte offset, binned mesh instance buffer, bin -> indirect offset buffer, work item
+/// buffer, indexed).
+type BinUnpackingBindGroupKey = (BindGroupLayoutId, BufferId, u32, BufferId, BufferId, BufferId, bool);
+
+impl BinUnpackingBindGroupCache {
+    fn on() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var("FH1_UNPACK_BG_CACHE").map_or(true, |v| v != "0"))
+    }
+
+    fn begin_frame(&mut self) {
+        self.previous = core::mem::take(&mut self.current);
+    }
+
+    fn end_frame(&mut self) {
+        self.previous.clear();
+    }
+
+    fn get_or_create(&mut self, key: BinUnpackingBindGroupKey, create: impl FnOnce() -> BindGroup) -> BindGroup {
+        if !Self::on() {
+            return create();
+        }
+        if let Some(bind_group) = self.current.get(&key) {
+            return bind_group.clone();
+        }
+        let bind_group = self.previous.remove(&key).unwrap_or_else(create);
+        self.current.insert(key, bind_group.clone());
+        bind_group
     }
 }
 
@@ -2808,6 +2859,7 @@ fn create_bin_unpacking_bind_groups(
     phase_instance_buffers: &TypeIdMap<UntypedPhaseBatchedInstanceBuffers<MeshUniform>>,
     bin_unpacking_buffers: &BinUnpackingBuffers,
     view_entity: &RetainedViewEntity,
+    unpack_cache: &mut BinUnpackingBindGroupCache,
 ) {
     let Some(bin_unpacking_metadata_buffer) = bin_unpacking_buffers.bin_unpacking_metadata.buffer()
     else {
@@ -2867,6 +2919,7 @@ fn create_bin_unpacking_bind_groups(
                                 bin_unpacking_metadata_buffer,
                                 indexed_work_item_buffer,
                                 true,
+                                unpack_cache,
                             )
                         })
                         .collect(),
@@ -2885,6 +2938,7 @@ fn create_bin_unpacking_bind_groups(
                                 bin_unpacking_metadata_buffer,
                                 non_indexed_work_item_buffer,
                                 false,
+                                unpack_cache,
                             )
                         })
                         .collect(),
@@ -2905,15 +2959,27 @@ fn create_bin_unpacking_bind_group(
     bin_unpacking_metadata_buffer: &Buffer,
     work_item_buffer: &Buffer,
     indexed: bool,
+    unpack_cache: &mut BinUnpackingBindGroupCache,
 ) -> ViewPhaseBinUnpackingBindGroup {
-    let bind_group = render_device.create_bind_group(
+    // FH1 patch 8: reuse the bind group when the layout, every bound buffer and the metadata offset are unchanged.
+    let layout =
+        pipeline_cache.get_bind_group_layout(&preprocess_pipelines.bin_unpacking.bind_group_layout);
+    let key = (
+        layout.id(),
+        bin_unpacking_metadata_buffer.id(),
+        job.bin_unpacking_metadata_index.uniform_offset(),
+        job.render_binned_mesh_instance_buffer.id(),
+        job.bin_index_to_indirect_parameters_offset_buffer.id(),
+        work_item_buffer.id(),
+        indexed,
+    );
+    let bind_group = unpack_cache.get_or_create(key, || render_device.create_bind_group(
         if indexed {
             "bin unpacking indexed bind group"
         } else {
             "bin unpacking non-indexed bind group"
         },
-        &pipeline_cache
-            .get_bind_group_layout(&preprocess_pipelines.bin_unpacking.bind_group_layout),
+        &layout,
         &BindGroupEntries::sequential((
             // @group(0) @binding(0) var<uniform>
             // bin_unpacking_metadata:
@@ -2937,7 +3003,7 @@ fn create_bin_unpacking_bind_group(
             job.bin_index_to_indirect_parameters_offset_buffer
                 .as_entire_binding(),
         )),
-    );
+    ));
     ViewPhaseBinUnpackingBindGroup {
         metadata_index: job.bin_unpacking_metadata_index,
         bind_group,

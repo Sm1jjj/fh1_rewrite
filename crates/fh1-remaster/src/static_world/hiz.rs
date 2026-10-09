@@ -11,10 +11,11 @@
 
 use bevy::prelude::*;
 use bevy::render::render_resource::binding_types::{texture_2d, texture_depth_2d, texture_storage_2d};
+use bevy::render::diagnostic::RecordDiagnostics;
 use bevy::render::render_resource::{
-    BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer, BufferDescriptor, BufferUsages, CachedComputePipelineId,
+    BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer, BufferDescriptor, BufferUsages, CachedComputePipelineId,
     ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, PipelineCache, ShaderStages, StorageTextureAccess, Texture, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
+    ComputePass, TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, TextureViewId,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 
@@ -91,6 +92,9 @@ pub(super) struct Hiz {
     /// Two-phase culling this frame (decided in draw.rs `prepare_views`: Hi-Z on, a single-sample main depth with
     /// TEXTURE_BINDING, pipelines ready).
     pub(super) active: bool,
+    /// P16-A (`build_with`): the per-mip bind groups for the depth view they were made for (the pyramid's views are fixed
+    /// until `ensure_pyramid` recreates it, which drops them).
+    groups: std::sync::Mutex<Option<(TextureViewId, Vec<BindGroup>)>>,
 }
 
 impl Hiz {
@@ -117,6 +121,9 @@ impl Hiz {
         self.full_view = Some(texture.create_view(&TextureViewDescriptor::default()));
         self.texture = Some(texture);
         self.size = size;
+        if let Ok(g) = self.groups.get_mut() {
+            *g = None;
+        }
     }
 
     /// Mip levels of the pyramid (0 without one).
@@ -187,6 +194,54 @@ impl Hiz {
             pass.set_bind_group(0, g, &[]);
             pass.dispatch_workgroups(s.x.div_ceil(8), s.y.div_ceil(8), 1);
         }
+    }
+
+    /// P16-A (FH1_SW_PASS_MERGE): the pyramid in ONE compute pass (one dispatch per mip; wgpu puts a barrier between
+    /// dispatches of a compute pass, as between passes), with bind groups kept while the depth view and the pyramid stay
+    /// the same, then `tail` (the phase-2 cull) in the same pass. False = not ready, nothing recorded.
+    pub(super) fn build_with(
+        &self,
+        ctx: &mut RenderContext,
+        cache: &PipelineCache,
+        pipes: &HizPipelines,
+        device: &RenderDevice,
+        depth: &TextureView,
+        tail: &mut dyn FnMut(&mut ComputePass<'_>),
+    ) -> bool {
+        let (Some(first), Some(down)) = (cache.get_compute_pipeline(pipes.first), cache.get_compute_pipeline(pipes.down)) else { return false };
+        if self.mip_views.is_empty() {
+            return false;
+        }
+        let groups = {
+            let Ok(mut cached) = self.groups.lock() else { return false };
+            match cached.as_ref() {
+                Some((id, g)) if *id == depth.id() && g.len() == self.mip_views.len() => g.clone(),
+                _ => {
+                    let first_layout = cache.get_bind_group_layout(&pipes.first_layout);
+                    let down_layout = cache.get_bind_group_layout(&pipes.down_layout);
+                    let g: Vec<BindGroup> = std::iter::once(device.create_bind_group("static world hiz first", &first_layout, &BindGroupEntries::sequential((depth, &self.mip_views[0]))))
+                        .chain((1..self.mip_views.len()).map(|i| device.create_bind_group("static world hiz down", &down_layout, &BindGroupEntries::sequential((&self.mip_views[i - 1], &self.mip_views[i])))))
+                        .collect();
+                    *cached = Some((depth.id(), g.clone()));
+                    g
+                }
+            }
+        };
+        let recorder = ctx.diagnostic_recorder();
+        let diagnostics = recorder.as_deref();
+        let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor { label: Some("static world hiz + cull"), timestamp_writes: None });
+        let span = diagnostics.pass_span(&mut pass, "static_world_hiz_cull");
+        for (i, g) in groups.iter().enumerate() {
+            let s = UVec2::new((self.size.x >> i).max(1), (self.size.y >> i).max(1));
+            if i <= 1 {
+                pass.set_pipeline(if i == 0 { first } else { down });
+            }
+            pass.set_bind_group(0, g, &[]);
+            pass.dispatch_workgroups(s.x.div_ceil(8), s.y.div_ceil(8), 1);
+        }
+        tail(&mut pass);
+        span.end(&mut pass);
+        true
     }
 }
 

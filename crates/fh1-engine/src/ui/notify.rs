@@ -243,7 +243,7 @@ fn objective(
     st.shown = want;
 }
 
-fn notifications(time: Res<Time>, mut st: ResMut<NotifyState>, mut posts: MessageReader<HudNotify>, mut scenes: Query<(Entity, &mut AnarkScene)>) {
+fn notifications(time: Res<Time>, mut st: ResMut<NotifyState>, mut posts: MessageReader<HudNotify>, mut scenes: Query<(Entity, &mut AnarkScene)>, mut snd: MessageWriter<super::sfx::UiSfx>) {
     for n in posts.read() {
         st.queue.push_back(n.lines.clone());
     }
@@ -260,6 +260,7 @@ fn notifications(time: Res<Time>, mut st: ResMut<NotifyState>, mut posts: Messag
                 }
             }
             p.fire_at("SHOW", note);
+            snd.write(super::sfx::UiSfx::play(super::sfx::keys::NOTIFICATION_APPEAR));
             st.note = Some(("SHOW_COMPLETE", SLIDE));
         }
         Some((ev, left)) => {
@@ -269,6 +270,9 @@ fn notifications(time: Res<Time>, mut st: ResMut<NotifyState>, mut posts: Messag
                 return;
             }
             p.fire_at(ev, note);
+            if ev == "HIDE" {
+                snd.write(super::sfx::UiSfx::play(super::sfx::keys::NOTIFICATION_DISAPPEAR));
+            }
             st.note = match ev {
                 "SHOW_COMPLETE" => Some(("HIDE", NOTIFY_HOLD)),
                 "HIDE" => Some(("HIDE_COMPLETE", SLIDE)),

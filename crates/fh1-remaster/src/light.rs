@@ -34,6 +34,10 @@
 //! material keeps its prepass off (material.rs), so only cars and Bevy-standard meshes write prepass depth: contact
 //! shadows are cast by cars (onto the road and themselves), the cost is the cars' depth-only draws plus a short
 //! screen-space march per shadowed pixel.
+//!
+//! Car-part sun casters (P16-C, docs/PERF_P16_C.md; `car_part_casters`): glass, lamps, covers, cabin, badges and the game's
+//! `*_noshadow` materials never cast; cars past FH1_RM_CAR_CAST_DETAIL (25 m) cast from their big parts only, past
+//! FH1_RM_CAR_CAST_FAR (200 m) not at all. FH1_RM_CAR_CASTERS=0 = old.
 
 use bevy::camera::Exposure;
 use bevy::color::Mix;
@@ -111,6 +115,8 @@ impl Plugin for RemasterLightPlugin {
             .add_systems(Update, (setup_camera, sky::update_sky, env_refresh.after(setup_camera)))
             .add_systems(Update, (game_shader_casters, game_shader_probe_skip, hiz_depth_usage))
             .add_systems(Update, apply_quality)
+            // After the bounds: the core-part rule reads each new part's Aabb (calculate_bounds adds it in PostUpdate).
+            .add_systems(PostUpdate, car_part_casters.after(bevy::camera::visibility::VisibilitySystems::CalculateBounds))
             .add_systems(PostUpdate, game_fog.after(update_lights))
             .add_systems(PostUpdate, update_lights.before(bevy::transform::TransformSystems::Propagate))
             .insert_resource(bevy::pbr::DirectionalShadowCache::default())
@@ -867,6 +873,121 @@ fn game_shader_casters(
             commands.entity(e).try_insert(bevy::light::NotShadowCaster);
         }
     }
+}
+
+/// Car-part sun shadows (P16-C, docs/PERF_P16_C.md). Every glTF car part (player, AI, traffic, remote) was its own ECS
+/// shadow caster, and Bevy 0.19 draws blended and masked materials into the shadow pass alpha-tested (`MAY_DISCARD`), so
+/// each car's glass / lamp / cover materials made their own shadow batch sets in every cascade. Rules:
+/// - Never cast: glass, dark glass, defrost lines, lamps, lenses, lamp covers (car.rs `look` kinds), cabin parts (the
+///   same words as car.rs `is_cabin`), badges / emblems, and materials the game itself names `*_noshadow(s)` (car.rs
+///   `base_name` strips that suffix for the look; here it is honoured). They sit inside the body's silhouette or let
+///   the light through.
+/// - A car farther than FH1_RM_CAR_CAST_DETAIL (25 m) from the main camera: only its core parts cast (mesh box half
+///   extent >= FH1_RM_CAR_CAST_CORE, 0.5 m: body shell, undercarriage, bumpers). Past ~10 m a car is in the 9-300 m
+///   cascade (~0.2 m texels at 2048²), where smaller parts are a texel or less.
+/// - Farther than FH1_RM_CAR_CAST_FAR (200 m; 0 = never): no part casts.
+/// Distance tiers have 10 % hysteresis; hidden (pooled / parked) bodies keep their tier until they show again.
+/// `FH1_RM_CAR_CASTERS=0` = old (every part casts at every distance).
+#[derive(Default)]
+struct CarCasterState {
+    bodies: bevy::platform::collections::HashMap<Entity, CarCasterBody>,
+    frame: u32,
+}
+
+struct CarCasterBody {
+    /// (part, core part, casting now).
+    parts: Vec<(Entity, bool, bool)>,
+    /// 0 = every castable part, 1 = core parts only, 2 = none.
+    tier: u8,
+}
+
+fn car_casters_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !flag_off("FH1_RM_CAR_CASTERS"))
+}
+
+/// A car material that never casts (see [`car_part_casters`]).
+fn car_part_never_casts(name: &str) -> bool {
+    use crate::car::Kind;
+    let n = name.to_ascii_lowercase();
+    const CABIN: [&str; 11] = ["interior", "seat", "leather", "steering", "gauge", "dash", "door_card", "doorcard", "headliner", "suede", "carpet"];
+    n.contains("_noshadow")
+        || CABIN.iter().any(|w| n.contains(w))
+        || n.starts_with("emblem")
+        || n.starts_with("badge")
+        || n.starts_with("liverybadge")
+        || n == "wheel_emblem"
+        || matches!(crate::car::look(name).kind, Kind::Glass | Kind::DarkGlass | Kind::Defrost | Kind::Lens(_) | Kind::Cover(_) | Kind::Lamp(_))
+}
+
+#[allow(clippy::type_complexity)]
+fn car_part_casters(
+    mut commands: Commands,
+    new_parts: Query<(Entity, &bevy::gltf::GltfMaterialName, Option<&bevy::camera::primitives::Aabb>), (Added<bevy::gltf::GltfMaterialName>, With<Mesh3d>, Without<bevy::light::NotShadowCaster>)>,
+    parents: Query<&ChildOf>,
+    bodies: Query<(&GlobalTransform, &InheritedVisibility), With<fh1_render::car::FxCarBody>>,
+    alive: Query<(), With<Mesh3d>>,
+    main: Query<&GlobalTransform, With<RemasterView>>,
+    mut st: Local<CarCasterState>,
+) {
+    if !car_casters_on() {
+        return;
+    }
+    let detail = env_f32("FH1_RM_CAR_CAST_DETAIL", 25.0).max(0.0);
+    let far = env_f32("FH1_RM_CAR_CAST_FAR", 200.0).max(0.0);
+    let core = env_f32("FH1_RM_CAR_CAST_CORE", 0.5).max(0.0);
+    let casts = |tier: u8, is_core: bool| tier == 0 || (tier == 1 && is_core);
+
+    for (e, name, aabb) in &new_parts {
+        let Some(body) = parents.iter_ancestors(e).find(|a| bodies.contains(*a)) else { continue };
+        if car_part_never_casts(&name.0) {
+            commands.entity(e).try_insert(bevy::light::NotShadowCaster);
+            continue;
+        }
+        // No box yet = treat as core (never hides a big part).
+        let is_core = aabb.is_none_or(|b| b.half_extents.max_element() >= core);
+        let entry = st.bodies.entry(body).or_insert(CarCasterBody { parts: Vec::new(), tier: 0 });
+        let on = casts(entry.tier, is_core);
+        if !on {
+            commands.entity(e).try_insert(bevy::light::NotShadowCaster);
+        }
+        entry.parts.push((e, is_core, on));
+    }
+
+    st.frame = st.frame.wrapping_add(1);
+    let prune = st.frame % 64 == 0;
+    let cam = main.iter().next().map(|t| t.translation());
+    st.bodies.retain(|body, b| {
+        let Ok((tf, vis)) = bodies.get(*body) else { return false };
+        if prune {
+            b.parts.retain(|(e, ..)| alive.contains(*e));
+        }
+        let (Some(cam), true) = (cam, vis.get()) else { return true };
+        let d = tf.translation().distance(cam);
+        let past = |limit: f32, inside_now: bool| limit > 0.0 && d > if inside_now { limit } else { 0.9 * limit };
+        let tier = if past(far, b.tier < 2) {
+            2
+        } else if past(detail, b.tier < 1) {
+            1
+        } else {
+            0
+        };
+        if tier != b.tier {
+            b.tier = tier;
+            for (e, is_core, on) in &mut b.parts {
+                let want = casts(tier, *is_core);
+                if want != *on {
+                    *on = want;
+                    if want {
+                        commands.entity(*e).try_remove::<bevy::light::NotShadowCaster>();
+                    } else {
+                        commands.entity(*e).try_insert(bevy::light::NotShadowCaster);
+                    }
+                }
+            }
+        }
+        true
+    });
 }
 
 /// The static world's Hi-Z (static_world/hiz.rs) reads the main camera's depth in a compute pass: its depth texture

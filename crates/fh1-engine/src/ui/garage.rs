@@ -11,6 +11,8 @@
 //!   `ui/textures/thumbnails/thumbnail_<Data_Car.Id>.png` (ui group, 153 selectable cars).
 //!
 //! `FH1_OWNERSHIP=0` (wallet::ownership_on) = the old Change car list of every car, no prices.
+//! Card menus (ui/cards.rs, default; `FH1_CARD_MENUS=0` = this list page): the screens are ui/cards/shop.rs; they ask
+//! through `request_buy` / `request_sell` and this file's `run_shop` still pays, sells and notifies.
 //! STOPGAP: drawn with the pause menu's panel, not the game's Anark screens (115_c_buy_mfrselect, 108_c_buy_carselect,
 //! 114_c_buy_buycar_color, 106_c_car_list), whose SUPER_STACKER / scrolling-list contracts aren't driven yet.
 
@@ -127,6 +129,17 @@ impl ShopState {
         }
     }
 
+    /// Card menus (ui/cards.rs): buy car `i` now (their own dialog asked already); `run_shop` pays, notifies and sets
+    /// `drive`.
+    pub(super) fn request_buy(&mut self, i: usize) {
+        self.requests.push(Req::Buy(i));
+    }
+
+    /// Card menus: sell car `i` now (after their own dialog); `run_shop` checks the rules and sets `notice`.
+    pub(super) fn request_sell(&mut self, i: usize) {
+        self.requests.push(Req::Sell(i));
+    }
+
     /// The hint line of the car page in this mode.
     pub fn hint_extra(&self) -> &'static str {
         match self.mode {
@@ -145,15 +158,25 @@ impl Plugin for GaragePlugin {
     }
 }
 
+/// "Maker Name" of garage car `i` for the notices: the list's name, else the catalog's (the card menus, ui/cards/shop.rs,
+/// don't fill the list), else the car folder.
+fn display_name(menu: &Menu, garage: &Garage, i: usize, car: &str) -> String {
+    menu.shop.names.get(&i).cloned().unwrap_or_else(|| {
+        let cat = menu.catalog.clone().unwrap_or_else(|| super::browser::catalog_for(&garage.assets, &garage.cars));
+        cat.entry_of(i).map_or_else(|| car.to_string(), |e| format!("{} {}", e.maker, e.name))
+    })
+}
+
 /// Carry out buy / sell answers, then rebuild the car list when needed.
 #[allow(clippy::too_many_arguments)]
-fn run_shop(
+pub(super) fn run_shop(
     mut menu: ResMut<Menu>,
     mut profile: Option<ResMut<Profile>>,
     events: Option<Res<crate::race::Events>>,
     garage: Res<Garage>,
     looks: Res<CarLooks>,
     mut notes: MessageWriter<HudNotify>,
+    mut snd: MessageWriter<super::sfx::UiSfx>,
 ) {
     let menu = &mut *menu;
     if menu.shop.requests.is_empty() && !menu.shop.rebuild {
@@ -172,22 +195,32 @@ fn run_shop(
         match req {
             Req::Buy(i) => {
                 let Some(car) = garage.cars.get(i) else { continue };
-                let name = menu.shop.names.get(&i).cloned().unwrap_or_else(|| car.clone());
+                let name = display_name(menu, &garage, i, car);
                 menu.shop.notice = Some(match wallet::buy(p, career, car) {
                     Ok(paid) => {
+                        snd.write(super::sfx::UiSfx::play(super::sfx::keys::CAR_ADDED_TO_GARAGE));
                         notes.write(HudNotify { lines: vec!["CAR ADDED TO GARAGE".into(), name.to_uppercase()] });
                         menu.shop.drive = Some(i);
                         format!("Bought the {name} for {} CR", fmt_num(paid))
                     }
-                    Err(BuyError::NotEnough { need, have }) => format!("INSUFFICIENT CR!  The {name} costs {} CR, you have {} CR", fmt_num(need), fmt_num(have)),
-                    Err(BuyError::AlreadyOwned) => format!("You already own the {name}"),
-                    Err(BuyError::NotForSale) => format!("The {name} is not for sale"),
+                    Err(BuyError::NotEnough { need, have }) => {
+                        snd.write(super::sfx::UiSfx::play(super::sfx::keys::DENY_ACCESS));
+                        format!("INSUFFICIENT CR!  The {name} costs {} CR, you have {} CR", fmt_num(need), fmt_num(have))
+                    }
+                    Err(BuyError::AlreadyOwned) => {
+                        snd.write(super::sfx::UiSfx::play(super::sfx::keys::DENY_ACCESS));
+                        format!("You already own the {name}")
+                    }
+                    Err(BuyError::NotForSale) => {
+                        snd.write(super::sfx::UiSfx::play(super::sfx::keys::DENY_ACCESS));
+                        format!("The {name} is not for sale")
+                    }
                 });
                 menu.shop.rebuild = true;
             }
             Req::Sell(i) => {
                 let Some(car) = garage.cars.get(i) else { continue };
-                let name = menu.shop.names.get(&i).cloned().unwrap_or_else(|| car.clone());
+                let name = display_name(menu, &garage, i, car);
                 menu.shop.notice = Some(match wallet::sell(p, career, car, current, looks.spent(car)) {
                     Ok(v) => format!("Sold the {name} for {} CR", fmt_num(v)),
                     Err(SellError::Current) => "You can't do this to the car you are currently in. Get in another car first.".into(),

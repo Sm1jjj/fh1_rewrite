@@ -76,6 +76,16 @@ impl ThumbStudio {
         self.queue.push_back((car.to_owned(), h.clone()));
         Some(h)
     }
+
+    /// The photo of `car` if it was already requested (rendered or still queued), without queueing it: card grids
+    /// (ui/cards.rs) show these for every card and call [`ThumbStudio::photo`] only for the focused one, so a page of
+    /// imported cars doesn't thrash the 3-deep queue.
+    pub fn cached(&self, car: &str) -> Option<Handle<Image>> {
+        if !enabled() {
+            return None;
+        }
+        self.cache.get(car).cloned()
+    }
 }
 
 pub struct ThumbPlugin;

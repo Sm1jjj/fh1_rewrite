@@ -6,6 +6,10 @@
 //! modes `FH1_VIEWS_SECS` s each (4; the first second of each discarded) and after every full cycle logs per mode the
 //! frame time and the render thread's extract..post-cleanup time (p50 / mean). Interleaved short windows because the
 //! festival scene drifts by +-2 ms over tens of seconds.
+//!
+//! `probeoff` (P16-B): the car probe paused (car_probe.rs `set_paused`: no face view, no probes, no filter), so one run
+//! measures the probe's whole cost against `base` on the same road, car and preset (`FH1_VIEWS_AB=base,probeoff`,
+//! `FH1_VIEWS_SECS=6`: a resumed probe re-bakes in the discarded first second).
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -24,12 +28,15 @@ struct Mode {
     ui_active: bool,
     /// The window UI camera kept but looking at an empty layer: its fixed per-view cost alone.
     ui_empty: bool,
+    /// The car probe running (false = paused, see the module doc).
+    probe: bool,
 }
 
 const MODES: &[Mode] = &[
-    Mode { name: "base", ui_active: true, ui_empty: false },
-    Mode { name: "uioff", ui_active: false, ui_empty: false },
-    Mode { name: "uiempty", ui_active: true, ui_empty: true },
+    Mode { name: "base", ui_active: true, ui_empty: false, probe: true },
+    Mode { name: "uioff", ui_active: false, ui_empty: false, probe: true },
+    Mode { name: "uiempty", ui_active: true, ui_empty: true, probe: true },
+    Mode { name: "probeoff", ui_active: true, ui_empty: false, probe: false },
 ];
 
 /// Render-thread frame time (ms), written by the render app.
@@ -104,6 +111,7 @@ fn rt_end(c: Res<RtClock>) {
 }
 
 fn apply(ab: &mut Ab, m: &Mode, commands: &mut Commands, ui: &mut Query<(Entity, &mut Camera, Option<&RenderLayers>), With<IsDefaultUiCamera>>) {
+    crate::car_probe::set_paused(!m.probe);
     for (e, mut cam, layers) in ui.iter_mut() {
         if cam.is_active != m.ui_active {
             cam.is_active = m.ui_active;

@@ -64,6 +64,12 @@ fn flag(k: &str, default: bool) -> bool {
     std::env::var(k).map_or(default, |v| v != "0")
 }
 
+/// FH1_TRAFFIC_NOREVERSE=0: a hit traffic car brakes with a full pedal (which reverses it) and recovers after 5 s / 50 m.
+fn no_reverse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("FH1_TRAFFIC_NOREVERSE", true))
+}
+
 fn lazy_path() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| flag("FH1_TRAFFIC_LAZY_PATH", true))
@@ -978,8 +984,16 @@ fn step_traffic(
             let controls = if let Some(w) = sim.wrecked {
                 sim.wrecked = Some(w + dt);
                 // Back on the lane when the player has left it behind (OUR rule; the game's recovery isn't traced).
-                recover = w + dt > 5.0 && dist > 50.0;
-                Controls { brake: 1.0, ..Default::default() }
+                if no_reverse() {
+                    // A full brake on a stopped automatic selects reverse after 0.3 s (select_direction) and swaps the pedals,
+                    // so a hit car drove backwards at full throttle. Brake gently (< 0.5), pause ~3 s, then put it back on its
+                    // lane: at once when the player is 20+ m away, else after 8 s.
+                    recover = w + dt > 3.0 && dist > 20.0 || w + dt > 8.0;
+                    Controls { brake: if v.speed() > 1.0 { 0.45 } else { 0.0 }, handbrake: if v.speed() < 1.0 { 1.0 } else { 0.0 }, ..Default::default() }
+                } else {
+                    recover = w + dt > 5.0 && dist > 50.0;
+                    Controls { brake: 1.0, ..Default::default() }
+                }
             } else {
                 sim.driver.controls(net, v, accel)
             };

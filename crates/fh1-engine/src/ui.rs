@@ -18,14 +18,18 @@ use serde::{Deserialize, Serialize};
 
 pub mod assists;
 pub mod browser;
+pub mod cards;
 pub mod customize;
 pub mod customize_upgrades;
+pub mod fmv;
 pub mod garage;
 pub mod graphics;
 pub mod thumbs;
 pub mod hud;
+pub mod intro;
 // L1: launch screen + loading covers.
 pub mod laptimer;
+pub mod statushud;
 pub mod launch;
 pub mod loading;
 pub mod world_load;
@@ -34,6 +38,7 @@ pub mod materials;
 pub mod minimap;
 pub mod notify;
 pub mod scene;
+pub mod sfx;
 pub mod skillhud;
 
 use crate::camera::CameraRig;
@@ -91,10 +96,14 @@ impl Plugin for UiPlugin {
             .add_plugins(thumbs::ThumbPlugin)
             // Garage > Customize (ui/customize.rs; garage.json beside settings.json).
             .add_plugins(customize::CustomizePlugin { path: self.settings_path.with_file_name("garage.json") })
+            .add_plugins(cards::CardsPlugin)
+            .add_plugins((fmv::FmvPlugin, intro::IntroPlugin, sfx::UiSfxPlugin))
             // L1: launch screen and loading covers (FH1_LAUNCH_SCREEN=0 / FH1_LOADING=0).
             .add_plugins(loading::LoadingPlugin)
             // L1b: Motorsport hot-lap timer (tracks with track.json timing).
             .add_plugins(laptimer::LapTimerPlugin)
+            // Free-roam credits / popularity / wristband strip, top right (FH1_STATUS_HUD=0 = off).
+            .add_plugins(statushud::StatusHudPlugin)
             .add_systems(Startup, load_fh1_ui)
             .add_systems(Update, spawn_world_ui.run_if(world_load::world_ready))
             .init_resource::<world_load::MapSwitch>()
@@ -143,6 +152,10 @@ pub struct Settings {
     pub telemetry: bool,
     pub engine_volume: f32,
     pub radio_volume: f32,
+    /// UI sound effects + FMV (movies) volume, 0..1 (ui/sfx.rs, ui/fmv.rs).
+    pub ui_volume: f32,
+    /// World ambience volume, 0..1 (ambience.rs).
+    pub ambient_volume: f32,
     /// Map to load when no `--track` is given (`colorado` or an imported map id); None = Colorado.
     pub map: Option<String>,
     /// L1b main menu: last Motorsport track (map id) and the last car picked there or in the pause menu (media name).
@@ -181,6 +194,8 @@ impl Default for Settings {
             telemetry: false,
             engine_volume: 1.0,
             radio_volume: 1.0,
+            ui_volume: 1.0,
+            ambient_volume: 1.0,
             map: None,
             motorsport_track: None,
             car: None,
@@ -283,7 +298,7 @@ impl Menu {
 /// Not paused and not in photo mode: driving input is live.
 pub fn driving(menu: Res<Menu>, rig: Res<CameraRig>) -> bool {
     // L1: not while the launch screen or a loading cover is up.
-    !menu.open && !rig.photo && !loading::blocking()
+    !menu.open && !rig.photo && !loading::blocking() && !crate::cutscene::active() && !intro::choice_open()
 }
 
 pub fn menu_closed(menu: Res<Menu>) -> bool {
@@ -725,7 +740,7 @@ fn update_hud(
     )>,
     fh1: Option<Res<hud::Fh1Hud>>,
 ) {
-    let show = settings.hud && !menu.open && !rig.photo;
+    let show = settings.hud && !menu.open && !rig.photo && !crate::cutscene::hide_hud();
     for (mut v, telemetry) in &mut hud {
         // The placeholder dial only stands in when FH1's own HUD isn't installed.
         let on = if telemetry { settings.telemetry } else { fh1.is_none() };
@@ -845,6 +860,8 @@ enum Opt {
     Telemetry,
     EngineVolume,
     RadioVolume,
+    UiVolume,
+    AmbientVolume,
     DrivingLine,
     AiDifficulty,
     Quality,
@@ -945,6 +962,8 @@ fn items(menu: &Menu, settings: &Settings, garage: &Garage, track: &Track, maps:
                     opt("Telemetry overlay", on_off(settings.telemetry), Opt::Telemetry),
                     opt("Engine volume", pct(settings.engine_volume), Opt::EngineVolume),
                     opt("Radio volume", pct(settings.radio_volume), Opt::RadioVolume),
+                    opt("Menu & movie volume", pct(settings.ui_volume), Opt::UiVolume),
+                    opt("Ambience volume", pct(settings.ambient_volume), Opt::AmbientVolume),
                     item("Graphics", Act::Open(Page::Graphics)),
                     Item { label: "Map".into(), value: Some(track.name.clone()), act: Act::Open(Page::Maps) },
                     item("Controls", Act::Open(Page::Controls)),
@@ -1121,8 +1140,13 @@ fn adjust(settings: &mut Settings, o: Opt, dir: i32) {
         Opt::Hud => settings.hud = !settings.hud,
         Opt::Telemetry => settings.telemetry = !settings.telemetry,
         // Enter (dir 0) steps up and wraps to 0 past 100%.
-        Opt::EngineVolume | Opt::RadioVolume => {
-            let v = if matches!(o, Opt::EngineVolume) { &mut settings.engine_volume } else { &mut settings.radio_volume };
+        Opt::EngineVolume | Opt::RadioVolume | Opt::UiVolume | Opt::AmbientVolume => {
+            let v = match o {
+                Opt::EngineVolume => &mut settings.engine_volume,
+                Opt::RadioVolume => &mut settings.radio_volume,
+                Opt::UiVolume => &mut settings.ui_volume,
+                _ => &mut settings.ambient_volume,
+            };
             if dir == 0 && *v >= 0.999 {
                 *v = 0.0;
             } else {
@@ -1210,6 +1234,7 @@ fn menu_input(
     mut rig: ResMut<CameraRig>,
     mut actions: MessageWriter<GameAction>,
     mut exit: MessageWriter<AppExit>,
+    mut snd: MessageWriter<sfx::UiSfx>,
     mut switch: ResMut<world_load::MapSwitch>,
     time: Res<Time<Real>>,
 ) {
@@ -1259,6 +1284,10 @@ fn menu_input(
         }
         return;
     }
+    // ui/cards.rs owns the Garage pages (input, drawing, back to Main).
+    if cards::owns(&menu) {
+        return;
+    }
     if nav.toggle && menu.page == Page::Main {
         close_menu(&mut menu, &settings, &path);
         return;
@@ -1272,6 +1301,7 @@ fn menu_input(
         // The buy / sell dialog takes the input while it is up.
         if menu.shop.confirm.is_some() {
             if nav.confirm || nav.back || nav.toggle {
+                snd.write(sfx::UiSfx::play(if nav.confirm { sfx::keys::ACCEPT } else { sfx::keys::CANCEL }));
                 menu.shop.answer(nav.confirm);
                 menu.dirty = true;
             }
@@ -1294,13 +1324,24 @@ fn menu_input(
             Page::Cars => menu.cars.as_mut().map_or(browser::Pick::Leave, |b| b.step(input)),
             _ => menu.maps.step(input),
         };
+        if let Some(s) = sfx::pick(&pick) {
+            snd.write(s);
+        }
         browser_pick(pick, &mut menu, &mut settings, &path, &garage, &track, &mut actions, &mut exit, &mut switch);
         return;
     }
     if menu.page == Page::Customize {
+        if nav.vertical != 0 {
+            snd.write(sfx::UiSfx::play(sfx::keys::VSCROLL));
+        } else if nav.horizontal != 0 {
+            snd.write(sfx::UiSfx::play(sfx::keys::HSCROLL));
+        } else if nav.confirm {
+            snd.write(sfx::UiSfx::play(sfx::keys::ACCEPT));
+        }
         let step = menu.custom.step(customize::Nav { vertical: nav.vertical, horizontal: nav.horizontal, confirm: nav.confirm, back: nav.back || nav.toggle });
         match step {
             customize::Step::Leave => {
+                snd.write(sfx::UiSfx::play(sfx::keys::CANCEL));
                 menu.page = Page::Garage;
                 menu.cursor = garage::customize_row();
                 menu.dirty = true;
@@ -1314,6 +1355,7 @@ fn menu_input(
             close_menu(&mut menu, &settings, &path);
         } else {
             let from = menu.page;
+            snd.write(sfx::UiSfx::play(sfx::keys::CANCEL));
             // Graphics is a sub-page of Options: back returns to its row there.
             menu.page = if from == Page::Graphics { Page::Options } else { Page::Main };
             menu.cursor = match from {
@@ -1329,6 +1371,7 @@ fn menu_input(
     }
     let (rows, first) = items(&menu, &settings, &garage, &track, &maps);
     if nav.vertical != 0 {
+        snd.write(sfx::UiSfx::play(sfx::keys::VSCROLL));
         if is_list(menu.page) {
             let n = if menu.page == Page::FastTravel { track.spawn_names.len() } else { maps.0.len() };
             menu.cursor = (menu.cursor as i32 + nav.vertical).rem_euclid(n.max(1) as i32) as usize;
@@ -1343,10 +1386,20 @@ fn menu_input(
     if nav.horizontal != 0 {
         if let Act::Opt(o) = row.act {
             adjust(&mut settings, o, nav.horizontal);
+            snd.write(sfx::option_step(o, nav.horizontal));
             menu.dirty = true;
         }
     }
     if nav.confirm {
+        match row.act {
+            Act::None => {}
+            Act::Opt(o) => {
+                snd.write(sfx::option_step(o, 0));
+            }
+            _ => {
+                snd.write(sfx::UiSfx::play(sfx::keys::ACCEPT));
+            }
+        }
         activate(row.act, &mut menu, &mut settings, &path, &garage, &track, &mut rig, &mut actions, &mut exit, &mut switch);
     }
 }
@@ -1502,9 +1555,10 @@ fn menu_mouse(
     mut rig: ResMut<CameraRig>,
     mut actions: MessageWriter<GameAction>,
     mut exit: MessageWriter<AppExit>,
+    mut snd: MessageWriter<sfx::UiSfx>,
     mut switch: ResMut<world_load::MapSwitch>,
 ) {
-    if !menu.open {
+    if !menu.open || cards::owns(&menu) {
         return;
     }
     for (interaction, row) in &rows {
@@ -1529,6 +1583,7 @@ fn menu_mouse(
                 menu.dirty = true;
             }
             Interaction::Pressed => {
+                snd.write(sfx::UiSfx::play(sfx::keys::ACCEPT));
                 activate(act, &mut menu, &mut settings, &path, &garage, &track, &mut rig, &mut actions, &mut exit, &mut switch);
                 return;
             }
@@ -1569,7 +1624,7 @@ fn draw_menu(
     menu.dirty = false;
     let Ok(mut vis) = root.single_mut() else { return };
     // The main page is FH1's own scene when the `ui` group is installed.
-    let placeholder = menu.open && !(menu.page == Page::Main && fh1.is_some()) && menu.page != Page::Map;
+    let placeholder = menu.open && !(menu.page == Page::Main && fh1.is_some()) && menu.page != Page::Map && !cards::owns(&menu);
     *vis = if placeholder { Visibility::Inherited } else { Visibility::Hidden };
     let Ok(panel) = panel.single() else { return };
     commands.entity(panel).despawn_children();

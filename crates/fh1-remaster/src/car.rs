@@ -411,7 +411,7 @@ impl Plugin for RemasterCarPlugin {
             return;
         }
         app.add_plugins(MaterialPlugin::<CarPaintMaterial>::default()).init_resource::<CarMaterials>().init_resource::<CarFill>();
-        let _ = app.world_mut().resource_mut::<Assets<Shader>>().insert(&crate::car_paint::SHADER, Shader::from_wgsl(crate::car_paint::WGSL, "fh1_remaster/car_paint.wgsl"));
+        let _ = app.world_mut().resource_mut::<Assets<Shader>>().insert(&crate::car_paint::SHADER, Shader::from_wgsl(crate::car_paint::wgsl(), "fh1_remaster/car_paint.wgsl"));
         app.add_systems(Update, (update_car_fill, mark_bodies, request_variants, restyle_car_materials, update_lamps).chain()).add_observer(apply_variants);
         if transp_lod_on() {
             app.add_systems(Update, transparency_lod.after(restyle_car_materials));
