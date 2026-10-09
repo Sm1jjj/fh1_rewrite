@@ -2,25 +2,51 @@
 //! average-speed gates and the photo-shoot spots, drawn in FH1's marker look so the player can see them while driving.
 //! `FH1_MISSION_MARKERS=0` = none. Needs the race marker shader (`FH1_RACE_FX` on, race/visuals.rs embeds it).
 //!
-//! INFERRED style (no FH1 captures of these; the shapes and colours are ours, the look is race/visuals.rs):
-//! - Outpost: a ground ring over the TriggerZone (`radius`) and a tall soft light column at the forecourt, Horizon
-//!   orange. Available = full column + ring; Done (all three missions completed) = desaturated, dim, short column;
-//!   Locked (not discovered) = no column, faint ring (as the map's padlock icon).
-//! - Speed camera: a glowing stripe across the road on the ground between the two posts, a low see-through curtain
-//!   over it and a lit post at each end. Yellow, Done (has a best speed) = green. Average-speed zone: the same at
-//!   both gates, blue, Done (has a best) = green.
-//! - Photo shoot: shown only while that mission runs ([`MarkerFocus`], set by outpost.rs): a cyan column with a
-//!   floating viewfinder frame (the "camera icon") and a radius ring at each zone.
-//! - Visible within a draw distance (outposts 1200 m, cameras / gates 400 m, photo zones 800 m, +60 m hysteresis);
+//! - Horizon Outpost (P19 redesign; the orange TriggerZone ring + 110 m light column were not FH1 and stood in the
+//!   wrong place). VERIFIED: the outposts are physical Horizon-branded gas stations; their gas_stations.xml
+//!   TriggerZone says `is_activation="false"` (as every venue: festival buildings, street race hubs; race events
+//!   leave it out), the game ships no marker model / effect for them (no ANIM_GPLY_* or effects.zip piece but the race
+//!   lasers), and the map icon is MapIconSheet cell (1,2): a white "H" in a white-rimmed black diamond, layer colour
+//!   233,233,233 (MapProfileFullscreen.xml `gas_station`). VERIFIED (offline probe of Colorado's collision, test
+//!   `anchors_have_ground`): 8 of the 10 `GASSTATION_NNN` points have no ground under them at all (they sit in the
+//!   building), so the old column stood inside the shop and the 29-76 m ring cut through buildings; every
+//!   `OUTPOST_NNN_NODE` (where the game parks the car for the outpost cutscene) is on open forecourt ground, no roof
+//!   within 20 m. INFERRED (ours, restrained): at the node, one upright camera-facing emblem drawn as that map icon
+//!   (style 20, 4 m, centre 6.5 m up, dark backing so it reads in daylight, a minimum screen size far away) and a soft
+//!   6 m ground pad (style 22). Available = full; Done (all three missions) = dimmer, same hue (the map greys it);
+//!   Locked (not discovered) = faint emblem, no pad. Emblem gone inside 6 m, in from 18 m; out by 700 m.
+//! - Speed camera / average-speed zone (P19 redesign; the earlier stripe + curtain + glowing posts were not FH1):
+//!   VERIFIED FH1 draws no marker effect for them. The traps are the physical festival camera posts ("a set of speed
+//!   cameras mounted on top of posts", Forza Wiki "Speed Trap"; "speed trap photo boxes", "speed zones are defined
+//!   by two linked speed trap devices", IGN FH1 guide), which we already place from GameObjs (`O_CO_FEST_SpeedCamera_001`
+//!   677 / `O_CO_Fest_SpeedCamera_Average` 683, docs/PROPS.md). Their material is plain `h_diff_1.fx` (one diffuse
+//!   texture, no emissive), and speed_camera.xml / average_speed.xml / ambient_challenge_activations.xml hold no
+//!   marker, effect or beam behaviour (only game control + the scoreboard screen). The map icon is a camera: white
+//!   for a speed trap, the same icon on yellow for a speed zone (Forza Wiki "Lawbreaker", xboxachievements.com).
+//!   So ours stays minimal: one small soft glint (camera-facing sprite, style 30) on each post's camera box, white for
+//!   a camera, yellow for a zone (the map icon colours), dimmer once it has a best (Done, INFERRED; same hue). The box
+//!   is VERIFIED from the template bounds (rmb_list 677: box 0.09..1.32 m towards the road, 3.26..4.26 m up; 683: the
+//!   arm's box ~2.8 m towards the road, 3.90..4.59 m up) and the GameObjs axes (every post's box points at its partner
+//!   post), placed from the post's own origin (the prop's, not ground-snapped). It fades in from 30 m to 10 m (gone
+//!   as you pass under it) and out by 400 m. `FH1_TRAP_LINE=1` (INFERRED, not FH1, default off) adds a faint soft
+//!   line on the road between the two boxes, ground-sampled every ~1.5 m so it follows camber and slopes.
+//! - Photo shoot: shown only while that mission runs ([`MarkerFocus`], set by outpost.rs). VERIFIED
+//!   (mission_photoshoots.xml + TrackRoute NamedTransforms): a shoot's 1-32 `PhotoZone`s (radius 50, one 600) are
+//!   overlapping circles 11-95 m apart that tile the area where the shot counts, not destinations, so the old ring +
+//!   column on every zone was a field of up to 32 beacons; the one authored spot is `mission_photo_pose_01`, where
+//!   the satnav already points (outpost.rs). The map's route and destination pin are green 74,238,97
+//!   (MapProfileFullscreen.xml `route`). INFERRED: ONE marker at the pose: a viewfinder emblem (style 21), a soft
+//!   9 m pad and a slender green beacon (style 23, 60 m) to find it from afar; gone up close; out by 1,500 m.
+//! - Visible within a draw distance (outposts 700 m, camera / zone glints 400 m, photo spot 1,500 m, +60 m hysteresis);
 //!   the shader fades them in / out by distance. Hidden during races (`RaceState::race`) and cutscenes.
 //!
 //! Perf (docs/PERF.md, PERF_P15_B marker merge): the same trick as race/visuals.rs `merged_markers`. Every visible
-//! marker is baked into ONE world-space mesh on ONE entity with ONE additive material (one transparent draw call in
-//! total, whatever is in range). Per-piece colour / intensity / fades ride in vertex attributes; pulse and rising
+//! marker is baked into ONE world-space mesh on ONE entity with ONE material (additive, premultiplied so the emblems
+//! can darken their backing; one transparent draw call in total, whatever is in range). Per-piece colour / intensity / fades ride in vertex attributes; pulse and rising
 //! bands are animated in marker.wgsl from `globals.time`, so nothing is rewritten per frame. The mesh is rebuilt only
 //! when the visible set, the profile (`Profile.generation` / `MissionMapIcons.generation`) or the focus changes,
 //! padded to power-of-two capacities so the allocator reuses the range. Ground heights (a ray per ring vertex /
-//! gate post) are taken once per marker, the first time it comes into range. The entity is a `WorldEntity`, so a
+//! trap road-line point) are taken once per marker, the first time it comes into range. The entity is a `WorldEntity`, so a
 //! map switch despawns it; a new `WorldGeneration` rebuilds the item list. The material is this file's own copy of
 //! race/visuals.rs `MarkerMaterial` (that one's fields are private) on the same shader.
 
@@ -45,8 +71,8 @@ pub fn markers_on() -> bool {
     *ON.get_or_init(|| super::flag_on("FH1_MISSION_MARKERS"))
 }
 
-/// The photo-shoot mission that is running (`photoshoot_NN`, a `PhotoShoot::name`), set by outpost.rs; its zones get
-/// markers while it is `Some`.
+/// The photo-shoot mission that is running (`photoshoot_NN`, a `PhotoShoot::name`), set by outpost.rs; its photo spot
+/// gets a marker while it is `Some`.
 #[derive(Resource, Default, Clone, Debug, PartialEq)]
 pub struct MarkerFocus(pub Option<String>);
 
@@ -120,8 +146,10 @@ impl Material for MissionMarkerMaterial {
         d.primitive.cull_mode = None;
         if let Some(f) = d.fragment.as_mut() {
             for t in f.targets.iter_mut().flatten() {
+                // Premultiplied: additive for every style that writes alpha 0, and the emblems' dark backing
+                // (styles 20 / 21 write alpha) darkens what is behind them.
                 t.blend = Some(BlendState {
-                    color: BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add },
+                    color: BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::OneMinusSrcAlpha, operation: BlendOperation::Add },
                     alpha: BlendComponent { src_factor: BlendFactor::Zero, dst_factor: BlendFactor::One, operation: BlendOperation::Add },
                 });
             }
@@ -147,9 +175,9 @@ impl Kind {
     /// Draw distance (m).
     pub fn show_m(self) -> f32 {
         match self {
-            Kind::Outpost => 1200.0,
+            Kind::Outpost => 700.0,
             Kind::Camera | Kind::Average => 400.0,
-            Kind::Photo => 800.0,
+            Kind::Photo => 1500.0,
         }
     }
 }
@@ -174,16 +202,26 @@ fn hdr(r: u8, g: u8, b: u8, k: f32) -> LinearRgba {
 
 /// State -> look (see the module docs).
 pub fn style(kind: Kind, state: IconState) -> Style {
-    let done_green = hdr(90, 230, 170, 2.0);
     match (kind, state) {
-        (Kind::Outpost, IconState::Available) => Style { colour: hdr(255, 140, 10, 2.0), intensity: 1.0, column: Some(110.0), ring: 0.9, emphasis: 0.4 },
-        (Kind::Outpost, IconState::Done) => Style { colour: hdr(205, 175, 145, 1.6), intensity: 0.45, column: Some(45.0), ring: 0.4, emphasis: 0.0 },
-        (Kind::Outpost, IconState::Locked) => Style { colour: hdr(255, 140, 10, 1.6), intensity: 0.35, column: None, ring: 0.35, emphasis: 0.0 },
-        (Kind::Camera, IconState::Done) | (Kind::Average, IconState::Done) => Style { colour: done_green, intensity: 0.6, column: None, ring: 0.6, emphasis: 0.0 },
-        (Kind::Camera, s) => Style { colour: hdr(255, 215, 60, 2.0), intensity: if s == IconState::Locked { 0.4 } else { 1.0 }, column: None, ring: 1.0, emphasis: 0.0 },
-        (Kind::Average, s) => Style { colour: hdr(110, 190, 255, 2.0), intensity: if s == IconState::Locked { 0.4 } else { 1.0 }, column: None, ring: 1.0, emphasis: 0.0 },
-        (Kind::Photo, IconState::Done) => Style { colour: hdr(120, 230, 255, 1.6), intensity: 0.5, column: Some(40.0), ring: 0.5, emphasis: 0.0 },
-        (Kind::Photo, _) => Style { colour: hdr(120, 230, 255, 2.0), intensity: 1.0, column: Some(70.0), ring: 0.9, emphasis: 0.4 },
+        // Outpost: the map icon's white (layer colour 233); `intensity` = the emblem, `ring` = the ground pad, no
+        // beacon (`column`). Done = greyed (dimmer), Locked = faint, no pad.
+        (Kind::Outpost, IconState::Available) => Style { colour: hdr(233, 233, 233, 1.4), intensity: 1.0, column: None, ring: 0.45, emphasis: 0.2 },
+        (Kind::Outpost, IconState::Done) => Style { colour: hdr(233, 233, 233, 1.4), intensity: 0.55, column: None, ring: 0.25, emphasis: 0.0 },
+        (Kind::Outpost, IconState::Locked) => Style { colour: hdr(233, 233, 233, 1.4), intensity: 0.35, column: None, ring: 0.0, emphasis: 0.0 },
+        // Glint colour = the FH1 map icon's (white trap, yellow zone); `ring` = the optional road line's intensity.
+        (Kind::Camera | Kind::Average, s) => {
+            let colour = if kind == Kind::Camera { hdr(255, 246, 228, 1.6) } else { hdr(255, 196, 40, 1.6) };
+            let intensity = match s {
+                IconState::Done => 0.5,
+                IconState::Locked => 0.35,
+                _ => 0.9,
+            };
+            Style { colour, intensity, column: None, ring: 0.35, emphasis: 0.0 }
+        }
+        // Photo spot: the map's route / destination green; `column` = the beacon height (m). Only shown while its
+        // mission runs, so it is never Done / Locked in practice.
+        (Kind::Photo, IconState::Available) => Style { colour: hdr(74, 238, 97, 1.4), intensity: 1.0, column: Some(PHOTO_BEACON_M), ring: 0.5, emphasis: 0.2 },
+        (Kind::Photo, _) => Style { colour: hdr(74, 238, 97, 1.4), intensity: 0.5, column: Some(PHOTO_BEACON_M), ring: 0.3, emphasis: 0.0 },
     }
 }
 
@@ -222,17 +260,18 @@ enum Shape {
 enum Prep {
     /// Ground point at the centre, and the ground height at each ring vertex angle (`ring_segments + 1` values).
     Disc { ground: Vec3, ys: Vec<f32> },
-    Gate { l: Vec3, r: Vec3 },
+    /// Ground points of the optional road line between the two camera boxes (empty without `FH1_TRAP_LINE=1`).
+    Gate { line: Vec<Vec3> },
 }
 
 #[derive(Clone, Debug)]
 struct Item {
     kind: Kind,
     name: String,
-    /// Photo zones: the photo shoot they belong to.
+    /// Photo spot: the photo shoot it belongs to.
     shoot: String,
     state: IconState,
-    /// Data position (centre of a ring, middle of a gate).
+    /// Data position (outpost node / photo pose: the pad's centre; middle of a gate).
     pos: Vec3,
     shape: Shape,
     prep: Option<Prep>,
@@ -263,8 +302,8 @@ fn build_items(d: &MissionData) -> Vec<Item> {
             name: o.name.clone(),
             shoot: String::new(),
             state: IconState::Available,
-            pos: Vec3::from_array(o.pos),
-            shape: Shape::Disc(o.radius.max(15.0)),
+            pos: outpost_anchor(o),
+            shape: Shape::Disc(OUTPOST_PAD_M),
             prep: None,
         });
     }
@@ -279,19 +318,39 @@ fn build_items(d: &MissionData) -> Vec<Item> {
         }
     }
     for s in &d.photo_shoots {
-        for z in &s.zones {
-            out.push(Item {
-                kind: Kind::Photo,
-                name: s.name.clone(),
-                shoot: s.name.clone(),
-                state: IconState::Available,
-                pos: Vec3::from_array(z.pos),
-                shape: Shape::Disc(z.radius.max(10.0)),
-                prep: None,
-            });
-        }
+        let Some(pos) = photo_anchor(s) else { continue };
+        out.push(Item { kind: Kind::Photo, name: s.name.clone(), shoot: s.name.clone(), state: IconState::Available, pos, shape: Shape::Disc(PHOTO_PAD_M), prep: None });
     }
     out
+}
+
+/// Ground pad radii (m): a parking spot at the outpost, a little wider at the photo spot.
+const OUTPOST_PAD_M: f32 = 6.0;
+const PHOTO_PAD_M: f32 = 9.0;
+/// Emblem centre above the ground (m) at its base size: its bottom edge is well over a car / van roof.
+const EMBLEM_Y_M: f32 = 6.5;
+/// Emblem half sizes (m, x across / y up): the outpost diamond, the 4:3 photo plate.
+const OUTPOST_EMBLEM_HALF: (f32, f32) = (2.0, 2.0);
+const PHOTO_EMBLEM_HALF: (f32, f32) = (2.4, 1.8);
+/// Photo beacon height and half width (m).
+const PHOTO_BEACON_M: f32 = 60.0;
+const PHOTO_BEACON_HALF_W: f32 = 0.9;
+
+/// Where an outpost's marker stands: `OUTPOST_NNN_NODE` (the game parks the car there for the outpost cutscene; on
+/// the forecourt), not the `GASSTATION_NNN` TriggerZone centre (inside the building at 8 of 10 outposts, see the
+/// module docs). An install without the node (all zero) falls back to the zone centre.
+fn outpost_anchor(o: &super::data::Outpost) -> Vec3 {
+    let node = Vec3::from_array(o.place.pos);
+    if node == Vec3::ZERO {
+        Vec3::from_array(o.pos)
+    } else {
+        node
+    }
+}
+
+/// A photo shoot's one marker: `mission_photo_pose_01` (the satnav target), else its first zone.
+fn photo_anchor(s: &super::data::PhotoShoot) -> Option<Vec3> {
+    s.pose.map(|p| p.point()).or_else(|| s.zones.first().map(|z| Vec3::from_array(z.pos)))
 }
 
 /// Recompute every item's state from the profile.
@@ -315,10 +374,15 @@ fn restyle(items: &mut [Item], d: &MissionData, s: &MissionsSave) {
 /// Ground height under `p`: a ray from just above `ref_y` (stays under station canopies), else from 50 m up (a hit
 /// within 30 m of `ref_y` only, so a roof is not taken for the ground), else `ref_y`.
 fn ground_y(track: &crate::track::Track, p: Vec3, ref_y: f32) -> f32 {
-    if let Some(h) = track.ground.ray(Vec3::new(p.x, ref_y + 3.0, p.z), Vec3::NEG_Y, 10.0) {
+    ground_at(&*track.ground, p, ref_y)
+}
+
+/// [`ground_y`] on any ground (the offline placement audit uses the world's directly).
+fn ground_at(g: &dyn crate::vehicle::Ground, p: Vec3, ref_y: f32) -> f32 {
+    if let Some(h) = g.ray(Vec3::new(p.x, ref_y + 3.0, p.z), Vec3::NEG_Y, 10.0) {
         return h.point.y;
     }
-    if let Some(h) = track.ground.ray(Vec3::new(p.x, ref_y + 50.0, p.z), Vec3::NEG_Y, 100.0) {
+    if let Some(h) = g.ray(Vec3::new(p.x, ref_y + 50.0, p.z), Vec3::NEG_Y, 100.0) {
         if (h.point.y - ref_y).abs() < 30.0 {
             return h.point.y;
         }
@@ -329,11 +393,6 @@ fn ground_y(track: &crate::track::Track, p: Vec3, ref_y: f32) -> f32 {
 /// Ring vertices around a circle of radius `r`: about one per 1.5 m of arc.
 fn ring_segments(r: f32) -> u32 {
     ((r / 1.5) as u32).clamp(24, 96)
-}
-
-/// Ring band width (m) for a zone radius.
-fn ring_width(r: f32) -> f32 {
-    (r * 0.06).clamp(2.0, 4.5)
 }
 
 fn prep_item(it: &mut Item, y_at: &dyn Fn(Vec3, f32) -> f32) {
@@ -353,16 +412,67 @@ fn prep_item(it: &mut Item, y_at: &dyn Fn(Vec3, f32) -> f32) {
                 .collect();
             Prep::Disc { ground: c, ys }
         }
-        Shape::Gate(l, r) => Prep::Gate { l: Vec3::new(l.x, y_at(l, l.y), l.z), r: Vec3::new(r.x, y_at(r, r.y), r.z) },
+        Shape::Gate(l, r) => Prep::Gate { line: if trap_line_on() { gate_line(it.kind, l, r, y_at) } else { Vec::new() } },
     });
+}
+
+/// `FH1_TRAP_LINE=1`: a faint line on the road across each speed camera / zone gate (not FH1; default off).
+fn trap_line_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_TRAP_LINE").is_ok_and(|v| v == "1"))
+}
+
+/// VERIFIED (bin.zip template bounds, `rmb_list` 677 / 683, and the GameObjs axes: every post's box overhangs towards
+/// its partner post): the camera box centre from a post's origin, (metres towards the other post, metres up), and
+/// the glint's half size (m). 677 `O_CO_FEST_SpeedCamera_001`: pole 3.68 m, box x 0.09..1.32, y 3.26..4.26.
+/// 683 `O_CO_Fest_SpeedCamera_Average`: pole 3.82 m, an arm out to the box at ~2.8 m, y 3.90..4.59.
+fn camera_head(kind: Kind) -> (f32, f32, f32) {
+    if kind == Kind::Average {
+        (2.78, 4.25, 0.95)
+    } else {
+        (0.70, 3.76, 1.05)
+    }
+}
+
+/// The glint centres of a gate's two posts (data positions = the props' origins, so no ground snap).
+fn gate_heads(kind: Kind, l: Vec3, r: Vec3) -> [Vec3; 2] {
+    let (out, up, _) = camera_head(kind);
+    let d = Vec3::new(r.x - l.x, 0.0, r.z - l.z).normalize_or(Vec3::X);
+    [l + d * out + Vec3::Y * up, r - d * out + Vec3::Y * up]
+}
+
+/// Ground points from under one camera box to under the other, about every 1.5 m, each from its own ray (the line
+/// follows camber, slopes and a bridge deck; the reference height is the posts' interpolated).
+fn gate_line(kind: Kind, l: Vec3, r: Vec3, y_at: &dyn Fn(Vec3, f32) -> f32) -> Vec<Vec3> {
+    let (out, ..) = camera_head(kind);
+    let d = Vec3::new(r.x - l.x, 0.0, r.z - l.z);
+    let len = d.length();
+    if len < 2.0 * out + 1.0 {
+        return Vec::new();
+    }
+    let dir = d / len;
+    let (a, b) = (l + dir * out, r - dir * out);
+    let n = ((len - 2.0 * out) / 1.5).ceil().max(2.0) as usize;
+    (0..=n)
+        .map(|k| {
+            let p = a.lerp(b, k as f32 / n as f32);
+            Vec3::new(p.x, y_at(p, p.y), p.z)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- mesh bake
 
-const BEAM: u8 = 0;
-const RING: u8 = 1;
-const CURTAIN: u8 = 3;
-const BAR: u8 = 6;
+/// marker.wgsl styles 20-23 (`mission_marker`): outpost emblem (the map's "H" diamond), photo emblem (viewfinder),
+/// ground pad, beacon ribbon.
+const EMBLEM_OUTPOST: u8 = 20;
+const EMBLEM_PHOTO: u8 = 21;
+const PAD: u8 = 22;
+const BEACON: u8 = 23;
+/// marker.wgsl style 30: soft camera-facing glint (speed camera / zone box).
+const GLINT: u8 = 30;
+/// marker.wgsl style 31: faint soft line on the road (`FH1_TRAP_LINE=1`).
+const ROAD_LINE: u8 = 31;
 
 /// Per-piece shader parameters.
 #[derive(Clone, Copy, Debug)]
@@ -423,33 +533,30 @@ impl Bake {
         }
     }
 
-    /// Open cylinder (vertical light column) of radius `r` and height `h` standing on `base`.
-    fn beam(&mut self, base: Vec3, r: f32, h: f32, a: &Attr) {
-        self.grid(16, 4, BEAM, a, |_, _, u, w| {
-            let ang = u * std::f32::consts::TAU;
-            let n = Vec3::new(ang.cos(), 0.0, ang.sin());
-            (base + n * r + Vec3::Y * (w * h), n, w * h)
+    /// Upright camera-facing emblem (marker.wgsl 20 / 21) centred on `c`, `hx` x `hy` m half size. Each corner's
+    /// position is where it would be facing +Z (so the mesh Aabb covers it), its normal the offset from `c`, and the
+    /// local height `hy` (the shader grows the emblem upwards from its bottom edge when it scales it up far away).
+    fn emblem(&mut self, c: Vec3, hx: f32, hy: f32, style: u8, a: &Attr) {
+        self.grid(1, 1, style, a, |_, _, u, w| {
+            let o = Vec3::new((u * 2.0 - 1.0) * hx, (w * 2.0 - 1.0) * hy, 0.0);
+            (c + o, o, hy)
         });
     }
 
-    /// Glowing tube of radius `r` from `a0` to `a1`.
-    fn tube(&mut self, a0: Vec3, a1: Vec3, r: f32, a: &Attr) {
-        let axis = (a1 - a0).normalize_or(Vec3::Y);
-        let u_ax = axis.any_orthonormal_vector();
-        let v_ax = axis.cross(u_ax);
-        let len = a0.distance(a1);
-        self.grid(8, 1, BAR, a, |_, _, u, w| {
-            let ang = u * std::f32::consts::TAU;
-            let n = u_ax * ang.cos() + v_ax * ang.sin();
-            (a0 + (a1 - a0) * w + n * r, n, w * len)
+    /// Upright camera-facing light ribbon (marker.wgsl 23), `half_w` m half width, `h` m tall, standing on `base`;
+    /// the normal carries each vertex's sideways offset (the shader turns it to the camera and widens it far away).
+    fn beacon(&mut self, base: Vec3, half_w: f32, h: f32, a: &Attr) {
+        self.grid(1, 6, BEACON, a, |_, _, u, w| {
+            let o = Vec3::new((u * 2.0 - 1.0) * half_w, 0.0, 0.0);
+            (base + Vec3::Y * (w * h) + o, o, w * h)
         });
     }
 
-    /// Flat ring band from `radius - width` to `radius` around `c` (x, z), each angular step at its own height
-    /// `ys[i]` (+ 0.15 m); `ys` has `segs + 1` entries.
+    /// Flat ground pad (marker.wgsl 22): an annulus from `radius - width` to `radius` around `c` (x, z), each angular
+    /// step at its own height `ys[i]` (+ 0.15 m); `ys` has `segs + 1` entries.
     fn ring(&mut self, c: Vec3, radius: f32, width: f32, ys: &[f32], segs: u32, a: &Attr) {
         let inner = (radius - width).max(0.5);
-        self.grid(segs, 4, RING, a, |i, _, u, w| {
+        self.grid(segs, 2, PAD, a, |i, _, u, w| {
             let ang = u * std::f32::consts::TAU;
             let rr = inner + (radius - inner) * w;
             let y = ys.get(i as usize).copied().unwrap_or(c.y) + 0.15;
@@ -457,10 +564,23 @@ impl Bake {
         });
     }
 
-    /// See-through curtain, `width` wide along `dir` (unit, x / z), `height` tall, centred on `base`.
-    fn curtain(&mut self, base: Vec3, dir: Vec3, width: f32, height: f32, a: &Attr) {
-        let n = Vec3::new(-dir.z, 0.0, dir.x);
-        self.grid(4, 2, CURTAIN, a, |_, _, u, w| (base + dir * ((u - 0.5) * width) + Vec3::Y * (w * height), n, w * height));
+    /// Camera-facing glint sprite at `c`, `half` m half size: all four vertices sit on `c`, the normal carries the
+    /// corner offset in the view plane (x right, y up) and z = how far it is pulled towards the camera (so the box
+    /// doesn't cut it); marker.wgsl expands it.
+    fn glint(&mut self, c: Vec3, half: f32, pull: f32, a: &Attr) {
+        self.grid(1, 1, GLINT, a, |_, _, u, w| (c, Vec3::new((u * 2.0 - 1.0) * half, (w * 2.0 - 1.0) * half, pull), 0.0));
+    }
+
+    /// Flat strip `width` m wide along the ground points `pts` (+ 0.1 m), u along, w across.
+    fn road_line(&mut self, pts: &[Vec3], width: f32, a: &Attr) {
+        let (Some(first), Some(last)) = (pts.first(), pts.last()) else { return };
+        let d = Vec3::new(last.x - first.x, 0.0, last.z - first.z).normalize_or(Vec3::X);
+        let side = Vec3::new(-d.z, 0.0, d.x) * width;
+        let n = pts.len().saturating_sub(1) as u32;
+        if n == 0 {
+            return;
+        }
+        self.grid(n, 2, ROAD_LINE, a, |i, _, _, w| (pts[i as usize] + Vec3::Y * 0.1 + side * (w - 0.5), Vec3::Y, 0.0));
     }
 
     fn into_mesh(self, vcap: usize, tcap: usize) -> Mesh {
@@ -500,52 +620,39 @@ fn capacity(n: usize, cur: usize, min: usize) -> usize {
     }
 }
 
-/// Floating viewfinder frame (the photo "camera icon"): two crossing frames of four tubes, `w` x `h` m, centred on `c`.
-fn viewfinder(b: &mut Bake, c: Vec3, w: f32, h: f32, a: &Attr) {
-    for dir in [Vec3::X, Vec3::Z] {
-        let (hw, hh) = (w * 0.5, h * 0.5);
-        let p = [c - dir * hw - Vec3::Y * hh, c + dir * hw - Vec3::Y * hh, c + dir * hw + Vec3::Y * hh, c - dir * hw + Vec3::Y * hh];
-        for k in 0..4 {
-            b.tube(p[k], p[(k + 1) % 4], 0.18, a);
-        }
-    }
-}
-
 /// The pieces of one item (needs `prep`).
 fn add_item(b: &mut Bake, it: &Item) {
     let st = style(it.kind, it.state);
     match (&it.shape, &it.prep) {
         (Shape::Disc(r), Some(Prep::Disc { ground, ys })) => {
-            let (ring_fade, col_fade) = if it.kind == Kind::Outpost {
-                ([2.0, 6.0, 900.0, 1200.0], [10.0, 40.0, 1000.0, 1200.0])
+            // Fades (near in / out, far in / out, m). The emblem is gone right under it (6 m) and back by 18 m; the pad
+            // is a near-field cue only; the photo beacon goes once you are there (60 -> 20 m).
+            let (pad_f, emblem_f, beacon_f) = if it.kind == Kind::Outpost {
+                ([1.0, 4.0, 200.0, 280.0], [6.0, 18.0, 600.0, 700.0], [0.0; 4])
             } else {
-                ([2.0, 6.0, 600.0, 800.0], [10.0, 40.0, 650.0, 800.0])
+                ([1.0, 4.0, 300.0, 400.0], [6.0, 18.0, 900.0, 1000.0], [20.0, 60.0, 1350.0, 1500.0])
             };
+            // Draw order inside the one draw: pad, beacon, then the emblem, so its dark backing sits in front of the beacon.
             let segs = ys.len().saturating_sub(1) as u32;
-            if segs >= 3 {
-                b.ring(*ground, *r, ring_width(*r), ys, segs, &Attr::new(st.colour, st.intensity * st.ring, ring_fade, st.emphasis));
+            if st.ring > 0.0 && segs >= 3 {
+                b.ring(*ground, *r, *r * 0.6, ys, segs, &Attr::new(st.colour, st.intensity * st.ring, pad_f, st.emphasis));
             }
             if let Some(h) = st.column {
-                b.beam(*ground, 1.4, h, &Attr::new(st.colour, st.intensity, col_fade, st.emphasis));
-                b.beam(*ground, 4.0, h * 0.7, &Attr::new(st.colour, st.intensity * 0.22, col_fade, st.emphasis));
-                if it.kind == Kind::Photo {
-                    viewfinder(b, *ground + Vec3::Y * (h * 0.35), 6.0, 4.0, &Attr::new(st.colour, st.intensity * 1.2, col_fade, 0.0));
-                }
+                b.beacon(*ground, PHOTO_BEACON_HALF_W, h, &Attr::new(st.colour, st.intensity * 0.6, beacon_f, 0.0));
             }
+            let (style_id, (hx, hy)) = if it.kind == Kind::Outpost { (EMBLEM_OUTPOST, OUTPOST_EMBLEM_HALF) } else { (EMBLEM_PHOTO, PHOTO_EMBLEM_HALF) };
+            b.emblem(*ground + Vec3::Y * EMBLEM_Y_M, hx, hy, style_id, &Attr::new(st.colour, st.intensity, emblem_f, st.emphasis));
         }
-        (Shape::Gate(..), Some(Prep::Gate { l, r })) => {
-            let (stripe_f, post_f, curtain_f) = ([1.0, 4.0, 300.0, 400.0], [3.0, 10.0, 300.0, 400.0], [3.0, 12.0, 300.0, 400.0]);
-            let lift = Vec3::Y * 0.12;
-            b.tube(*l + lift, *r + lift, 0.2, &Attr::new(st.colour, st.intensity * st.ring, stripe_f, 0.0));
-            let post = Attr::new(st.colour, st.intensity * 1.1, post_f, 0.0);
-            for p in [*l, *r] {
-                b.tube(p, p + Vec3::Y * 4.5, 0.22, &post);
+        (Shape::Gate(l, r), Some(Prep::Gate { line })) => {
+            // Glints: gone as you pass under (30 -> 10 m), out by the draw distance. Road line: near only.
+            let (glint_f, line_f) = ([10.0, 30.0, 330.0, 400.0], [2.0, 6.0, 110.0, 160.0]);
+            let (.., half) = camera_head(it.kind);
+            let glint = Attr::new(st.colour, st.intensity, glint_f, 0.0);
+            for c in gate_heads(it.kind, *l, *r) {
+                b.glint(c, half, 0.8, &glint);
             }
-            let d = Vec3::new(r.x - l.x, 0.0, r.z - l.z);
-            let len = d.length();
-            if len > 0.5 {
-                let mid = (*l + *r) * 0.5;
-                b.curtain(Vec3::new(mid.x, l.y.min(r.y), mid.z), d / len, len, 3.0, &Attr::new(st.colour, st.intensity * 0.7, curtain_f, 0.0));
+            if line.len() >= 2 {
+                b.road_line(line, 0.6, &Attr::new(st.colour, st.intensity * st.ring, line_f, 0.0));
             }
         }
         _ => {}
@@ -723,31 +830,31 @@ mod tests {
     }
 
     #[test]
-    fn ring_mesh_counts_and_radii() {
-        let it = disc(Kind::Outpost, IconState::Locked, 54.0);
+    fn pad_mesh_counts_and_radii() {
+        let it = disc(Kind::Outpost, IconState::Available, OUTPOST_PAD_M);
         let Some(Prep::Disc { ground, ys }) = &it.prep else { panic!("prep") };
-        let segs = ring_segments(54.0);
+        let segs = ring_segments(OUTPOST_PAD_M);
+        assert_eq!(segs, 24);
         assert_eq!(ys.len() as u32, segs + 1);
         let mut b = Bake::new(*ground);
         let a = Attr::new(LinearRgba::WHITE, 1.0, [0.0; 4], 0.0);
-        b.ring(*ground, 54.0, ring_width(54.0), ys, segs, &a);
-        assert_eq!(b.pos.len() as u32, (segs + 1) * 5);
-        assert_eq!(b.idx.len() as u32, segs * 4 * 6);
-        let (inner, outer) = (54.0 - ring_width(54.0), 54.0);
+        b.ring(*ground, OUTPOST_PAD_M, OUTPOST_PAD_M * 0.6, ys, segs, &a);
+        assert_eq!(b.pos.len() as u32, (segs + 1) * 3);
+        assert_eq!(b.idx.len() as u32, segs * 2 * 6);
+        let (inner, outer) = (OUTPOST_PAD_M * 0.4, OUTPOST_PAD_M);
         for p in &b.pos {
             let r = Vec2::new(p[0], p[2]).length();
             assert!(r >= inner - 1e-3 && r <= outer + 1e-3, "radius {r}");
             assert!((p[1] - 0.15).abs() < 1e-4);
         }
+        assert!(b.shape.iter().all(|s| s[0] == PAD as f32));
         assert!(b.idx.iter().all(|&i| (i as usize) < b.pos.len()));
     }
 
     #[test]
-    fn ring_segments_and_width_clamp() {
+    fn ring_segments_clamp() {
         assert_eq!(ring_segments(1.0), 24);
         assert_eq!(ring_segments(1000.0), 96);
-        assert_eq!(ring_width(10.0), 2.0);
-        assert_eq!(ring_width(500.0), 4.5);
     }
 
     #[test]
@@ -757,18 +864,118 @@ mod tests {
         assert_eq!(outpost_state(true, 3, 3), IconState::Done);
         assert_eq!(outpost_state(true, 0, 0), IconState::Available);
         let (a, d, l) = (style(Kind::Outpost, IconState::Available), style(Kind::Outpost, IconState::Done), style(Kind::Outpost, IconState::Locked));
-        assert!(a.column.unwrap() > d.column.unwrap());
+        // The map icon's white in every state (greyed = dimmer), no beacon; Locked has no pad.
+        assert!(a.colour == d.colour && d.colour == l.colour);
+        assert!((a.colour.red - a.colour.blue).abs() < 1e-6 && (a.colour.red - a.colour.green).abs() < 1e-6);
+        assert!(a.column.is_none() && d.column.is_none() && l.column.is_none());
         assert!(a.intensity > d.intensity && d.intensity > l.intensity);
-        assert!(l.column.is_none() && l.ring > 0.0);
+        assert!(a.ring > d.ring && l.ring == 0.0);
     }
 
     #[test]
-    fn camera_done_has_other_tint() {
+    fn outpost_pieces_pad_then_emblem() {
+        let it = disc(Kind::Outpost, IconState::Available, OUTPOST_PAD_M);
+        let b = build_bake(std::slice::from_ref(&it), &[true], it.pos);
+        let segs = ring_segments(OUTPOST_PAD_M) as usize;
+        assert_eq!(b.pos.len(), (segs + 1) * 3 + 4);
+        assert_eq!(b.shape.last().map(|s| s[0]), Some(EMBLEM_OUTPOST as f32));
+        assert!(!b.shape.iter().any(|s| s[0] == BEACON as f32));
+        // The emblem: four corners around a centre EMBLEM_Y_M over the ground, normal = offset, k.y = half height.
+        let n = b.pos.len();
+        let (hx, hy) = OUTPOST_EMBLEM_HALF;
+        for v in n - 4..n {
+            let (p, o) = (Vec3::from_array(b.pos[v]), Vec3::from_array(b.nrm[v]));
+            assert!((p - o - Vec3::Y * EMBLEM_Y_M).length() < 1e-4, "{p} {o}");
+            assert!((o.x.abs() - hx).abs() < 1e-5 && (o.y.abs() - hy).abs() < 1e-5 && o.z == 0.0);
+            assert_eq!(b.k[v][1], hy);
+        }
+        // Locked: the emblem only.
+        let l = disc(Kind::Outpost, IconState::Locked, OUTPOST_PAD_M);
+        assert_eq!(build_bake(std::slice::from_ref(&l), &[true], l.pos).pos.len(), 4);
+    }
+
+    #[test]
+    fn photo_pieces_pad_beacon_emblem() {
+        let it = disc(Kind::Photo, IconState::Available, PHOTO_PAD_M);
+        let b = build_bake(std::slice::from_ref(&it), &[true], it.pos);
+        let segs = ring_segments(PHOTO_PAD_M) as usize;
+        assert_eq!(b.pos.len(), (segs + 1) * 3 + 2 * 7 + 4);
+        let styles: Vec<u8> = b.shape.iter().map(|s| s[0] as u8).collect();
+        let first = |s: u8| styles.iter().position(|&x| x == s).unwrap();
+        assert!(first(PAD) < first(BEACON) && first(BEACON) < first(EMBLEM_PHOTO));
+        // The beacon stands on the pad's centre, PHOTO_BEACON_M tall, offsets only sideways.
+        let top = (0..b.pos.len()).filter(|&v| styles[v] == BEACON).map(|v| b.pos[v][1]).fold(0.0f32, f32::max);
+        assert!((top - PHOTO_BEACON_M).abs() < 1e-3);
+        for v in (0..b.pos.len()).filter(|&v| styles[v] == BEACON) {
+            let o = Vec3::from_array(b.nrm[v]);
+            assert!((o.x.abs() - PHOTO_BEACON_HALF_W).abs() < 1e-5 && o.y == 0.0 && o.z == 0.0);
+            assert!((b.pos[v][0] - o.x).abs() < 1e-4 && b.pos[v][2].abs() < 1e-4);
+        }
+    }
+
+    fn data_with(outposts: Vec<super::super::data::Outpost>, shoots: Vec<super::super::data::PhotoShoot>) -> MissionData {
+        MissionData { outposts, photo_shoots: shoots, ..Default::default() }
+    }
+
+    #[test]
+    fn outposts_stand_at_the_node_and_one_marker_per_shoot() {
+        use super::super::data::{Outpost, PhotoShoot, PhotoZone, Pose};
+        let o = Outpost { name: "GasStation_01".into(), pos: [100.0, 5.0, 100.0], radius: 54.0, place: Pose { pos: [80.0, 5.2, 120.0], yaw: 0.0 }, ..Default::default() };
+        let bare = Outpost { name: "GasStation_02".into(), pos: [300.0, 1.0, 0.0], ..Default::default() };
+        let zone = |x: f32| PhotoZone { pos: [x, 0.0, 0.0], radius: 50.0, max_mph: None };
+        let s = PhotoShoot { name: "photoshoot_02".into(), zones: (0..32).map(|i| zone(i as f32 * 40.0)).collect(), pose: Some(Pose { pos: [500.0, 2.0, 7.0], yaw: 0.0 }), ..Default::default() };
+        let no_pose = PhotoShoot { name: "photoshoot_07".into(), zones: vec![PhotoZone { pos: [9.0, 1.0, 9.0], radius: 600.0, max_mph: None }], ..Default::default() };
+        let items = build_items(&data_with(vec![o, bare], vec![s, no_pose]));
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].pos, Vec3::new(80.0, 5.2, 120.0));
+        assert_eq!(items[0].shape, Shape::Disc(OUTPOST_PAD_M));
+        assert_eq!(items[1].pos, Vec3::new(300.0, 1.0, 0.0));
+        assert_eq!((items[2].kind, items[2].pos, items[2].shoot.as_str()), (Kind::Photo, Vec3::new(500.0, 2.0, 7.0), "photoshoot_02"));
+        assert_eq!(items[3].pos, Vec3::new(9.0, 1.0, 9.0));
+        assert_eq!(items[3].shape, Shape::Disc(PHOTO_PAD_M));
+    }
+
+    /// Placement audit on the installed Colorado (skipped without the install): every outpost / photo anchor has
+    /// drivable ground within 1.5 m of its data height and no roof over the emblem.
+    #[test]
+    fn anchors_have_ground() {
+        use crate::vehicle::Ground;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(private) = crate::data::private_assets(&root.join("data")) else { return };
+        let Ok(g) = fh1_engine::world::WorldGround::load(&private.join("world/colorado")) else { return };
+        let d = MissionData::load(&private);
+        let items = build_items(&d);
+        let mut zone_centres_in_buildings = 0;
+        for o in &d.outposts {
+            let p = Vec3::from_array(o.pos);
+            if g.ray(p + Vec3::Y * 50.0, Vec3::NEG_Y, 100.0).is_none() {
+                zone_centres_in_buildings += 1;
+            }
+        }
+        for it in items.iter().filter(|it| matches!(it.kind, Kind::Outpost | Kind::Photo)) {
+            let hit = g.ray(it.pos + Vec3::Y * 3.0, Vec3::NEG_Y, 10.0);
+            let Some(h) = hit else { panic!("{}: no ground under the anchor {}", it.name, it.pos) };
+            assert!((h.point.y - it.pos.y).abs() < 1.5, "{}: ground {} vs data {}", it.name, h.point.y, it.pos.y);
+            assert!((ground_at(&g, it.pos, it.pos.y) - h.point.y).abs() < 1e-3);
+            let roof = g.ray(h.point + Vec3::Y * 0.5, Vec3::Y, EMBLEM_Y_M + 4.0);
+            assert!(roof.is_none(), "{}: roof {:?} over the emblem", it.name, roof.map(|r| r.point.y - h.point.y));
+        }
+        eprintln!("{} outposts, {zone_centres_in_buildings} GASSTATION points without ground under them", d.outposts.len());
+    }
+
+    #[test]
+    fn camera_done_is_dimmer_same_hue() {
         assert_eq!(best_state(true), IconState::Done);
         assert_eq!(best_state(false), IconState::Available);
-        assert_ne!(style(Kind::Camera, IconState::Done).colour, style(Kind::Camera, IconState::Available).colour);
-        assert_ne!(style(Kind::Average, IconState::Done).colour, style(Kind::Average, IconState::Available).colour);
-        assert!(style(Kind::Camera, IconState::Available).column.is_none());
+        for k in [Kind::Camera, Kind::Average] {
+            let (a, d) = (style(k, IconState::Available), style(k, IconState::Done));
+            assert_eq!(a.colour, d.colour);
+            assert!(d.intensity < a.intensity);
+            assert!(a.column.is_none());
+        }
+        // Map icon colours: white trap, yellow zone (blue well below red / green).
+        let (c, z) = (style(Kind::Camera, IconState::Available).colour, style(Kind::Average, IconState::Available).colour);
+        assert!(c.blue > 0.7 * c.red && z.blue < 0.1 * z.red && z.green > 0.4 * z.red);
     }
 
     #[test]
@@ -786,13 +993,45 @@ mod tests {
         let mut it = Item { kind: Kind::Camera, name: "c".into(), shoot: String::new(), state: IconState::Available, pos: (l + r) * 0.5, shape: Shape::Gate(l, r), prep: None };
         prep_item(&mut it, &flat);
         let b = build_bake(std::slice::from_ref(&it), &[true], it.pos);
-        // stripe + 2 posts (8x1 each) + curtain (4x2).
-        assert_eq!(b.pos.len(), 3 * 18 + 5 * 3);
-        assert_eq!(b.idx.len(), 3 * 8 * 6 + 8 * 6);
+        // One glint quad per post (the road line is off without FH1_TRAP_LINE=1).
+        assert_eq!(b.pos.len(), 2 * 4);
+        assert_eq!(b.idx.len(), 2 * 6);
+        assert!(b.shape.iter().all(|s| s[0] == GLINT as f32));
         assert!(build_bake(std::slice::from_ref(&it), &[false], it.pos).pos.is_empty());
         // Inside the gate's reach the distance is zero; 500 m away it is 490.
         assert_eq!(it.dist(Vec3::new(10.0, 0.0, 0.0)), 0.0);
         assert!((it.dist(Vec3::new(510.0, 0.0, 0.0)) - 490.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn glints_sit_on_the_camera_boxes() {
+        // Posts 16 m apart along +z, the left one 0.5 m lower: each glint hangs over the road from its own post.
+        let (l, r) = (Vec3::new(5.0, 10.0, 0.0), Vec3::new(5.0, 10.5, 16.0));
+        let [a, b] = gate_heads(Kind::Camera, l, r);
+        assert!((a - Vec3::new(5.0, 13.76, 0.70)).length() < 1e-4, "{a}");
+        assert!((b - Vec3::new(5.0, 14.26, 15.30)).length() < 1e-4, "{b}");
+        let [a, b] = gate_heads(Kind::Average, l, r);
+        assert!((a.z - 2.78).abs() < 1e-4 && (b.z - (16.0 - 2.78)).abs() < 1e-4);
+        assert!((a.y - 14.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn road_line_follows_the_ground() {
+        let (l, r) = (Vec3::new(0.0, 1.0, 0.0), Vec3::new(20.0, 1.0, 0.0));
+        // A cambered road: crown 0.3 m above the edges.
+        let camber = |p: Vec3, _: f32| 1.0 + 0.3 * (1.0 - ((p.x - 10.0) / 10.0).abs());
+        let pts = gate_line(Kind::Camera, l, r, &camber);
+        assert!(pts.len() >= 12);
+        assert!((pts[0].x - 0.7).abs() < 1e-4 && (pts.last().unwrap().x - 19.3).abs() < 1e-4);
+        for p in &pts {
+            assert!((p.y - camber(*p, 0.0)).abs() < 1e-4);
+        }
+        let mut b = Bake::new(Vec3::ZERO);
+        b.road_line(&pts, 0.6, &Attr::new(LinearRgba::WHITE, 1.0, [0.0; 4], 0.0));
+        assert_eq!(b.pos.len(), pts.len() * 3);
+        assert!(b.idx.iter().all(|&i| (i as usize) < b.pos.len()));
+        // Too narrow for a line between the boxes.
+        assert!(gate_line(Kind::Average, l, Vec3::new(5.0, 1.0, 0.0), &camber).is_empty());
     }
 
     #[test]

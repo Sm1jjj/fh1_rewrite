@@ -44,13 +44,34 @@ pub struct GroundHit {
     pub surface: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SphereContact {
     pub point: Vec3,
     /// Direction to push the sphere out along.
     pub normal: Vec3,
     pub depth: f32,
     pub surface: u8,
+    /// Ground triangle (|n.y| >= 0.5) the sphere sits on or in: its upward face normal. [`Vehicle::collide_body`] pushes
+    /// along it instead of `normal`, so a triangle's edge (welded crease, unwelded seam) can't push sideways.
+    pub face: Option<Vec3>,
+    /// A step the sphere touches from the side: a ground triangle's edge above the sphere's centre (the lip of a kerb or
+    /// of an unwelded patch a few cm higher) or a low wall of a drivable surface. The step's top height (engine Y);
+    /// [`Vehicle::collide_body`] lets the wheels climb steps lower than [`step_climb`] instead of stopping the body.
+    pub step_top: Option<f32>,
+}
+
+/// Steps up to this height above the car's wheel contact plane don't stop the body (m; `FH1_STEP_CLIMB`, default 0.25):
+/// Colorado's paved patches meet in unwelded 8-10 cm steps (kerbs and road-patch seams: tools/ground_seams.py, 2026-10-09),
+/// which the 5 cm body contact points caught like a wall ("hits invisible objects where the ground texture changes").
+/// `FH1_STEP_CONTACT=0` = the old contacts (every overlap pushes along the closest-point normal).
+pub fn step_climb() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if std::env::var("FH1_STEP_CONTACT").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        Some(std::env::var("FH1_STEP_CLIMB").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25))
+    })
 }
 
 /// The world the car drives on.
@@ -81,7 +102,7 @@ impl Ground for FlatGround {
     fn sphere(&self, center: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
         out.clear();
         if center.y < radius {
-            out.push(SphereContact { point: Vec3::new(center.x, 0.0, center.z), normal: Vec3::Y, depth: radius - center.y, surface: 0 });
+            out.push(SphereContact { point: Vec3::new(center.x, 0.0, center.z), normal: Vec3::Y, depth: radius - center.y, surface: 0, face: Some(Vec3::Y), step_top: None });
         }
     }
 }
@@ -344,6 +365,33 @@ impl Vehicle {
         self.brakes.abs_active
     }
 
+    /// The wheel's ground ray (`origin` + `down` x t, t <= `max`; the hit `distance` is where the wheel CENTRE's ray would
+    /// meet the ground) with the tyre's round profile (2026-10-09, "wheels fall into / snag on seams where the texture
+    /// changes"; tools/ground_seams.py: ~60k crack samples of 2-50 cm and ~11 km of 8-10 cm unwelded steps between paved
+    /// patches on Colorado). Besides the centre, rays at +-0.35 r and +-0.7 r along the wheel's heading: ground at
+    /// fore / aft offset x stops the wheel r - sqrt(r^2 - x^2) higher than under the centre, so the wheel rolls up a step
+    /// over its leading arc instead of jumping its full height when the axle passes it, and a crack narrower than the
+    /// probe span can't swallow the wheel (the lips either side hold it). The hit point stays under the axle.
+    /// `FH1_WHEEL_PROFILE=0` = the old single centre ray.
+    fn wheel_ray(&self, ground: &dyn Ground, i: usize, origin: Vec3, down: Vec3, max: f32) -> Option<GroundHit> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let centre = ground.ray(origin, down, max);
+        if !*ON.get_or_init(|| std::env::var("FH1_WHEEL_PROFILE").map_or(true, |v| v != "0")) {
+            return centre;
+        }
+        let r = self.tyre_radius(i);
+        let fwd = (self.rotation * Quat::from_rotation_y(self.wheels[i].steer) * Vec3::NEG_Z).reject_from(down).normalize_or_zero();
+        let mut best = centre;
+        for x in [-0.7f32, -0.35, 0.35, 0.7].map(|k| k * r) {
+            let Some(mut h) = ground.ray(origin + fwd * x, down, max) else { continue };
+            h.distance += r - (r * r - x * x).sqrt();
+            if h.distance <= max && best.is_none_or(|b| h.distance < b.distance) {
+                best = Some(h);
+            }
+        }
+        best.map(|h| GroundHit { point: origin + down * h.distance, ..h })
+    }
+
     /// Visual suspension offset of a wheel from its modelled hub (m, +Y up).
     pub fn wheel_drop(&self, i: usize) -> f32 {
         self.static_length[i] - self.wheels[i].length
@@ -374,7 +422,7 @@ impl Vehicle {
             let r = self.tyre_radius(i);
             let anchor = self.position + self.rotation * self.anchors[i];
             // Ray from the top of travel: the wheel centre sits r above the hit.
-            let hit = ground.ray(anchor, down, self.max_length[i] + r);
+            let hit = self.wheel_ray(ground, i, anchor, down, self.max_length[i] + r);
             let length = hit.map_or(f32::MAX, |h| h.distance - r);
             let w = &mut self.wheels[i];
             if let (Some(h), true) = (hit, length < self.max_length[i]) {
@@ -629,7 +677,7 @@ impl Vehicle {
             point_vel[i] = (self.velocity + self.angular_velocity.cross(anchor - self.position)).dot(up);
             // Ray from a little above the top of travel (the bump stop lets the wheel pass it).
             let lift = 0.1;
-            if let Some(h) = ground.ray(anchor - down * lift, down, self.max_length[i] + r + lift) {
+            if let Some(h) = self.wheel_ray(ground, i, anchor - down * lift, down, self.max_length[i] + r + lift) {
                 free[i] = h.distance - lift - r;
                 hits[i] = Some(h);
             }
@@ -703,6 +751,13 @@ impl Vehicle {
         let mut contacts = Vec::new();
         let inv_mass = 1.0 / self.data.mass;
         let spheres = self.data.collision_spheres.clone();
+        // The wheels' contact plane (mean height of the tyre bottoms): steps up to step_climb() above it are the wheels' to
+        // climb, not the body's to hit.
+        let climb = step_climb().map(|h| {
+            let down = self.rotation * Vec3::NEG_Y;
+            let base = (0..4).map(|i| (self.position + self.rotation * self.anchors[i] + down * (self.wheels[i].length + self.tyre_radius(i))).y).sum::<f32>() / 4.0;
+            base + h
+        });
         for (si, (centre, radius)) in spheres.into_iter().enumerate() {
             let c = self.position + self.rotation * (centre - self.cg_model);
             let from = start_pose.0 + start_pose.1 * (centre - self.cg_model);
@@ -712,6 +767,9 @@ impl Vehicle {
                 ground.sphere_sweep(from, c, radius, &mut contacts);
             } else {
                 ground.sphere(c, radius, &mut contacts);
+            }
+            if let Some(limit) = climb {
+                contacts.retain(|c| c.step_top.is_none_or(|top| top > limit));
             }
             // Deepest contact only, so overlapping triangles don't push several times.
             let Some(ct) = contacts.iter().copied().max_by(|a, b| a.depth.total_cmp(&b.depth)) else { continue };

@@ -42,7 +42,7 @@ use bevy::pbr::{
 use bevy::prelude::*;
 use bevy::render::camera::ExtractedCamera;
 use bevy::render::mesh::{MeshVertexBufferLayoutRef, MeshVertexBufferLayouts};
-use bevy::render::render_resource::binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer};
+use bevy::render::render_resource::binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer, uniform_buffer_sized};
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer, BufferDescriptor, BufferUsages, CachedComputePipelineId,
     CachedRenderPipelineId, CompareFunction, ComputePass, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, DepthBiasState, DepthStencilState, DynamicUniformBuffer,
@@ -328,7 +328,12 @@ impl SpecializedRenderPipeline for ShadowPipeline {
             // Pre-pass: the material table only to drop cloth / non-opaque materials in the vertex stage.
             defs.push("PREPASS".into());
         }
-        let table = mask || (pre && self.bindless);
+        // P18: the pre-pass tests the record's FLAG_PRE_OK instead of the material table (FH1_SW_PREPASS_NOMAT=0 = old).
+        let pre_flag = pre && super::prepass_nomat_on();
+        if pre_flag {
+            defs.push("PREPASS_FLAG".into());
+        }
+        let table = mask || (pre && self.bindless && !pre_flag);
         if table {
             defs.push("TABLE".into());
         }
@@ -338,7 +343,7 @@ impl SpecializedRenderPipeline for ShadowPipeline {
         }
         // P16: without the table the shader reads nothing from the material group (FH1_SW_SHADOW_NOMAT=0 = old).
         let mut layout = vec![self.view_layout.clone(), self.arena_layout.clone()];
-        if table || !shadow_nomat_on() {
+        if table || (!shadow_nomat_on() && !pre_flag) {
             layout.push(self.material_layout.clone());
         }
         RenderPipelineDescriptor {
@@ -395,7 +400,12 @@ fn init_pipelines(
         "static world arena",
         &BindGroupLayoutEntries::with_indices(
             ShaderStages::VERTEX_FRAGMENT,
-            ((100, storage_buffer_read_only_sized(false, None)), (101, storage_buffer_read_only_sized(false, None))),
+            (
+                (100, storage_buffer_read_only_sized(false, None)),
+                (101, storage_buffer_read_only_sized(false, None)),
+                // P17-A: x = LOD distance scale (material.rs rm_dither; the cull and cascades carry it in eye.w).
+                (102, uniform_buffer_sized(false, std::num::NonZeroU64::new(16))),
+            ),
         ),
     );
     let material_layout = <RemasterMaterial as bevy::render::render_resource::AsBindGroup>::bind_group_layout_descriptor(&device);
@@ -529,7 +539,14 @@ fn resolve_materials(mut arena: ResMut<Arena>, bindings: Res<RenderMaterialBindi
         let Some(Some((_, material))) = arena.slot_mesh.get(s).cloned() else { continue };
         match bindings.get(&material) {
             Some(b) => {
-                if arena.records[s].material != b.slot.0 || arena.slot_group[s] != Some(b.group.0) {
+                // P18: the pre-pass reads this bit instead of the material table (FH1_SW_PREPASS_NOMAT).
+                let flags = if super::prepass_nomat_on() && arena.pre_ok.contains_key(&material) {
+                    arena.records[s].flags | super::FLAG_PRE_OK
+                } else {
+                    arena.records[s].flags & !super::FLAG_PRE_OK
+                };
+                if arena.records[s].material != b.slot.0 || arena.slot_group[s] != Some(b.group.0) || arena.records[s].flags != flags {
+                    arena.records[s].flags = flags;
                     arena.records[s].material = b.slot.0;
                     arena.slot_group[s] = Some(b.group.0);
                     if batch {
@@ -592,6 +609,8 @@ pub(super) struct DrawLists {
     /// Bumped on every candidate list rebuild (Hi-Z: the visibility bits reset).
     generation: u64,
     arena_bind_group: Option<(u32, BindGroup)>,
+    /// P17-A: the arena bind group's LOD uniform (vec4, x = LOD distance scale), rewritten every frame.
+    lod_uniform: Option<Buffer>,
     /// Cascade pipelines per (variant, dithering class).
     shadow_pipelines: HashMap<(Variant, bool), CachedRenderPipelineId>,
     /// P16: cascade draw order (bin indices): bins that need no material first, then the rest grouped by slab.
@@ -871,6 +890,8 @@ fn prepare_views(
         (true, false) => 2,
     };
     let opts = UVec4::new(lists.split as u32, fade_mode, bindless as u32, 0);
+    // P17-A: the quality preset's draw distance shrinks every LOD band (the shader multiplies the eye distance by w).
+    let lod_k = 1.0 / fh1_render::quality::draw_distance();
     hiz.active = false;
     let u = &mut *uniforms;
     u.buffer.clear();
@@ -918,7 +939,7 @@ fn prepare_views(
             ViewUniform {
                 clip_from_world: cfw,
                 planes: p,
-                eye: eye.extend(1.0),
+                eye: eye.extend(lod_k),
                 params: Vec4::new(0.0, 0.0, 0.0, n as f32),
                 info: UVec4::new(KIND_MAIN, 0, 0, 0),
                 extra: UVec4::new(if hiz_now { 1 } else { 0 }, mips, 0, 0),
@@ -937,7 +958,7 @@ fn prepare_views(
             ViewUniform {
                 clip_from_world: cfw,
                 planes: p,
-                eye: eye.extend(1.0),
+                eye: eye.extend(lod_k),
                 params: Vec4::new(crate::car_probe::probe_min_radius(), far, 0.0, n as f32),
                 info: UVec4::new(KIND_PROBE, 0, 0, 0),
                 extra: UVec4::ZERO,
@@ -970,7 +991,7 @@ fn prepare_views(
                 let vu = ViewUniform {
                     clip_from_world: cfw,
                     planes: p,
-                    eye: eye.extend(1.0),
+                    eye: eye.extend(lod_k),
                     params: Vec4::new(0.0, 0.0, small_dist(), n as f32),
                     info: UVec4::new(KIND_SHADOW, 0, 0, 0),
                     extra: UVec4::ZERO,
@@ -1001,10 +1022,22 @@ fn prepare_bind_groups(
     device: Res<RenderDevice>,
 ) {
     let (Some(pipeline), Some(cull), Some(shadow)) = (pipeline, cull, shadow) else { return };
+    let lod = lists
+        .lod_uniform
+        .get_or_insert_with(|| device.create_buffer(&BufferDescriptor { label: Some("static world lod"), size: 16, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false }))
+        .clone();
+    let lod_k = 1.0 / fh1_render::quality::draw_distance();
+    let mut bytes = [0u8; 16];
+    bytes[..4].copy_from_slice(&lod_k.to_le_bytes());
+    queue.write_buffer(&lod, 0, &bytes);
     if !lists.arena_bind_group.as_ref().is_some_and(|(g, _)| *g == arena.buffers_generation) {
         if let (Some(v), Some(r)) = (arena.vertex_buffer(), arena.record_buffer.as_ref()) {
             let layout = cache.get_bind_group_layout(&pipeline.arena_layout);
-            let bg = device.create_bind_group("static world arena", &layout, &BindGroupEntries::with_indices(((100, v.as_entire_binding()), (101, r.as_entire_binding()))));
+            let bg = device.create_bind_group(
+                "static world arena",
+                &layout,
+                &BindGroupEntries::with_indices(((100, v.as_entire_binding()), (101, r.as_entire_binding()), (102, lod.as_entire_binding()))),
+            );
             lists.arena_bind_group = Some((arena.buffers_generation, bg));
         }
     }
@@ -1122,8 +1155,9 @@ fn draw_static_world(
     // GPU / CPU time of the passes for the perf recorder (RenderDiagnosticsPlugin; a no-op without it).
     let recorder = ctx.diagnostic_recorder();
     let diagnostics = recorder.as_deref();
-    // One lit pass over every bin from `base` (+ draw counts when compacted).
-    let draw = |ctx: &mut RenderContext, base: u32, counts: Option<u32>| {
+    // One lit pass over every bin from `base` (+ draw counts when compacted). `span`: the recorder's pass name (P18: the
+    // Hi-Z phase-2 pass is "static_world_phase2", so the GPU table splits the lit cost between the two passes).
+    let draw = |ctx: &mut RenderContext, base: u32, counts: Option<u32>, span: &'static str| {
         let counts = counts.and_then(|c| lists.counts.as_ref().map(|b| (b, c)));
         let color = [Some(target.get_color_attachment())];
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
@@ -1141,7 +1175,7 @@ fn draw_static_world(
         pass.set_bind_group(1, &view_bg.binding_array, &[]);
         pass.set_bind_group(2, arena_bg, &[]);
         pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-        let span = diagnostics.pass_span(&mut pass, "static_world");
+        let span = diagnostics.pass_span(&mut pass, span);
         for (b, bin) in lists.bins.iter().enumerate() {
             if !classes && bin.class != CLASS_FAR {
                 continue;
@@ -1159,7 +1193,7 @@ fn draw_static_world(
     // Unculled (FH1_STATIC_WORLD_CULL=0): region 0, main camera only.
     if !cull_on() {
         if is_main(camera) {
-            draw(&mut ctx, 0, None);
+            draw(&mut ctx, 0, None, "static_world");
         }
         return;
     }
@@ -1174,7 +1208,7 @@ fn draw_static_world(
     } else if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
         return;
     }
-    draw(&mut ctx, cv.base, compact.then_some(cv.counts));
+    draw(&mut ctx, cv.base, compact.then_some(cv.counts), "static_world");
     // Hi-Z phase 2 (main view): pyramid from the depth so far, occlusion-tested cull, the newly visible.
     if let (Some(SwCullViewHiz(cv2)), Some(pipes)) = (hiz_view, hiz_pipes.as_ref()) {
         if hiz.active {
@@ -1188,11 +1222,11 @@ fn draw_static_world(
                 }
             }
             if merged {
-                draw(&mut ctx, cv2.base, compact.then_some(cv2.counts));
+                draw(&mut ctx, cv2.base, compact.then_some(cv2.counts), "static_world_phase2");
             } else {
                 hiz.build(&mut ctx, &cache, pipes, &device, depth.view());
                 if dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv2, lists.count) {
-                    draw(&mut ctx, cv2.base, compact.then_some(cv2.counts));
+                    draw(&mut ctx, cv2.base, compact.then_some(cv2.counts), "static_world_phase2");
                 }
             }
         }
@@ -1273,10 +1307,13 @@ fn record_prepass(
         }
         let Some(id) = pipelines.pre.get(&bin.variant) else { continue };
         let Some(p) = cache.get_render_pipeline(*id) else { continue };
-        let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
-        let Some(material_bg) = slab.bind_group() else { continue };
+        // P18: with FH1_SW_PREPASS_NOMAT the pipeline has no material group (ShadowPipeline::specialize, pre_flag).
+        if !super::prepass_nomat_on() {
+            let Some(slab) = allocator.get(MaterialBindGroupIndex(bin.group)) else { continue };
+            let Some(material_bg) = slab.bind_group() else { continue };
+            pass.set_bind_group(2, material_bg, &[]);
+        }
         pass.set_render_pipeline(p);
-        pass.set_bind_group(2, material_bg, &[]);
         draw_bin(&mut pass, args, Some((counts, cv.counts)), cv.base, b as u32, bin);
     }
     span.end(&mut pass);
@@ -1683,6 +1720,12 @@ fn vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> O
 #ifdef DITHER
     out.dither = sw_dither(r);
 #endif
+#ifdef PREPASS_FLAG
+    // P18: the same test, done on the CPU per material (static_world.rs pre_ok -> FLAG_PRE_OK = 64).
+    if (r.flags & 64u) == 0u {
+        out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+#else
 #ifdef PREPASS
     // Only what the lit pass draws solid at exactly this position: no cloth wave (vertex animated), no cutout / decal /
     // water / additive classes, no decal mask. Collapsed to a point otherwise (no fragments).
@@ -1691,6 +1734,7 @@ fn vertex(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> O
     if (q.info.z & 0x8080u) != 0u || cls == 1u || cls == 2u || cls == 4u || cls == 5u {
         out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
+#endif
 #endif
 #ifdef MASK
     let p = scenery_params[scenery_indices[r.material].material];

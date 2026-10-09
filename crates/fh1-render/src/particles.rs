@@ -368,6 +368,8 @@ pub struct FxParticles {
     cpu: (f64, u32),
     /// particles.wgsl for the half-res pass (the same embedded asset the Material uses).
     half_shader: Option<Handle<Shader>>,
+    /// P18: effects whose textures `draw` loads ahead of their first spawn, one per frame ([`FxParticles::preload`]).
+    warm: Vec<EffectId>,
 }
 
 impl FxParticles {
@@ -381,6 +383,24 @@ impl FxParticles {
             rng: 0x9E37_79B9,
             cpu: (0.0, 0),
             half_shader: None,
+            warm: Vec::new(),
+        }
+    }
+
+    /// P18 (docs/PERF.md; `FH1_FX_PRELOAD=0` = off): resolves these effects now (their XML is read here) and has `draw` load
+    /// their textures over the next frames, one effect per frame, before anything spawns them. The race-finish cannons
+    /// read 4 XMLs and decoded their DDS synchronously on the finish frame (part of the 1.3 s stall in user log
+    /// 20261009_143733). Call it where a short hitch doesn't matter (race load / grid). Unknown names are ignored.
+    pub fn preload(&mut self, names: &[&str]) {
+        if !preload_on() {
+            return;
+        }
+        for name in names {
+            if let Some(id) = self.effect(name) {
+                if !self.warm.contains(&id) {
+                    self.warm.push(id);
+                }
+            }
         }
     }
 
@@ -435,9 +455,10 @@ impl FxParticles {
         self.effects.get(id.0 as usize).map_or(0, |e| e.parts.len())
     }
 
-    /// Particles to start this frame: `Quantity × intensity × dt`, with the fraction carried in `carry`.
+    /// Particles to start this frame: `Quantity × intensity × dt` × the quality preset's particle scale (P17-A), with the
+    /// fraction carried in `carry`.
     pub fn count(&self, id: EffectId, intensity: f32, dt: f32, carry: &mut f32) -> u32 {
-        let want = *carry + self.def(id).rate * intensity.max(0.0) * dt;
+        let want = *carry + self.def(id).rate * intensity.max(0.0) * dt * crate::quality::particles();
         let n = want.floor();
         *carry = (want - n).min(1.0);
         n as u32
@@ -666,6 +687,19 @@ fn draw(
         shape: Vec4::ZERO,
     };
     let lag_fix = lag_fix();
+    // P18: one preloaded effect's textures per frame (FxParticles::preload).
+    if let Some(id) = fx.warm.pop() {
+        if let Some(e) = fx.effects.get_mut(id.0 as usize) {
+            if e.textures.is_none() {
+                let d = &e.def;
+                if let Some(texture) = load_texture(&mut images, &root, &d.texture, ImageAddressMode::ClampToEdge) {
+                    let gradient = (!d.gradient.is_empty()).then(|| load_texture(&mut images, &root, &d.gradient, ImageAddressMode::ClampToEdge)).flatten();
+                    e.gradient = gradient.is_some();
+                    e.textures = Some((texture, gradient));
+                }
+            }
+        }
+    }
     for e in &mut fx.effects {
         let n = e.parts.len();
         if n == 0 {
@@ -803,8 +837,14 @@ fn draw(
                 }
             }
             None => {
-                let texture = load_texture(&mut images, &root, &d.texture, ImageAddressMode::ClampToEdge);
-                let gradient = (!d.gradient.is_empty()).then(|| load_texture(&mut images, &root, &d.gradient, ImageAddressMode::ClampToEdge)).flatten();
+                // Preloaded (P18) or loaded by the half-res path before: reuse, else load now.
+                let (texture, gradient) = match e.textures.clone() {
+                    Some((t, g)) => (Some(t), g),
+                    None => (
+                        load_texture(&mut images, &root, &d.texture, ImageAddressMode::ClampToEdge),
+                        (!d.gradient.is_empty()).then(|| load_texture(&mut images, &root, &d.gradient, ImageAddressMode::ClampToEdge)).flatten(),
+                    ),
+                };
                 let Some(texture) = texture else {
                     warn!("fh1-render particles: texture {} for {} missing; effect not drawn", d.texture, d.name);
                     e.parts.clear();
@@ -842,6 +882,12 @@ fn draw(
         e.drawn = n;
     }
     fx.cpu.0 += t0.elapsed().as_secs_f64() * 1e6;
+}
+
+/// P18: [`FxParticles::preload`] on (`FH1_FX_PRELOAD=0` = effects load on their first spawn, as before).
+fn preload_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_FX_PRELOAD").map_or(true, |v| v != "0"))
 }
 
 /// Stable GPU allocations for the per-frame quad meshes (these particles, engine smoke.rs / backfire.rs). P13

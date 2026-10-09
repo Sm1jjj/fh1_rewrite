@@ -50,13 +50,13 @@ use bevy_render::{
     render_phase::GpuRenderBinnedMeshInstance,
     render_resource::{
         binding_types::{storage_buffer, storage_buffer_read_only, texture_2d, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+        BindGroup, BindGroupEntries, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
         BindGroupLayoutId, BindingResource, Buffer, BufferBinding, BufferId, BufferVec, CachedComputePipelineId,
         ComputePassDescriptor, ComputePipelineDescriptor, DynamicBindGroupLayoutEntries,
         PartialBufferVec, PipelineCache, RawBufferVec, ShaderStages, ShaderType,
         SparseBufferUpdateBindGroups, SparseBufferUpdateJobs, SparseBufferUpdatePipelines,
         SpecializedComputePipeline, SpecializedComputePipelines, TextureSampleType,
-        UninitBufferVec,
+        UninitBufferVec, WgpuSampler, WgpuTextureView,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     settings::WgpuFeatures,
@@ -1814,9 +1814,12 @@ pub fn prepare_preprocess_bind_groups(
     pipelines: Res<PreprocessPipelines>,
     mut bin_unpacking_bind_groups: ResMut<BinUnpackingBindGroups>,
     mut unpack_cache: Local<BinUnpackingBindGroupCache>,
+    mut preprocess_cache_local: Local<PreprocessBindGroupCache>,
 ) {
     // FH1 patch 8: last frame's bin unpacking bind groups become the lookup set; whatever isn't reused is dropped below.
     unpack_cache.begin_frame();
+    // FH1 patch 10: the same for the preprocess / build-indirect-parameters bind groups.
+    preprocess_cache_local.begin_frame();
     // Grab the `BatchedInstanceBuffers`.
     let BatchedInstanceBuffers {
         current_input_buffer: current_input_buffer_vec,
@@ -1830,6 +1833,7 @@ pub fn prepare_preprocess_bind_groups(
     ) else {
         return;
     };
+    let preprocess_cache = core::cell::RefCell::new(core::mem::take(&mut *preprocess_cache_local));
 
     // Record whether we have any meshes that are to be drawn indirectly. If we
     // don't, then we can skip building indirect parameters.
@@ -1872,6 +1876,7 @@ pub fn prepare_preprocess_bind_groups(
                 pipeline_cache: &pipeline_cache,
                 phase_indirect_parameters_buffers,
                 mesh_culling_data_buffer: &mesh_culling_data_buffer,
+                cache: &preprocess_cache,
                 visibility_range_data_buffer: visibility_ranges.buffer(),
                 view_uniforms: &view_uniforms,
                 previous_view_uniforms: &previous_view_uniforms,
@@ -1942,6 +1947,7 @@ pub fn prepare_preprocess_bind_groups(
             &pipelines,
             current_input_buffer,
             &indirect_parameters_buffers,
+            &preprocess_cache,
         );
     }
 
@@ -1961,6 +1967,8 @@ pub fn prepare_preprocess_bind_groups(
         );
     }
     unpack_cache.end_frame();
+    *preprocess_cache_local = preprocess_cache.into_inner();
+    preprocess_cache_local.end_frame();
 }
 
 /// FH1 patch 8 (P16-C): bin unpacking bind groups reused across frames. Upstream creates one bind group per batch set per
@@ -2006,6 +2014,83 @@ impl BinUnpackingBindGroupCache {
     }
 }
 
+/// FH1 patch 10 (P18): preprocess / build-indirect-parameters bind groups reused across frames. Upstream creates every
+/// (view, phase) preprocess bind group and every phase's four build-indirect-parameters bind groups each frame (~40
+/// `create_bind_group` calls per frame in FH1, most of `prepare_preprocess_bind_groups`' 0.66 ms in user log
+/// 20261009_143733), although their bindings only change when a buffer is reallocated or a binding size (item / batch
+/// count) changes. The key is the layout id plus every entry's (binding, resource): buffers with offset and size, texture
+/// views, samplers. The key holds a clone of each wgpu object, and wgpu compares those by the address of their `Arc`, so
+/// an identity cannot be reused by another object while the entry exists: a hit binds exactly what a new group would.
+/// Groups with an array entry are created every frame as before. Entries unused in a frame are dropped at its end.
+/// Also used by the atmosphere bind groups (patch 11). `FH1_PREPROCESS_BG_CACHE=0` = old (create every frame).
+#[derive(Default)]
+pub struct PreprocessBindGroupCache {
+    current: HashMap<PreprocessBindGroupKey, BindGroup>,
+    previous: HashMap<PreprocessBindGroupKey, BindGroup>,
+}
+
+type WgpuBuffer = <Buffer as core::ops::Deref>::Target;
+
+/// One bind group entry's resource, by identity.
+#[derive(PartialEq, Eq, Hash)]
+enum CachedBinding {
+    Buffer(WgpuBuffer, u64, Option<NonZeroU64>),
+    TextureView(WgpuTextureView),
+    Sampler(WgpuSampler),
+}
+
+type PreprocessBindGroupKey = (BindGroupLayoutId, SmallVec<[(u32, CachedBinding); 14]>);
+
+impl PreprocessBindGroupCache {
+    pub(crate) fn on() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var("FH1_PREPROCESS_BG_CACHE").map_or(true, |v| v != "0"))
+    }
+
+    pub(crate) fn begin_frame(&mut self) {
+        self.previous = core::mem::take(&mut self.current);
+    }
+
+    pub(crate) fn end_frame(&mut self) {
+        self.previous.clear();
+    }
+}
+
+/// `render_device.create_bind_group(label, layout, entries)` through [`PreprocessBindGroupCache`].
+#[doc(hidden)]
+pub fn cached_bind_group<'a>(
+    cache: &core::cell::RefCell<PreprocessBindGroupCache>,
+    render_device: &RenderDevice,
+    label: &'static str,
+    layout: &'a BindGroupLayout,
+    entries: &'a [BindGroupEntry<'a>],
+) -> BindGroup {
+    if !PreprocessBindGroupCache::on() {
+        return render_device.create_bind_group(label, layout, entries);
+    }
+    let mut key_entries = SmallVec::new();
+    for entry in entries {
+        let resource = match &entry.resource {
+            BindingResource::Buffer(b) => CachedBinding::Buffer(b.buffer.clone(), b.offset, b.size),
+            BindingResource::TextureView(v) => CachedBinding::TextureView((*v).clone()),
+            BindingResource::Sampler(s) => CachedBinding::Sampler((*s).clone()),
+            _ => return render_device.create_bind_group(label, layout, entries),
+        };
+        key_entries.push((entry.binding, resource));
+    }
+    let key = (layout.id(), key_entries);
+    let mut cache = cache.borrow_mut();
+    if let Some(bind_group) = cache.current.get(&key) {
+        return bind_group.clone();
+    }
+    let bind_group = match cache.previous.remove(&key) {
+        Some(bind_group) => bind_group,
+        None => render_device.create_bind_group(label, layout, entries),
+    };
+    cache.current.insert(key, bind_group.clone());
+    bind_group
+}
+
 /// A temporary structure that stores all the information needed to construct
 /// bind groups for the mesh preprocessing shader.
 struct PreprocessBindGroupBuilder<'a> {
@@ -2048,6 +2133,8 @@ struct PreprocessBindGroupBuilder<'a> {
     /// This is the buffer containing the mesh's final transforms that the
     /// shaders will write to.
     data_buffer: &'a Buffer,
+    /// FH1 patch 10: bind groups reused across frames.
+    cache: &'a core::cell::RefCell<PreprocessBindGroupCache>,
 }
 
 impl<'a> PreprocessBindGroupBuilder<'a> {
@@ -2066,7 +2153,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
         .ok();
 
         Some(PhasePreprocessBindGroups::Direct(
-            self.render_device.create_bind_group(
+            cached_bind_group(self.cache, self.render_device,
                 "preprocess_direct_bind_group",
                 &self
                     .pipeline_cache
@@ -2178,7 +2265,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    cached_bind_group(self.cache, self.render_device,
                         "preprocess_early_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2280,7 +2367,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    cached_bind_group(self.cache, self.render_device,
                         "preprocess_early_non_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2379,7 +2466,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    cached_bind_group(self.cache, self.render_device,
                         "preprocess_late_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2470,7 +2557,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    cached_bind_group(self.cache, self.render_device,
                         "preprocess_late_non_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2572,7 +2659,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    cached_bind_group(self.cache, self.render_device,
                         "preprocess_gpu_indexed_frustum_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2639,7 +2726,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    cached_bind_group(self.cache, self.render_device,
                         "preprocess_gpu_non_indexed_frustum_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2683,6 +2770,7 @@ fn create_build_indirect_parameters_bind_groups(
     pipelines: &PreprocessPipelines,
     current_input_buffer: &Buffer,
     indirect_parameters_buffers: &IndirectParametersBuffers,
+    cache: &core::cell::RefCell<PreprocessBindGroupCache>,
 ) {
     let mut build_indirect_parameters_bind_groups = BuildIndirectParametersBindGroups::new();
 
@@ -2694,7 +2782,7 @@ fn create_build_indirect_parameters_bind_groups(
                     .indexed
                     .batch_sets_buffer()
                     .map(|indexed_batch_sets_buffer| {
-                        render_device.create_bind_group(
+                        cached_bind_group(cache, render_device,
                             "reset_indexed_indirect_batch_sets_bind_group",
                             // The early bind group is good for the main phase and late
                             // phase too. They bind the same buffers.
@@ -2714,7 +2802,7 @@ fn create_build_indirect_parameters_bind_groups(
                     .non_indexed
                     .batch_sets_buffer()
                     .map(|non_indexed_batch_sets_buffer| {
-                        render_device.create_bind_group(
+                        cached_bind_group(cache, render_device,
                             "reset_non_indexed_indirect_batch_sets_bind_group",
                             // The early bind group is good for the main phase and late
                             // phase too. They bind the same buffers.
@@ -2746,7 +2834,7 @@ fn create_build_indirect_parameters_bind_groups(
                         Some(indexed_indirect_parameters_data_buffer),
                         Some(indexed_batch_sets_buffer),
                     ) => Some(
-                        render_device.create_bind_group(
+                        cached_bind_group(cache, render_device,
                             "build_indexed_indirect_parameters_bind_group",
                             // The frustum culling bind group is good for occlusion culling
                             // too. They bind the same buffers.
@@ -2803,7 +2891,7 @@ fn create_build_indirect_parameters_bind_groups(
                         Some(non_indexed_indirect_parameters_data_buffer),
                         Some(non_indexed_batch_sets_buffer),
                     ) => Some(
-                        render_device.create_bind_group(
+                        cached_bind_group(cache, render_device,
                             "build_non_indexed_indirect_parameters_bind_group",
                             // The frustum culling bind group is good for occlusion culling
                             // too. They bind the same buffers.

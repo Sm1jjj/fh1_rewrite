@@ -47,7 +47,7 @@ pub(crate) fn open_external(target: impl AsRef<std::ffi::OsStr>) {
 }
 /// The converted-data revision: bump ONLY when a release's setup output changes (a new fh1setup group version), so
 /// existing installs are offered an update. Game-only releases keep it, so nobody re-converts their disc for nothing.
-const RELEASE: &str = "0.1.0";
+const RELEASE: &str = "0.1.3";
 /// Shown in the title bar.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ACCENT: Color32 = style::MAGENTA;

@@ -36,6 +36,8 @@ pub struct WorldGround {
     event_tris_on: std::sync::atomic::AtomicBool,
     /// Tyre terms per surface id (surfaceTypes.xml `<Friction>`), built once.
     tyre: Vec<TyreSurface>,
+    /// Surfaces a car drives on (roads, verges, off-road): their low wall triangles are kerb faces, not barriers.
+    drivable: Vec<bool>,
 }
 
 impl WorldGround {
@@ -43,6 +45,11 @@ impl WorldGround {
         let world = World::load(dir)?;
         let invisible = world.surfaces.iter().position(|s| s.name == "Invisible").map(|i| i as u8);
         let tyre = world.surfaces.iter().map(|s| TyreSurface::from_params(|k| s.param(k))).collect();
+        const DRIVABLE: [&str; 15] = [
+            "Asphalt", "Asphault", "Concrete", "Brick", "Rumble", "Trackway", "Kerb", "Cobble", "Dirt", "Gravel", "Grass", "Sand", "Leaf", "Litter",
+            "Grasscrete",
+        ];
+        let drivable = world.surfaces.iter().map(|s| DRIVABLE.iter().any(|k| s.name.contains(k)) && !s.name.contains("Barrier")).collect();
         Ok(Self {
             world,
             invisible,
@@ -51,6 +58,7 @@ impl WorldGround {
             event_tris: Default::default(),
             event_tris_on: std::sync::atomic::AtomicBool::new(false),
             tyre,
+            drivable,
         })
     }
 
@@ -145,6 +153,43 @@ impl WorldGround {
         out
     }
 
+    /// A body sphere's contact (collision space; the sphere moved from `from` to `to` this step) for the vehicle, with the
+    /// ground / step classification of [`SphereContact::face`] and [`SphereContact::step_top`] (2026-10-09, wheels and
+    /// bodies snagging on unwelded patch seams: tools/ground_seams.py). A ground triangle the sphere is above, or crossed
+    /// from above this step, pushes along its upward face normal by its plane distance; one the sphere is below and came
+    /// at from the side is a step (its lip / plane height); a wall under 0.4 m of a drivable surface is a kerb face.
+    /// `FH1_STEP_CONTACT=0`: the raw contact.
+    fn contact(&self, c: &fh1_world::Contact, from: [f32; 3], to: [f32; 3], radius: f32) -> Option<SphereContact> {
+        let mut out = SphereContact { point: Self::from_world(c.point), normal: Self::from_world(c.normal), depth: c.depth, surface: c.surface, face: None, step_top: None };
+        if crate::vehicle::step_climb().is_none() {
+            return Some(out);
+        }
+        let p = self.world.tri_points(c.tri).map(Vec3::from);
+        let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+        if n.y.abs() < 0.5 {
+            let (lo, hi) = (p[0].y.min(p[1].y).min(p[2].y), p[0].y.max(p[1].y).max(p[2].y));
+            if hi - lo < 0.4 && self.drivable.get(c.surface as usize).copied().unwrap_or(false) {
+                out.step_top = Some(hi);
+            }
+            return Some(out);
+        }
+        let up = n * n.y.signum();
+        let (s_from, s_to) = ((Vec3::from(from) - p[0]).dot(up), (Vec3::from(to) - p[0]).dot(up));
+        let proj = Vec3::from(to) - up * s_to;
+        let inside = point_in_tri(proj, p, up);
+        if s_to >= 0.0 || s_from >= 0.0 {
+            // Resting on / landing on it: straight up out of the plane (an edge of the face can't push sideways).
+            out.normal = Self::from_world(up.to_array());
+            out.face = Some(out.normal);
+            if inside || s_to < 0.0 {
+                out.depth = radius - s_to;
+            }
+            return (out.depth > 0.0).then_some(out);
+        }
+        out.step_top = Some(if inside { proj.y } else { c.point[1] });
+        Some(out)
+    }
+
     pub fn surface_name(&self, id: u8) -> &str {
         self.world.surface(id).map(|s| s.name.as_str()).unwrap_or("?")
     }
@@ -182,17 +227,24 @@ impl Ground for WorldGround {
 
     fn sphere(&self, center: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
         let mut raw = Vec::new();
-        self.world.sphere_contacts(Self::to_world(center), radius, &mut raw);
+        let c = Self::to_world(center);
+        self.world.sphere_contacts(c, radius, &mut raw);
         out.clear();
-        out.extend(raw.iter().filter(|c| self.active(c.tri)).map(|c| SphereContact { point: Self::from_world(c.point), normal: Self::from_world(c.normal), depth: c.depth, surface: c.surface }));
+        out.extend(raw.iter().filter(|r| self.active(r.tri)).filter_map(|r| self.contact(r, c, c, radius)));
     }
 
     fn sphere_sweep(&self, from: Vec3, to: Vec3, radius: f32, out: &mut Vec<SphereContact>) {
         let mut raw = Vec::new();
-        self.world.sphere_sweep(Self::to_world(from), Self::to_world(to), radius, &mut raw);
+        let (f, t) = (Self::to_world(from), Self::to_world(to));
+        self.world.sphere_sweep(f, t, radius, &mut raw);
         out.clear();
-        out.extend(raw.iter().filter(|c| self.active(c.tri)).map(|c| SphereContact { point: Self::from_world(c.point), normal: Self::from_world(c.normal), depth: c.depth, surface: c.surface }));
+        out.extend(raw.iter().filter(|r| self.active(r.tri)).filter_map(|r| self.contact(r, f, t, radius)));
     }
+}
+
+/// Whether `q` (on the plane of `p` with unit normal `n`) lies inside the triangle.
+fn point_in_tri(q: Vec3, p: [Vec3; 3], n: Vec3) -> bool {
+    (0..3).all(|k| (p[(k + 1) % 3] - p[k]).cross(q - p[k]).dot(n) >= -1e-6) || (0..3).all(|k| (p[(k + 1) % 3] - p[k]).cross(q - p[k]).dot(n) <= 1e-6)
 }
 
 #[cfg(test)]

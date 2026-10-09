@@ -501,6 +501,8 @@ struct SwRecord {
 }
 @group(2) @binding(100) var<storage> sw_vertices: array<u32>;
 @group(2) @binding(101) var<storage> sw_records: array<SwRecord>;
+// P17-A: x = LOD distance scale (the quality preset's draw distance; the cull multiplies by the same factor).
+@group(2) @binding(102) var<uniform> sw_lod: vec4<f32>;
 
 fn rm_world_from_local(i: u32) -> mat4x4<f32> {
     let r = sw_records[i].rows;
@@ -532,7 +534,7 @@ fn rm_dither(i: u32, world_origin: vec3<f32>) -> i32 {
     if r.tag != 0 {
         return r.tag;
     }
-    let d = length(view.world_position - world_origin);
+    let d = length(view.world_position - world_origin) * sw_lod.x;
     let lod = r.lod;
     let offset = select(-16, 0, d >= lod.z);
     let bounds = select(lod.xy, lod.zw, d >= lod.z);

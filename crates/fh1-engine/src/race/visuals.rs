@@ -17,14 +17,34 @@
 //! triangle capacities (as fh1-render particles `pad_quad_mesh`) so the mesh allocator reuses the freed range.
 //! Gameplay (gate crossing in race.rs) never reads these entities.
 //!
-//! Checkpoint / finish look (2026-10-09, `FH1_RACE_LASERS=0` = the posts + curtain + chevrons above): the game's own
-//! gameplay objects are `ANIM_GPLY_Laser_Checkpoint` (blue) and `ANIM_GPLY_Final_Laser` (green) in
-//! media/animatedobjects.zip (docs/RACES.md "Original marker data"): per gate a pair of road-level laser emitters (a
-//! flat lens plate, textures `checkpoint_laser` / `_EMIS`) that each shoot a tall laser straight up (two crossed
-//! ribbons, streaky `GR_Laser_Checkpoint` / `_End` additive texture, ~613 m long) wrapped in a widening light cone
-//! (`OBJ_LightLaser_DIFF`, ~757 m). The next gate is lit, the one after is the dim "_Off" state; the finish is the
-//! green set. Reproduced procedurally in marker.wgsl styles 7 (laser), 9 (cone) and 8 (emitter lens), with the
-//! colours of the game's textures (blue 0,0,158 / green 14,158,0 average, HDR so bloom catches them).
+//! Checkpoint / finish lasers (redone 2026-10-09 after "ugly, miscoloured, positioned wrong"; `FH1_RACE_LASERS=0` =
+//! the posts + curtain + chevrons above). docs/RACES.md "Checkpoint lasers" has the evidence.
+//! - VERIFIED (default.xex strings + loader 0x824D4BA0, media/animatedobjects.zip, TrackRoute*.xml): the game loads two
+//!   gameplay objects, `ANIM_GPLY_Laser_Checkpoint` and `ANIM_GPLY_Final_Laser`, each with `_On` / `_Off` animations.
+//!   One object = a ~1.8 m emitter plate on the road (`checkpoint_laser`, white `_EMIS` lens) and three beams from that
+//!   one point, 120 degrees apart, each a crossed ribbon ~600 m long (`GR_Laser_Blue_DIFF`: pure blue 0,0,115..214;
+//!   finish `GR_Laser_Final_DIFF` 16,211,0; the top cap fades out, `_End`), each wrapped in a ~3-6 m light haze
+//!   (`OBJ_LightLaser_DIFF`: lavender 156,138,214 at the source fading to 8,8,123; finish mint 239,251,247 -> 99,223,71),
+//!   swinging out to ~6 degrees and back twice per 5 s loop while the fan turns. The blue one also has a 17 x 139 m glow
+//!   rising from the plate. `_Off` scales the beams to zero (only the plate is left). Additive (SRCALPHA / ONE).
+//! - VERIFIED placement data: every street `route_checkpoint_NN` has one `route_checkpoint_indicator_NN` on the road
+//!   centre line a few metres past the trigger (735 checkpoints: median 6.1 m ahead, 0.0 m across); the loader reads the
+//!   second `_NNb` indicator for the LAST checkpoint only, and the finish pairs straddle the road at its edges (131
+//!   pairs, median 13.2 m apart). Routes without `route_checkpoint_NN` (festival races: gates on the sparse waypoints)
+//!   make the loader return before any laser is set up. A reviewer (Saving Content, 2012): "checkpoints that appear as
+//!   beams of light", hard to see by day, "wonderful" at night.
+//! - INFERRED: one laser on (the next checkpoint) at a time, the one just passed switching off (beams retract into the
+//!   plate); the indicators themselves aren't in events.json, so the single laser stands `CHECKPOINT_AHEAD_M` past the
+//!   checkpoint on its facing and the finish pair at the road edges found by ground rays (`road_edges`); the beam
+//!   motion is a fit to the decoded animation (marker.wgsl `laser_dir`).
+//! - Festival races: the loader reading above says they get no checkpoint lasers, but the user's playtest (2026-10-09:
+//!   "the finish lights were there but no checkpoint ones") remembers FH1 showing them in every race, which wins: their
+//!   waypoint gates get the blue laser too, on the race's road path at the gate (`on_path`; waypoints have no
+//!   indicator and can sit off the tarmac). `FH1_RACE_FESTIVAL_LASERS=0` = the strict reading (finish only).
+//!
+//! Procedural in marker.wgsl (merged path only): 7 beam, 9 haze, 10 base glow (camera-facing ribbons swung in the
+//! vertex shader, so the mesh is only rebuilt when the target gate changes), 8 emitter plate. The game's texture colours
+//! at their own (non-HDR) strength: overlapping hazes near the plate are what blooms.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -57,6 +77,13 @@ pub fn lasers_on() -> bool {
     *ON.get_or_init(|| std::env::var("FH1_RACE_LASERS").map_or(true, |v| v != "0") && merge_on())
 }
 
+/// `FH1_RACE_FESTIVAL_LASERS=0`: no checkpoint laser on festival races' waypoint gates (only the finish), the strict
+/// reading of the game's loader. Default on: the user's playtest (2026-10-09) remembers FH1 showing them in every race.
+fn festival_lasers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FH1_RACE_FESTIVAL_LASERS").map_or(true, |v| v != "0"))
+}
+
 /// `FH1_MARKER_MERGE=0`: one entity / draw per marker piece (the path before P14) instead of one merged mesh.
 pub fn merge_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -67,8 +94,8 @@ pub fn merge_on() -> bool {
 const ATTRIBUTE_MARKER_COLOUR: MeshVertexAttribute = MeshVertexAttribute::new("Fh1_MarkerColour", 0x4648_0060, VertexFormat::Float32x4);
 /// Merged mesh: near fade start / end, far fade start / end (m).
 const ATTRIBUTE_MARKER_FADE: MeshVertexAttribute = MeshVertexAttribute::new("Fh1_MarkerFade", 0x4648_0061, VertexFormat::Float32x4);
-/// Merged mesh: x pulse Hz, y template-local height (beam bands), z emphasis, w pass-ripple birth (wrapped seconds,
-/// `globals.time` clock) or -1 for a static piece.
+/// Merged mesh: x pulse Hz (laser styles: beam index + 4 for the finish), y template-local height (beam bands), z
+/// emphasis, w pass-ripple / laser-off birth (wrapped seconds, `globals.time` clock) or -1 for a static piece.
 const ATTRIBUTE_MARKER_K: MeshVertexAttribute = MeshVertexAttribute::new("Fh1_MarkerK", 0x4648_0062, VertexFormat::Float32x4);
 /// Pass ripple: scale grows by `exp(FLASH_GROW * age)` for `FLASH_LIFE` s (the old per-frame `scale *= 1 + 1.5 dt`,
 /// despawned after 0.9 s). Mirrored in marker.wgsl.
@@ -79,16 +106,34 @@ const FLASH_LIFE: f32 = 0.9;
 fn pink() -> LinearRgba {
     Color::srgb_u8(250, 0, 100).to_linear() * 2.0
 }
-/// The game's checkpoint laser (GR_Laser_Checkpoint average rgb 0,0,158, bright cores near 40,80,255) and the finish
-/// laser (GR_Laser_Final_DIFF 14,158,0), x2.4 HDR.
-fn laser_blue() -> LinearRgba {
-    Color::srgb_u8(30, 60, 255).to_linear() * 2.4
+/// The game's laser textures (module docs), as stored: the beam's bright stripe (`GR_Laser_Blue_DIFF` 0,0,214;
+/// finish `GR_Laser_Final_DIFF` 16,211,0) and the haze at its source (`OBJ_LightLaser_DIFF` 156,138,214; finish
+/// `OBJ_LightLaser_Final_DIFF` 239,251,247). The haze's far colour is in marker.wgsl.
+fn beam_colour(finish: bool) -> LinearRgba {
+    if finish { Color::srgb_u8(16, 211, 0) } else { Color::srgb_u8(0, 0, 214) }.to_linear()
 }
-fn laser_green() -> LinearRgba {
-    Color::srgb_u8(40, 255, 20).to_linear() * 2.4
+fn haze_colour(finish: bool) -> LinearRgba {
+    if finish { Color::srgb_u8(239, 251, 247) } else { Color::srgb_u8(156, 138, 214) }.to_linear()
 }
-/// Length of the game's laser meshes (613 m beams; the shader fades them out well before).
+/// Beam length (bind pose 614 m; whether the groups' 0.7 scale shortens them to ~430 m is not resolved) and width
+/// (~1 m ribbon x 2 in `_On`, x 0.7).
 const LASER_LEN: f32 = 600.0;
+const BEAM_W: f32 = 1.2;
+/// Haze ribbon: ~1 m wide at the plate growing to `HAZE_W` (the strobe planes are 2.5-6.3 m wide; the texture's glow
+/// widens along them).
+const HAZE_W: f32 = 6.0;
+const HAZE_LEN: f32 = 640.0;
+/// The blue object's base glow plane (`LightStrobe_009`: 17 x 139 m).
+const GLOW_W: f32 = 17.0;
+const GLOW_LEN: f32 = 139.0;
+/// Emitter plate radius (`Cylinder001` 1.2 m across x 1.5).
+const PLATE_R: f32 = 0.9;
+/// Where the single checkpoint laser stands past the trigger line (indicator median 6.1 m; module docs).
+const CHECKPOINT_AHEAD_M: f32 = 6.0;
+/// Half the finish pair's spacing where the road edge isn't found (indicator pairs: median 13.2 m apart).
+const FINISH_HALF_M: f32 = 6.6;
+/// A passed laser's beams retract into the plate over this long (mirrored in marker.wgsl `LASER_OFF_S`).
+const LASER_OFF_S: f32 = 0.6;
 fn street_blue() -> LinearRgba {
     Color::srgb_u8(56, 167, 255).to_linear() * 2.0
 }
@@ -196,7 +241,8 @@ const FINISH: u8 = 5;
 const BAR: u8 = 6;
 const LASER: u8 = 7;
 const EMITTER: u8 = 8;
-const CONE: u8 = 9;
+const HAZE: u8 = 9;
+const GLOW: u8 = 10;
 
 struct Builder {
     pos: Vec<[f32; 3]>,
@@ -286,19 +332,22 @@ fn curtain_b(style: u8) -> Builder {
     b
 }
 
-/// The laser: two crossed ribbons (X plane and Z plane) of width 1 and height 1; uv = (across, up).
-fn laser_b() -> Builder {
+/// A laser ribbon from the emitter (origin) up +Y, unit length, `width(w)` across X; uv = (across, up). marker.wgsl
+/// turns it to face the camera about its (swinging) axis, from the vertex's offset to the emitter (the merged mesh's
+/// normal, see [`Piece::offset_normal`]), so there are no crossed-plane seams. Only u = 0 / 1 columns: every vertex is
+/// on an edge.
+fn ribbon_b(style: u8, rows: u32, width: impl Fn(f32) -> f32) -> Builder {
     let mut b = Builder::new();
-    b.grid(1, 24, LASER, 0.0, |u, w| (Vec3::new(u - 0.5, w, 0.0), Vec3::Z));
-    b.grid(1, 24, LASER, 0.0, |u, w| (Vec3::new(0.0, w, u - 0.5), Vec3::X));
+    b.grid(1, rows, style, 0.0, |u, w| (Vec3::new((u - 0.5) * width(w), w, 0.0), Vec3::Z));
     b
 }
 
-/// The laser's light cone: crossed ribbons widening from 0.3 to 2.0 over the height.
-fn cone_b() -> Builder {
+/// Two unindexed vertices (never drawn) spanning the unit box -1..1 x 0..1 x -1..1: widens the merged mesh's Aabb to
+/// where the swinging beams reach.
+fn bounds_b() -> Builder {
     let mut b = Builder::new();
-    b.grid(1, 24, CONE, 0.0, |u, w| (Vec3::new((u - 0.5) * (0.3 + 1.7 * w), w, 0.0), Vec3::Z));
-    b.grid(1, 24, CONE, 0.0, |u, w| (Vec3::new(0.0, w, (u - 0.5) * (0.3 + 1.7 * w)), Vec3::X));
+    b.v(Vec3::new(-1.0, 0.0, -1.0), Vec3::Y, Vec2::ZERO, LASER, 0.0);
+    b.v(Vec3::new(1.0, 1.0, 1.0), Vec3::Y, Vec2::ZERO, LASER, 0.0);
     b
 }
 
@@ -330,7 +379,13 @@ fn build_meshes(mut v: ResMut<Visuals>, mut meshes: ResMut<Assets<Mesh>>, merged
         // Merged path: CPU templates only (indexed by the T_* constants), baked into the merged mesh.
         m.templates = vec![cylinder_b(BEAM), cylinder_b(BAR), annulus_b(0.7, RING), annulus_b(0.05, RIPPLE), curtain_b(CURTAIN), curtain_b(FINISH)];
         m.templates.extend((0..5).map(|k| floor_quad_b(CHEVRON, k as f32)));
-        m.templates.extend([laser_b(), cone_b(), annulus_b(0.0, EMITTER)]);
+        m.templates.extend([
+            ribbon_b(LASER, 1, |_| 1.0),
+            ribbon_b(GLOW, 8, |w| 0.08 + 0.92 * w),
+            annulus_b(0.0, EMITTER),
+            ribbon_b(HAZE, 16, |w| (1.0 + (HAZE_W - 1.0) * w.sqrt()) / HAZE_W),
+            bounds_b(),
+        ]);
         return;
     }
     v.meshes.insert("beam", meshes.add(cylinder(BEAM)));
@@ -654,8 +709,10 @@ const T_CURTAIN: usize = 4;
 const T_FINISH: usize = 5;
 const T_CHEVRON: usize = 6;
 const T_LASER: usize = 11;
-const T_CONE: usize = 12;
+const T_GLOW: usize = 12;
 const T_EMITTER: usize = 13;
+const T_HAZE: usize = 14;
+const T_BOUNDS: usize = 15;
 
 /// Marks the one merged marker entity.
 #[derive(Component)]
@@ -671,23 +728,31 @@ struct Piece {
     intensity: f32,
     fade: [f32; 4],
     emphasis: f32,
-    /// Pass ripple: `Some(birth)` (wrapped seconds); `xf` is then the ripple at its final scale.
+    /// Pass ripple: `Some(birth)` (wrapped seconds); `xf` is then the ripple at its final scale. Laser pieces: the
+    /// time their beams start retracting (the passed gate's `_Off`).
     flash: Option<f32>,
+    /// Vertex attribute k.x: the pulse rate, or for the laser styles the beam index (0..2) + 4 for the finish colours.
+    kx: f32,
+    /// The normal attribute carries each vertex's offset from the piece's origin (camera-facing laser ribbons).
+    offset_normal: bool,
 }
 
 impl Piece {
     fn new(tpl: usize, xf: Affine3A, colour: LinearRgba, intensity: f32, fade: [f32; 4], emphasis: f32) -> Self {
-        Self { tpl, xf, colour, intensity, fade, emphasis, flash: None }
+        Self { tpl, xf, colour, intensity, fade, emphasis, flash: None, kx: PULSE_HZ, offset_normal: false }
+    }
+
+    /// A laser piece (styles 7-10): no pulse, `kx` as above.
+    fn laser(tpl: usize, xf: Affine3A, colour: LinearRgba, intensity: f32, fade: [f32; 4], kx: f32) -> Self {
+        Self { kx, offset_normal: true, ..Self::new(tpl, xf, colour, intensity, fade, 0.0) }
     }
 }
 
-/// A pass ripple in flight.
-#[derive(Clone, Copy)]
+/// Something left behind at a gate just passed: the pink ripple (`FH1_RACE_LASERS=0`) or the passed laser retracting.
+#[derive(Clone)]
 struct Flash {
-    centre: Vec3,
-    /// Start scale (the gate's clamped half width).
-    scale: f32,
-    colour: LinearRgba,
+    /// The pieces, `flash` set to `birth`.
+    pieces: Vec<Piece>,
     /// Birth on the wrapped clock (`globals.time` in the shader).
     birth: f32,
     /// End on the elapsed clock.
@@ -731,6 +796,9 @@ fn tf(t: Transform) -> Affine3A {
 
 /// The pieces of the gates for (race, gates_done): the same layout and parameters as [`gate_visuals`], in world space.
 fn gate_pieces(def: &super::RaceDef, done: u32, track: &crate::track::Track) -> Vec<Piece> {
+    if lasers_on() {
+        return laser_gate(def, done, track);
+    }
     let mut out = Vec::new();
     let total = total_gates(def);
     for k in 0..2u32 {
@@ -741,10 +809,6 @@ fn gate_pieces(def: &super::RaceDef, done: u32, track: &crate::track::Track) -> 
         let g = *gate(def, n);
         let last = n + 1 == total;
         let strength = if k == 0 { 1.0 } else { 0.35 };
-        if lasers_on() {
-            laser_gate(&mut out, &g, last, strength, track);
-            continue;
-        }
         let colour = if last { LinearRgba::rgb(1.8, 1.8, 1.8) } else { pink() };
         let hw = g.half_width.clamp(6.0, 18.0);
         let base = ground(track, g.centre);
@@ -779,22 +843,114 @@ fn gate_pieces(def: &super::RaceDef, done: u32, track: &crate::track::Track) -> 
     out
 }
 
-/// One gate as the game draws it: a laser emitter at each end of the gate line, each shooting a laser (+ cone) up.
-/// `strength` 1 = the lit next gate, < 1 = the dim one after it (the game's `_Off` object).
-fn laser_gate(out: &mut Vec<Piece>, g: &super::Gate, last: bool, strength: f32, track: &crate::track::Track) {
-    let colour = if last { laser_green() } else { laser_blue() };
-    let hw = g.half_width.clamp(6.0, 18.0);
-    let right = Vec3::new(-g.forward.y, 0.0, g.forward.x);
-    for s in [-1.0f32, 1.0] {
-        let p = ground(track, g.centre + right * (s * hw));
-        let at = Affine3A::from_translation(p);
-        let core = Transform::from_scale(Vec3::new(0.9, LASER_LEN, 0.9));
-        out.push(Piece::new(T_LASER, at * tf(core), colour, 1.5 * strength, [1.5, 6.0, 2600.0, 3800.0], 0.0));
-        let cone = Transform::from_scale(Vec3::new(3.0, LASER_LEN, 3.0));
-        out.push(Piece::new(T_CONE, at * tf(cone), colour, 0.55 * strength, [2.0, 8.0, 2600.0, 3800.0], 0.0));
-        let lens = Transform::from_xyz(0.0, 0.1, 0.0).with_scale(Vec3::splat(2.6));
-        out.push(Piece::new(T_EMITTER, at * tf(lens), colour, 1.3 * strength, [1.0, 4.0, 500.0, 900.0], 0.0));
+/// Whether the race's gates are the game's street `route_checkpoint_NN` (laser just past the checkpoint) rather than
+/// festival gates on the sparse `route_waypoint_NN` (laser on the road path, see [`laser_gate`]): fh1setup events.rs
+/// gives waypoint gates a half width of exactly 30 m, checkpoint gates width / 2 (the widest checkpoint is 50 m).
+fn checkpoint_route(def: &super::RaceDef) -> bool {
+    let n = def.gates.len();
+    n <= 1 || def.gates[..n - 1].iter().any(|g| (g.half_width - 30.0).abs() > 0.01)
+}
+
+/// Ground under `p`: looked for just above it first, so a bridge or overhang above the road isn't taken for it.
+fn road_ground(track: &crate::track::Track, p: Vec3) -> Option<Vec3> {
+    track.ground.ray(p + Vec3::Y * 2.5, Vec3::NEG_Y, 8.0).or_else(|| track.ground.ray(p + Vec3::Y * 10.0, Vec3::NEG_Y, 40.0)).map(|h| h.point)
+}
+
+/// The road's edges either side of ground point `centre` along `right` (left, right point), as the finish pair stands:
+/// walked out in 0.5 m steps until the surface turns off-road (offroadness changes) or the ground steps (kerb, ditch,
+/// wall foot), then 0.3 m back in. A side whose edge isn't found between 3 and 12 m keeps the game's median spacing.
+fn road_edges(track: &crate::track::Track, centre: Vec3, right: Vec3) -> [Vec3; 2] {
+    let fallback = |s: f32| road_ground(track, centre + right * (s * FINISH_HALF_M)).unwrap_or(centre + right * (s * FINISH_HALF_M));
+    let Some(c) = track.ground.ray(centre + Vec3::Y * 2.5, Vec3::NEG_Y, 8.0) else { return [fallback(-1.0), fallback(1.0)] };
+    [-1.0f32, 1.0].map(|s| {
+        let mut last = c.point;
+        let mut edge = None;
+        let mut d = 0.5;
+        while d <= 12.0 {
+            let q = Vec3::new(c.point.x, last.y, c.point.z) + right * (s * d);
+            match track.ground.ray(q + Vec3::Y * 2.0, Vec3::NEG_Y, 4.0) {
+                Some(h) if (h.point.y - last.y).abs() < 0.25 && (h.tyre.offroadness - c.tyre.offroadness).abs() < 0.25 => last = h.point,
+                _ => {
+                    edge = Some(d - 0.5);
+                    break;
+                }
+            }
+            d += 0.5;
+        }
+        match edge {
+            Some(e) if e >= 3.0 => road_ground(track, c.point + right * (s * (e - 0.3))).unwrap_or(last),
+            _ => fallback(s),
+        }
+    })
+}
+
+/// The lasers of the race's next gate `done` (module docs): the next checkpoint's single blue laser on the road (a few
+/// metres past a street checkpoint, on the road path at a festival waypoint gate), or the green pair across the road
+/// at the finish.
+fn laser_gate(def: &super::RaceDef, done: u32, track: &crate::track::Track) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let total = total_gates(def);
+    if done >= total {
+        return out;
     }
+    let g = *gate(def, done);
+    let fwd = Vec3::new(g.forward.x, 0.0, g.forward.y).normalize_or(Vec3::NEG_Z);
+    let right = Vec3::new(-fwd.z, 0.0, fwd.x);
+    if done + 1 == total {
+        let centre = road_ground(track, g.centre).unwrap_or(g.centre);
+        for p in road_edges(track, centre, right) {
+            laser(&mut out, p, true);
+        }
+    } else if checkpoint_route(def) {
+        // A street checkpoint: where its indicator stands, on the road centre line just past the trigger.
+        let p = g.centre + fwd * CHECKPOINT_AHEAD_M;
+        laser(&mut out, road_ground(track, p).unwrap_or(p), false);
+    } else if festival_lasers_on() {
+        // A festival waypoint gate: no indicator, and the waypoint itself can sit off the tarmac (sparse, hand placed), so
+        // the laser stands where the race's road path (the game's racing line, else the A* road) passes the gate.
+        let p = on_path(&def.path, g.centre).unwrap_or(g.centre);
+        laser(&mut out, road_ground(track, p).unwrap_or(p), false);
+    }
+    out
+}
+
+/// The nearest point of the road path `path` to `p` (in plan; height interpolated), if within 40 m.
+fn on_path(path: &[Vec3], p: Vec3) -> Option<Vec3> {
+    let q = Vec2::new(p.x, p.z);
+    let mut best: Option<(f32, Vec3)> = None;
+    for s in path.windows(2) {
+        let (a, b) = (Vec2::new(s[0].x, s[0].z), Vec2::new(s[1].x, s[1].z));
+        let ab = b - a;
+        let t = if ab.length_squared() < 1e-6 { 0.0 } else { ((q - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) };
+        let d = (a + ab * t).distance(q);
+        if best.is_none_or(|x| d < x.0) {
+            best = Some((d, s[0].lerp(s[1], t)));
+        }
+    }
+    best.filter(|x| x.0 < 40.0).map(|x| x.1)
+}
+
+/// One laser object standing at ground point `p` (blue checkpoint or green finish): three beams with their hazes, the
+/// blue one's base glow, the emitter plate.
+fn laser(out: &mut Vec<Piece>, p: Vec3, finish: bool) {
+    let (beam, haze) = (beam_colour(finish), haze_colour(finish));
+    let at = Affine3A::from_translation(p);
+    let fin = if finish { 4.0 } else { 0.0 };
+    for b in 0..3 {
+        let kx = b as f32 + fin;
+        // A little over the textures' own strength (beam alpha ~0.85; the haze x 1/3 as three overlap at the plate) so the
+        // next checkpoint still reads by day, where the game's are faint.
+        out.push(Piece::laser(T_LASER, at * tf(Transform::from_scale(Vec3::new(BEAM_W, LASER_LEN, 1.0))), beam, 1.3, [0.6, 3.0, 2600.0, 3800.0], kx));
+        out.push(Piece::laser(T_HAZE, at * tf(Transform::from_scale(Vec3::new(HAZE_W, HAZE_LEN, 1.0))), haze, 0.45, [4.0, 16.0, 2000.0, 3200.0], kx));
+    }
+    if !finish {
+        out.push(Piece::laser(T_GLOW, at * tf(Transform::from_scale(Vec3::new(GLOW_W, GLOW_LEN, 1.0))), haze, 0.3, [4.0, 18.0, 1500.0, 2500.0], fin));
+    }
+    let plate = Transform::from_xyz(0.0, 0.06, 0.0).with_scale(Vec3::splat(PLATE_R));
+    out.push(Piece::new(T_EMITTER, at * tf(plate), beam, 1.0, [0.5, 1.5, 150.0, 300.0], 0.0));
+    // The beams swing out to ~6 degrees: 600 m x tan(6.5 deg) ~ 70 m.
+    let reach = Transform::from_scale(Vec3::new(72.0, LASER_LEN + 20.0, 72.0));
+    out.push(Piece::new(T_BOUNDS, at * tf(reach), LinearRgba::NONE, 0.0, [0.0; 4], 0.0));
 }
 
 /// The pieces of one event marker standing at ground point `p` (same layout and parameters as [`event_markers`]).
@@ -842,17 +998,19 @@ fn bake(m: &mut Merged, pieces: &[Piece], anchor: Vec3) -> Mesh {
         for (vi, v) in t.pos.iter().enumerate() {
             let lp = Vec3::from_array(*v);
             pos.push(xf.transform_point3(lp).into());
-            nrm.push(match p.flash {
-                // The ripple vertex's offset from its centre at the final scale: the shader pulls it in by age.
-                Some(_) => p.xf.transform_vector3(lp).into(),
+            nrm.push(if p.flash.is_some() || p.offset_normal {
+                // The vertex's offset from the piece's origin: the ripple's at its final scale (the shader pulls it in by
+                // age), a laser ribbon's from its emitter (the shader turns it to the camera).
+                p.xf.transform_vector3(lp).into()
+            } else {
                 // The old vertex shader's `normalize(m * n)` (the model matrix, as before).
-                None => p.xf.transform_vector3(Vec3::from_array(t.nrm[vi])).normalize_or_zero().into(),
+                p.xf.transform_vector3(Vec3::from_array(t.nrm[vi])).normalize_or_zero().into()
             });
             uv.push(t.uv[vi]);
             shape.push(t.shape[vi]);
             colour.push(c);
             fade.push(p.fade);
-            k.push([PULSE_HZ, lp.y, p.emphasis, p.flash.unwrap_or(-1.0)]);
+            k.push([p.kx, lp.y, p.emphasis, p.flash.unwrap_or(-1.0)]);
         }
         idx.extend(t.idx.iter().map(|i| base + i));
     }
@@ -934,20 +1092,36 @@ fn merged_markers(
         }
     }
 
-    // Checkpoint gates (current + next) and the ripple left at a gate just passed.
+    // Checkpoint gates (lasers: the next one; old look: current + next) and what is left at a gate just passed.
     let key = match (rs.phase, rs.race, rs.racers.first()) {
         (RacePhase::Idle | RacePhase::Results, _, _) | (_, None, _) | (_, _, None) => None,
         (_, Some(i), Some(p)) if p.finished_s.is_none() => Some((i, p.gates_done)),
         _ => None,
     };
     if m.gates_key != key {
-        if let (Some((i, done)), Some(k)) = (m.gates_key, key) {
-            if k.0 == i && k.1 == done + 1 {
-                if let Some(def) = events.races.get(i) {
+        if let Some((i, done)) = m.gates_key {
+            // Passed: the next gate of the same race, or the finish (the gates go away with the finish).
+            let passed = match key {
+                Some(k) => k == (i, done + 1),
+                None => rs.race == Some(i) && rs.racers.first().is_some_and(|p| p.finished_s.is_some() && p.gates_done == done + 1),
+            };
+            if let (true, Some(def)) = (passed, events.races.get(i)) {
+                let birth = time.elapsed_secs_wrapped();
+                let (mut pieces, life) = if lasers_on() {
+                    // The passed laser switches off: its beams retract into the plate (the plate goes with them).
+                    (std::mem::take(&mut m.gate_pieces), LASER_OFF_S)
+                } else {
                     let g = gate(def, done);
                     let centre = ground(&track, g.centre) + Vec3::Y * 0.2;
-                    let colour = if lasers_on() { laser_blue() } else { pink() };
-                    m.flashes.push(Flash { centre, scale: g.half_width.clamp(6.0, 18.0), colour, birth: time.elapsed_secs_wrapped(), until: now + FLASH_LIFE });
+                    let xf = Affine3A::from_scale_rotation_translation(Vec3::splat(g.half_width.clamp(6.0, 18.0) * (FLASH_GROW * FLASH_LIFE).exp()), Quat::IDENTITY, centre);
+                    (vec![Piece::new(T_RIPPLE, xf, pink(), 1.2, [1.0, 4.0, 400.0, 600.0], 0.0)], FLASH_LIFE)
+                };
+                pieces.retain(|p| p.tpl != T_EMITTER);
+                for p in &mut pieces {
+                    p.flash = Some(birth);
+                }
+                if !pieces.is_empty() {
+                    m.flashes.push(Flash { pieces, birth, until: now + life + 0.05 });
                 }
             }
         }
@@ -975,12 +1149,8 @@ fn merged_markers(
     for &(i, colour, intensity, emph, ripple, height) in &shown {
         marker_pieces(&mut pieces, m.grounds[i], colour, intensity, emph, ripple, height);
     }
-    let smax = (FLASH_GROW * FLASH_LIFE).exp();
     for f in &m.flashes {
-        let xf = Affine3A::from_scale_rotation_translation(Vec3::splat(f.scale * smax), Quat::IDENTITY, f.centre);
-        let mut p = Piece::new(T_RIPPLE, xf, f.colour, 1.2, [1.0, 4.0, 400.0, 600.0], 0.0);
-        p.flash = Some(f.birth);
-        pieces.push(p);
+        pieces.extend_from_slice(&f.pieces);
     }
     let live = m.entity.and_then(|e| ent.get_mut(e).ok());
     if pieces.is_empty() {
@@ -1023,5 +1193,93 @@ fn merged_markers(
                 .id();
             m.entity = Some(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fh1_engine::vehicle::{Ground, GroundHit, SphereContact, TyreSurface};
+
+    /// Flat ground at y = 0: asphalt for x in `road`, grass (offroadness 1) outside, raised by `kerb` m outside.
+    struct Road {
+        road: (f32, f32),
+        kerb: f32,
+    }
+
+    impl Ground for Road {
+        fn ray(&self, o: Vec3, d: Vec3, max: f32) -> Option<GroundHit> {
+            let off = o.x < self.road.0 || o.x > self.road.1;
+            let y = if off { self.kerb } else { 0.0 };
+            if d.y >= -1e-6 || o.y < y {
+                return None;
+            }
+            let t = (o.y - y) / -d.y;
+            let tyre = TyreSurface { offroadness: if off && self.kerb == 0.0 { 1.0 } else { 0.0 }, ..Default::default() };
+            (t <= max).then(|| GroundHit { distance: t, point: o + d * t, normal: Vec3::Y, tyre, surface: 0 })
+        }
+        fn sphere(&self, _: Vec3, _: f32, out: &mut Vec<SphereContact>) {
+            out.clear();
+        }
+    }
+
+    fn track(road: (f32, f32), kerb: f32) -> crate::track::Track {
+        crate::track::Track { ground: std::sync::Arc::new(Road { road, kerb }), ..crate::track::Track::flat() }
+    }
+
+    #[test]
+    fn finish_pair_stands_at_the_road_edges() {
+        // Grass beyond -4.5 / +5.5: the pair 0.3 m inside each edge.
+        let [l, r] = road_edges(&track((-4.5, 5.5), 0.0), Vec3::ZERO, Vec3::X);
+        assert!((l.x + 4.2).abs() < 0.01 && (r.x - 5.2).abs() < 0.01, "{l} {r}");
+        // A kerb (0.3 m step) at +-6 m.
+        let [l, r] = road_edges(&track((-6.0, 6.0), 0.3), Vec3::ZERO, Vec3::X);
+        assert!((l.x + 5.7).abs() < 0.01 && (r.x - 5.7).abs() < 0.01 && l.y.abs() < 0.01, "{l} {r}");
+        // No edge within 12 m (a plaza): the game's median spacing.
+        let [l, r] = road_edges(&track((-100.0, 100.0), 0.0), Vec3::ZERO, Vec3::X);
+        assert!((l.x + FINISH_HALF_M).abs() < 0.01 && (r.x - FINISH_HALF_M).abs() < 0.01, "{l} {r}");
+    }
+
+    #[test]
+    fn every_race_type_lights_its_next_checkpoint() {
+        let path = [(0.0, 0.0), (300.0, 0.0)];
+        let at = |def: &super::super::RaceDef, done: u32| -> Vec<Vec3> {
+            laser_gate(def, done, &crate::track::Track::flat()).iter().filter(|p| p.tpl == T_LASER).map(|p| Vec3::from(p.xf.translation)).collect()
+        };
+        // Festival (waypoint gates, half width 30): one laser where the road path passes the off-road waypoint.
+        let fest = crate::race::tests::test_def(&[(100.0, 12.0), (200.0, 0.0)], 30.0, &path, 1, false);
+        assert!(!checkpoint_route(&fest));
+        let v = at(&fest, 0);
+        assert!(v.len() == 3 && v.iter().all(|p| p.distance(Vec3::new(100.0, 0.0, 0.0)) < 1e-3), "{v:?}");
+        // Street (checkpoint gates): CHECKPOINT_AHEAD_M past the checkpoint along its facing (+X).
+        let street = crate::race::tests::test_def(&[(100.0, 0.0), (200.0, 0.0)], 25.0, &path, 1, false);
+        assert!(at(&street, 0).iter().all(|p| p.distance(Vec3::new(100.0 + CHECKPOINT_AHEAD_M, 0.0, 0.0)) < 1e-3));
+        // Circuit, lap 1's lap line (not the final gate): a blue laser, not the finish pair.
+        let circuit = crate::race::tests::test_def(&[(100.0, 0.0), (200.0, 0.0)], 30.0, &path, 2, true);
+        assert_eq!(at(&circuit, 1).len(), 3);
+        assert_eq!(at(&circuit, 3).len(), 6);
+    }
+
+    #[test]
+    fn festival_laser_snaps_to_the_road_path() {
+        let path = [Vec3::new(0.0, 10.0, 0.0), Vec3::new(100.0, 20.0, 0.0)];
+        let p = on_path(&path, Vec3::new(50.0, 0.0, 12.0)).unwrap();
+        assert!((p - Vec3::new(50.0, 15.0, 0.0)).length() < 1e-3, "{p}");
+        assert!(on_path(&path, Vec3::new(50.0, 0.0, 60.0)).is_none());
+    }
+
+    #[test]
+    fn laser_objects() {
+        let mut blue = Vec::new();
+        laser(&mut blue, Vec3::new(1.0, 2.0, 3.0), false);
+        let count = |v: &[Piece], t: usize| v.iter().filter(|p| p.tpl == t).count();
+        assert_eq!((count(&blue, T_LASER), count(&blue, T_HAZE), count(&blue, T_GLOW), count(&blue, T_EMITTER)), (3, 3, 1, 1));
+        // Beams 120 degrees apart (k.x = index), the finish's flagged + 4 and without the base glow.
+        let mut green = Vec::new();
+        laser(&mut green, Vec3::ZERO, true);
+        assert_eq!(count(&green, T_GLOW), 0);
+        let kx: Vec<f32> = green.iter().filter(|p| p.tpl == T_LASER).map(|p| p.kx).collect();
+        assert_eq!(kx, [4.0, 5.0, 6.0]);
+        assert!(blue.iter().filter(|p| p.tpl != T_EMITTER && p.tpl != T_BOUNDS).all(|p| p.offset_normal && Vec3::from(p.xf.translation) == Vec3::new(1.0, 2.0, 3.0)));
     }
 }

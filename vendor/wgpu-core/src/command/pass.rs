@@ -110,7 +110,9 @@ where
         // render passes, and is used to fail submission of the command buffer if
         // any resource in any of the bind groups has been destroyed, whether or
         // not the bind group is actually used by the pipeline.
-        let bind_group = state.base.tracker.bind_groups.insert_single(bind_group);
+        // FH1 patch 3: once per command buffer (re-binds of the same group added a duplicate each time).
+        let key = bind_group.tracker_index().as_usize();
+        let bind_group = state.base.tracker.bind_groups.insert_single_once(bind_group, key);
 
         bind_group.same_device(device)?;
 

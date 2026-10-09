@@ -14,7 +14,7 @@ use crate::{resources::GpuAtmosphere, ViewLightsUniformOffset};
 
 use super::{
     resources::{
-        AtmosphereBindGroups, AtmosphereLutPipelines, AtmosphereTransformsOffset,
+        AtmosphereBindGroups, AtmosphereLutPipelines, AtmosphereStaticLutsValid, AtmosphereTransformsOffset,
         RenderSkyPipelineId,
     },
     GpuAtmosphereSettings,
@@ -29,6 +29,7 @@ pub fn atmosphere_luts(
         &AtmosphereTransformsOffset,
         &ViewUniformOffset,
         &ViewLightsUniformOffset,
+        bevy_ecs::query::Has<AtmosphereStaticLutsValid>,
     )>,
     pipelines: Res<AtmosphereLutPipelines>,
     pipeline_cache: Res<PipelineCache>,
@@ -42,6 +43,7 @@ pub fn atmosphere_luts(
         atmosphere_transforms_offset,
         view_uniforms_offset,
         lights_uniforms_offset,
+        static_luts_valid,
     ) = view.into_inner();
 
     let (
@@ -77,6 +79,8 @@ pub fn atmosphere_luts(
         compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
     }
 
+    // FH1 patch 11: the transmittance + multiscattering LUTs persist per view and only re-render when their inputs change.
+    if !static_luts_valid {
     // Transmittance LUT
 
     luts_pass.set_pipeline(transmittance_lut_pipeline);
@@ -108,6 +112,7 @@ pub fn atmosphere_luts(
         settings.multiscattering_lut_size.y,
         1,
     );
+    }
 
     // Sky View LUT
 

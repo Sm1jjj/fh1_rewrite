@@ -14,6 +14,12 @@
 //! data. `FH1_TRAP_PAY_ONCE=0`: every pass at or above the minimum pays (farmable by driving back and forth).
 //!
 //! Every crossing (any speed) is also sent as [`SpeedTrapCrossed`] for the speed-stunt missions (outpost.rs).
+//!
+//! In the world (P19): VERIFIED FH1 shows a trap only as its two camera posts (the GameObjs props 677 / 683, drawn by
+//! props) plus the map icon (white camera = trap, yellow = zone) and this HUD; markers.rs adds just a small glint on
+//! each post's camera box (and, with `FH1_TRAP_LINE=1`, a faint line on the road between them). The posts of all 22
+//! cameras and 18 zone gates were re-checked against GameObjs.xml for the redesign: missions.json holds exactly their
+//! positions (Z negated), every post's camera box points at its partner, so no data change.
 
 use bevy::prelude::*;
 

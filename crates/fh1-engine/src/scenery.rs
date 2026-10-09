@@ -582,9 +582,12 @@ fn zone_union_radius() -> f32 {
     *R.get_or_init(|| std::env::var("FH1_ZONE_UNION").ok().and_then(|v| v.parse().ok()).filter(|r: &f32| *r >= 0.0).unwrap_or(ZONE_UNION_RADIUS))
 }
 
+/// P17-A: without `FH1_ZONE_CULL_SCALE`, the push-out shrinks with the quality preset's draw distance, never below the
+/// game's culls (Low 0.7 -> x1.12).
 fn zone_cull_scale() -> f32 {
-    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *K.get_or_init(|| std::env::var("FH1_ZONE_CULL_SCALE").ok().and_then(|v| v.parse().ok()).filter(|k: &f32| *k > 0.0).unwrap_or(ZONE_CULL_SCALE))
+    static K: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    K.get_or_init(|| std::env::var("FH1_ZONE_CULL_SCALE").ok().and_then(|v| v.parse().ok()).filter(|k: &f32| *k > 0.0))
+        .unwrap_or_else(|| (ZONE_CULL_SCALE * fh1_render::quality::draw_distance()).max(1.0))
 }
 
 /// A range that never culls but has crossfade margins: it only makes Bevy compile the mesh with
@@ -1869,7 +1872,8 @@ struct LevelEntry {
 
 impl LevelEntry {
     fn wanted(&self, eye: Vec3, margin: f32) -> bool {
-        let d = self.m.w_axis.truncate().distance(eye);
+        // P17-A: the static world cull scales its bands the same way (uniform eye.w).
+        let d = self.m.w_axis.truncate().distance(eye) / fh1_render::quality::draw_distance();
         d >= self.from - margin && d <= self.to + margin
     }
 }

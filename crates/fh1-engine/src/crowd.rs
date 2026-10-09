@@ -864,7 +864,8 @@ fn stream(
         }
     }
     near.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let cap: usize = w.lod_counts.iter().sum();
+    // P17-A: the quality preset thins the 3D figures (the nearest keep their LODs; the cards start at the new cut).
+    let cap = (w.lod_counts.iter().sum::<usize>() as f32 * fh1_render::quality::crowd_density()).round() as usize;
     let cut = if near.len() > cap { near[cap].0 } else { w.near };
     near.truncate(cap);
     if (cut - w.cut).abs() > 0.25 {
@@ -895,6 +896,7 @@ fn stream(
                     let f = w.near_loaded.get_mut(&i).unwrap();
                     commands.entity(f.body).insert(Mesh3d(m));
                     f.lod = lod;
+                    set_figure_shadow(&mut commands, f.body, lod);
                 }
             }
             continue;
@@ -912,6 +914,7 @@ fn stream(
             let t = Transform::from_translation(s.position).with_rotation(Quat::from_rotation_y(yaw));
             let mut a3 = Assets3d { meshes: &mut meshes, images: &mut images, raw: &mut raw, std_mats: &mut std_mats, bindposes: &mut bindposes, buffers: &mut buffers, fig_mats: &mut fig_mats };
             let Some(f) = w.spawn_figure(&mut commands, &mut a3, i as u32, s.class, s.model, lod, t) else { continue };
+            set_figure_shadow(&mut commands, f.body, lod);
             w.near_loaded.insert(i, f);
         }
     }
@@ -941,6 +944,22 @@ fn card_light(suns: &Query<(&DirectionalLight, &GlobalTransform)>, ambient: Opti
         l += a.color.to_linear().to_vec3() * a.brightness * k;
     }
     l.clamp(Vec3::ZERO, Vec3::splat(4.0))
+}
+
+/// P18: 3D figures cast shadows only in the nearest `FH1_CROWD_SHADOW_LODS` skinbin LOD bands (default 2 = the nearest
+/// 5 + 20 figures by the game's crowd LOD counts). The ~175 farther figures are a few pixels tall and each one is a skinned
+/// draw in every cascade (census 2026-10-09: ~200 ECS casters). 4 = every figure casts (old).
+fn crowd_shadow_lods() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("FH1_CROWD_SHADOW_LODS").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+}
+
+fn set_figure_shadow(commands: &mut Commands, body: Entity, lod: usize) {
+    if lod < crowd_shadow_lods() {
+        commands.entity(body).remove::<NotShadowCaster>();
+    } else {
+        commands.entity(body).insert(NotShadowCaster);
+    }
 }
 
 /// 3D figures spawned per frame at most (`FH1_CROWD_SPAWNS`, 0 = unlimited).

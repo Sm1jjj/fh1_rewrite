@@ -11,12 +11,12 @@ use bevy_ecs::{
     error::BevyError,
     query::With,
     resource::Resource,
-    system::{Commands, Query, Res, ResMut},
+    system::{Commands, Local, Query, Res, ResMut},
     world::{FromWorld, World},
 };
 use bevy_image::ToExtents;
 use bevy_light::atmosphere::ScatteringMedium;
-use bevy_math::{Affine3A, Mat4, Vec3, Vec3A};
+use bevy_math::{Affine3A, Mat4, UVec2, Vec3, Vec3A};
 use bevy_render::{
     extract_component::ComponentUniforms,
     render_asset::RenderAssets,
@@ -394,40 +394,67 @@ pub struct AtmosphereTextures {
     pub aerial_view_lut: CachedTexture,
 }
 
+/// FH1 patch 11 (P18): the transmittance and multiscattering LUTs depend only on the planet (radii, ground albedo), the
+/// scattering medium and the LUT settings, not on the view or the sun, yet upstream takes them from the per-frame
+/// `TextureCache` and re-renders both every frame. With `static_luts_on()` each view keeps its own pair (re-created when
+/// a size changes) and [`AtmosphereStaticLutsValid`] tells `atmosphere_luts` to skip their dispatches while their inputs
+/// are unchanged. `FH1_ATMO_STATIC_LUTS=0` = old.
+pub(crate) fn static_luts_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_ATMO_STATIC_LUTS").map_or(true, |v| v != "0"))
+}
+
+/// FH1 patch 11: this view's transmittance + multiscattering LUTs already hold this frame's inputs (rendered on an
+/// earlier frame into the same persistent textures): `atmosphere_luts` skips those two dispatches.
+#[derive(Component)]
+pub struct AtmosphereStaticLutsValid;
+
+/// FH1 patch 11: a view's persistent static LUT pair, by size.
+pub(super) struct StaticLutTextures {
+    sizes: (UVec2, UVec2),
+    transmittance_lut: CachedTexture,
+    multiscattering_lut: CachedTexture,
+}
+
 pub(super) fn prepare_atmosphere_textures(
     views: Query<(Entity, &GpuAtmosphereSettings), With<ExtractedAtmosphere>>,
     render_device: Res<RenderDevice>,
     mut texture_cache: ResMut<TextureCache>,
     mut commands: Commands,
+    mut static_luts: Local<bevy_platform::collections::HashMap<Entity, StaticLutTextures>>,
 ) {
+    let descriptor = |label: &'static str, size: UVec2| TextureDescriptor {
+        label: Some(label),
+        size: size.to_extents(),
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba16Float,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    };
+    if static_luts_on() {
+        static_luts.retain(|e, _| views.contains(*e));
+    }
     for (entity, lut_settings) in &views {
-        let transmittance_lut = texture_cache.get(
-            &render_device,
-            TextureDescriptor {
-                label: Some("transmittance_lut"),
-                size: lut_settings.transmittance_lut_size.to_extents(),
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba16Float,
-                usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-        );
-
-        let multiscattering_lut = texture_cache.get(
-            &render_device,
-            TextureDescriptor {
-                label: Some("multiscattering_lut"),
-                size: lut_settings.multiscattering_lut_size.to_extents(),
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba16Float,
-                usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-        );
+        let (transmittance_lut, multiscattering_lut) = if static_luts_on() {
+            let sizes = (lut_settings.transmittance_lut_size, lut_settings.multiscattering_lut_size);
+            let new = || StaticLutTextures {
+                sizes,
+                transmittance_lut: persistent_texture(&render_device, &descriptor("transmittance_lut", sizes.0)),
+                multiscattering_lut: persistent_texture(&render_device, &descriptor("multiscattering_lut", sizes.1)),
+            };
+            let entry = static_luts.entry(entity).or_insert_with(new);
+            if entry.sizes != sizes {
+                *entry = new();
+            }
+            (entry.transmittance_lut.clone(), entry.multiscattering_lut.clone())
+        } else {
+            (
+                texture_cache.get(&render_device, descriptor("transmittance_lut", lut_settings.transmittance_lut_size)),
+                texture_cache.get(&render_device, descriptor("multiscattering_lut", lut_settings.multiscattering_lut_size)),
+            )
+        };
 
         let sky_view_lut = texture_cache.get(
             &render_device,
@@ -466,6 +493,13 @@ pub(super) fn prepare_atmosphere_textures(
             }
         });
     }
+}
+
+/// FH1 patch 11: a texture + default view that lives as long as its owner (not the per-frame `TextureCache`).
+fn persistent_texture(render_device: &RenderDevice, descriptor: &TextureDescriptor) -> CachedTexture {
+    let texture = render_device.create_texture(descriptor);
+    let default_view = texture.create_view(&TextureViewDescriptor::default());
+    CachedTexture { texture, default_view }
 }
 
 #[derive(Copy, Clone, Debug, thiserror::Error)]
@@ -618,6 +652,14 @@ enum AtmosphereBindGroupError {
     LightUniforms,
 }
 
+/// FH1 patch 11: what a view's static LUTs were last rendered from (texture views, medium LUT views, planet, settings).
+type StaticLutKey = (
+    [WgpuTextureView; 4],
+    [u32; 5],
+    (UVec2, UVec2, u32, u32, u32),
+);
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_atmosphere_bind_groups(
     views: Query<
         (
@@ -626,9 +668,15 @@ pub(super) fn prepare_atmosphere_bind_groups(
             &AtmosphereTextures,
             &ViewDepthTexture,
             &Msaa,
+            (Option<&GpuAtmosphere>, &GpuAtmosphereSettings),
         ),
         (With<Camera3d>, With<ExtractedAtmosphere>),
     >,
+    (lut_pipelines, mut bind_group_cache, mut static_lut_keys): (
+        Res<AtmosphereLutPipelines>,
+        Local<crate::render::PreprocessBindGroupCache>,
+        Local<bevy_platform::collections::HashMap<Entity, StaticLutKey>>,
+    ),
     render_device: Res<RenderDevice>,
     layouts: Res<AtmosphereBindGroupLayouts>,
     render_sky_layouts: Res<RenderSkyBindGroupLayouts>,
@@ -670,12 +718,58 @@ pub(super) fn prepare_atmosphere_bind_groups(
         .binding()
         .ok_or(AtmosphereBindGroupError::LightUniforms)?;
 
-    for (entity, atmosphere, textures, view_depth_texture, msaa) in &views {
+    // FH1 patch 11: the LUT pass dispatches only when all four pipelines exist (node.rs); before that nothing is rendered.
+    let luts_ready = [lut_pipelines.transmittance_lut, lut_pipelines.multiscattering_lut, lut_pipelines.sky_view_lut, lut_pipelines.aerial_view_lut]
+        .iter()
+        .all(|id| pipeline_cache.get_compute_pipeline(*id).is_some());
+    static_lut_keys.retain(|e, _| views.contains(*e));
+    bind_group_cache.begin_frame();
+    let cache = core::cell::RefCell::new(core::mem::take(&mut *bind_group_cache));
+    let result = (|| -> Result<(), BevyError> {
+    for (entity, atmosphere, textures, view_depth_texture, msaa, (gpu_atmosphere, settings)) in &views {
         let gpu_medium = gpu_media
             .get(atmosphere.medium)
             .ok_or(ScatteringMediumMissingError(atmosphere.medium))?;
 
-        let transmittance_lut = render_device.create_bind_group(
+        // FH1 patch 11: static LUTs still valid = same persistent textures, medium, planet and settings as the frame that
+        // rendered them.
+        if static_luts_on() {
+            let key = gpu_atmosphere.map(|a| -> StaticLutKey {
+                (
+                    [
+                        (*textures.transmittance_lut.default_view).clone(),
+                        (*textures.multiscattering_lut.default_view).clone(),
+                        (*gpu_medium.density_lut_view).clone(),
+                        (*gpu_medium.scattering_lut_view).clone(),
+                    ],
+                    [a.inner_radius.to_bits(), a.outer_radius.to_bits(), a.ground_albedo.x.to_bits(), a.ground_albedo.y.to_bits(), a.ground_albedo.z.to_bits()],
+                    (
+                        settings.transmittance_lut_size,
+                        settings.multiscattering_lut_size,
+                        settings.transmittance_lut_samples,
+                        settings.multiscattering_lut_dirs,
+                        settings.multiscattering_lut_samples,
+                    ),
+                )
+            });
+            let valid = key.is_some() && static_lut_keys.get(&entity) == key.as_ref();
+            if valid {
+                commands.entity(entity).insert(AtmosphereStaticLutsValid);
+            } else {
+                commands.entity(entity).remove::<AtmosphereStaticLutsValid>();
+                // Rendered this frame (when the pass can run): valid from the next frame on.
+                match key {
+                    Some(key) if luts_ready => {
+                        static_lut_keys.insert(entity, key);
+                    }
+                    _ => {
+                        static_lut_keys.remove(&entity);
+                    }
+                }
+            }
+        }
+
+        let transmittance_lut = crate::render::cached_bind_group(&cache, &render_device,
             "transmittance_lut_bind_group",
             &pipeline_cache.get_bind_group_layout(&layouts.transmittance_lut),
             &BindGroupEntries::with_indices((
@@ -691,7 +785,7 @@ pub(super) fn prepare_atmosphere_bind_groups(
             )),
         );
 
-        let multiscattering_lut = render_device.create_bind_group(
+        let multiscattering_lut = crate::render::cached_bind_group(&cache, &render_device,
             "multiscattering_lut_bind_group",
             &pipeline_cache.get_bind_group_layout(&layouts.multiscattering_lut),
             &BindGroupEntries::with_indices((
@@ -710,7 +804,7 @@ pub(super) fn prepare_atmosphere_bind_groups(
             )),
         );
 
-        let sky_view_lut = render_device.create_bind_group(
+        let sky_view_lut = crate::render::cached_bind_group(&cache, &render_device,
             "sky_view_lut_bind_group",
             &pipeline_cache.get_bind_group_layout(&layouts.sky_view_lut),
             &BindGroupEntries::with_indices((
@@ -733,7 +827,7 @@ pub(super) fn prepare_atmosphere_bind_groups(
             )),
         );
 
-        let aerial_view_lut = render_device.create_bind_group(
+        let aerial_view_lut = crate::render::cached_bind_group(&cache, &render_device,
             "sky_view_lut_bind_group",
             &pipeline_cache.get_bind_group_layout(&layouts.aerial_view_lut),
             &BindGroupEntries::with_indices((
@@ -755,7 +849,7 @@ pub(super) fn prepare_atmosphere_bind_groups(
             )),
         );
 
-        let render_sky = render_device.create_bind_group(
+        let render_sky = crate::render::cached_bind_group(&cache, &render_device,
             "render_sky_bind_group",
             &pipeline_cache.get_bind_group_layout(if *msaa == Msaa::Off {
                 &render_sky_layouts.render_sky
@@ -794,6 +888,10 @@ pub(super) fn prepare_atmosphere_bind_groups(
     }
 
     Ok(())
+    })();
+    *bind_group_cache = cache.into_inner();
+    bind_group_cache.end_frame();
+    result
 }
 
 pub fn init_atmosphere_buffer(mut commands: Commands) {

@@ -24,3 +24,15 @@ them. Rebase them when wgpu is upgraded (or drop them if upstream stops re-walki
    and keeps the lengths, so `set_size` is a no-op unless the device grew. The compute path's mid-pass removals
    (`set_and_remove_from_usage_scope_sparse`) now also reset the removed slot, so every slot reads exactly as after the
    old clear + resize. Revert = the two `clear()` calls in `track/mod.rs`.
+
+3. **Bind groups tracked once per command buffer** (P18, 2026-10-09; docs/PERF.md "P18"). `command/pass.rs` `set_bind_group`
+   pushed the bind group into the command buffer's `trackers.bind_groups` (`StatelessTracker`, a plain `Vec<Arc<_>>`) on
+   EVERY call, duplicates included, and `device/queue.rs` `validate_command_buffer` calls `BindGroup::try_raw` on every
+   entry at submit, which walks all of the group's buffers and textures. A bindless RemasterMaterial slab holds hundreds
+   of texture views and is re-bound per draw bin (static world lit classes, cutout cascade bins, Bevy's passes), so
+   submit re-walked each slab's textures once per re-bind (part of `submit_pending_command_buffers` 1.39 ms, user log
+   20261009_143733), and the duplicate Arcs were dropped again when the submission retired.
+   `track/stateless.rs`: `StatelessTracker::insert_single_once(resource, key)` keeps a key -> position map and pushes a
+   resource only once per tracker; pass.rs uses it with the bind group's tracker index (unique while the tracker holds
+   the group alive). The tracker only keeps resources alive and lets submit validate them, so one entry per bind group
+   is equivalent. Render bundles (`command/bundle.rs`) keep `insert_single`. No flag; revert = `insert_single` in pass.rs.

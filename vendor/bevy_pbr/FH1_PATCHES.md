@@ -80,3 +80,26 @@ fh1-render's half-res effects composite (fx_half_res.rs) can order itself `.afte
    per-pixel black dots (the car paint's sun removal then clamped them to pure black; car_paint.rs FH1_RM_PAINT_SUN_MATCH).
    No flag (shader library patch); revert = march from `world_position` again. Contacts shorter than the offset lose
    their contact shadow (a few cm at car distance).
+
+10. **Preprocess bind groups cached** (P18, 2026-10-09, docs/PERF.md "P18"; `FH1_PREPROCESS_BG_CACHE=0` = old).
+   `src/render/gpu_preprocess.rs`: every (view, phase) mesh-preprocessing bind group and every phase's four
+   build-indirect-parameters bind groups were created each frame (~40 `create_bind_group` per frame in FH1;
+   `prepare_preprocess_bind_groups` 0.66 ms of render thread in user log 20261009_143733). `cached_bind_group` (pub,
+   doc-hidden) wraps `create_bind_group` with `PreprocessBindGroupCache` (a `Local`): key = layout id + every entry's
+   (binding, resource), resources = buffers (+ offset, size), texture views, samplers, held as clones of the wgpu
+   objects. wgpu compares those by `Arc` address and the clone keeps the address alive, so a hit binds exactly what a
+   new group would; a reallocated buffer or a changed binding size (item / batch counts) is a miss. Groups with array
+   entries are created as before. Entries unused in a frame are dropped at its end (patch 8's scheme).
+
+11. **Atmosphere: static LUTs persist, bind groups cached** (P18, 2026-10-09; `FH1_ATMO_STATIC_LUTS=0` = old LUTs,
+   `FH1_PREPROCESS_BG_CACHE=0` = old bind groups). `src/atmosphere/{resources,node}.rs`:
+   - `prepare_atmosphere_textures`: with static LUTs on, each view keeps its own transmittance + multiscattering LUT
+     textures (`StaticLutTextures` in a `Local`, re-created when a size changes, dropped with the view) instead of
+     taking them from the per-frame `TextureCache`. Sky-view / aerial-view LUTs still come from the cache.
+   - `prepare_atmosphere_bind_groups`: those two LUTs depend only on the planet (radii, ground albedo), the scattering
+     medium's LUTs and the LUT settings (sizes, samples, dirs); the shaders read nothing view- or sun-dependent
+     (transmittance_lut.wgsl, multiscattering_lut.wgsl). A per-view key of exactly those inputs (texture / medium views
+     by identity, f32 bits) is stored on the frame the LUTs render (only when all four LUT pipelines exist, i.e. the
+     node dispatches); while the key is unchanged the view gets `AtmosphereStaticLutsValid` and `atmosphere_luts`
+     skips the two dispatches. fh1-remaster rebuilding the medium (haze change >4 %, sky.rs) = new medium views = one
+     re-render. Also the five bind groups go through patch 10's `cached_bind_group`.

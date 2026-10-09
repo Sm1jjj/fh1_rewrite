@@ -97,6 +97,24 @@ pub const FLAG_LIVE: u32 = 4;
 pub const FLAG_MASK: u32 = 8;
 pub const FLAG_TWO_SIDED: u32 = 16;
 pub const FLAG_HIDDEN: u32 = 32;
+/// P18: the record's material may draw in the P15-A depth pre-pass (opaque class, no cloth wave, no decal mask). Set by
+/// the render world (draw.rs resolve_materials) from [`pre_ok`]; read by the pre-pass instead of the material table, so
+/// the pre-pass binds no material slab (`FH1_SW_PREPASS_NOMAT=0` = old: the shader reads the table).
+pub const FLAG_PRE_OK: u32 = 64;
+
+/// P18: whether a RemasterMaterial may be pre-passed: the same rule as the pre-pass shader's old material test (info.z:
+/// no cloth 0x80 / decal mask 0x8000 flag; class not cutout 1, decal 2, water 4, additive 5).
+pub fn pre_ok(m: &crate::material::RemasterMaterial) -> bool {
+    let z = m.extension.params.info.z;
+    let cls = (z >> 16) & 0xff;
+    z & 0x8080 == 0 && !matches!(cls, 1 | 2 | 4 | 5)
+}
+
+/// P18: the pre-pass reads FLAG_PRE_OK and binds no material (`FH1_SW_PREPASS_NOMAT=0` = old).
+pub fn prepass_nomat_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FH1_SW_PREPASS_NOMAT").map_or(true, |v| v != "0"))
+}
 
 /// What a scenery entity draws (main world): its slot in the record buffer.
 #[derive(Component, Debug)]
@@ -133,6 +151,8 @@ enum Op {
     SetHidden(u32, bool),
     /// A material was modified (night writes): re-resolve its records' bindless slot / slab.
     Rebind(UntypedAssetId),
+    /// P18: a material's pre-pass eligibility ([`pre_ok`]); sent before its Rebind.
+    PreClass(UntypedAssetId, bool),
 }
 
 /// Main-world bookkeeping: packed geometry ids and free instance slots.
@@ -375,18 +395,22 @@ fn free_geometry(mut events: MessageReader<AssetEvent<Mesh>>) {
 /// Material changes (47's dusk / dawn night writes, 256 per frame): Bevy re-prepares the material, which may move it to
 /// another bindless slot or slab; the records using it are re-resolved (draw.rs resolve_materials).
 /// `FH1_STATIC_WORLD_REBIND=0` = never re-resolve (chunk 4).
-fn watch_materials(mut events: MessageReader<AssetEvent<crate::material::RemasterMaterial>>) {
-    if std::env::var("FH1_STATIC_WORLD_REBIND").is_ok_and(|v| v == "0") {
-        events.clear();
-        return;
+fn watch_materials(mut events: MessageReader<AssetEvent<crate::material::RemasterMaterial>>, materials: Res<Assets<crate::material::RemasterMaterial>>) {
+    let rebind = !std::env::var("FH1_STATIC_WORLD_REBIND").is_ok_and(|v| v == "0");
+    let mut ops: Vec<Op> = Vec::new();
+    for e in events.read() {
+        if let AssetEvent::Modified { id } | AssetEvent::Added { id } = e {
+            // P18: the pre-pass class first, so the re-resolve below sees it.
+            if prepass_nomat_on() {
+                if let Some(m) = materials.get(*id) {
+                    ops.push(Op::PreClass(id.untyped(), pre_ok(m)));
+                }
+            }
+            if rebind {
+                ops.push(Op::Rebind(id.untyped()));
+            }
+        }
     }
-    let mut ops: Vec<Op> = events
-        .read()
-        .filter_map(|e| match e {
-            AssetEvent::Modified { id } | AssetEvent::Added { id } => Some(Op::Rebind(id.untyped())),
-            _ => None,
-        })
-        .collect();
     if !ops.is_empty() {
         with(|s| s.ops.append(&mut ops));
     }
@@ -545,6 +569,8 @@ pub struct Arena {
     /// Material -> its record slots (re-binding), and slots to re-resolve once more next frame.
     by_material: HashMap<UntypedAssetId, Vec<u32>>,
     pub(crate) recheck: Vec<u32>,
+    /// P18: pre-pass eligibility per material ([`pre_ok`]; missing = not pre-passed).
+    pub(crate) pre_ok: HashMap<UntypedAssetId, bool>,
     /// Records / buffers changed since the draw lists were built (draw.rs).
     pub(crate) dirty: bool,
     /// Bumped whenever a GPU buffer is re-created (the draw bind group must be rebuilt).
@@ -565,6 +591,7 @@ impl Default for Arena {
             pending: Vec::new(),
             by_material: HashMap::new(),
             recheck: Vec::new(),
+            pre_ok: HashMap::new(),
             dirty: false,
             buffers_generation: 0,
         }
@@ -746,6 +773,17 @@ fn apply_ops(mut arena: ResMut<Arena>, device: Res<RenderDevice>, queue: Res<Ren
                     } else {
                         a.write_record(&device, &queue, slot);
                     }
+                }
+            }
+            Op::PreClass(material, ok) => {
+                if ok {
+                    a.pre_ok.insert(material, true);
+                } else {
+                    a.pre_ok.remove(&material);
+                }
+                // Without rebinding (FH1_STATIC_WORLD_REBIND=0) the records still need the new flag.
+                if let Some(v) = a.by_material.get(&material) {
+                    a.pending.extend_from_slice(v);
                 }
             }
             Op::Rebind(material) => {

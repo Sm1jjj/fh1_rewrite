@@ -141,6 +141,10 @@ pub struct SatNav {
     pub distance_m: Option<f32>,
     /// The route's graph nodes from the car to the target ([`NavGraph`] indices; ui/worldmap's GPS line and chevrons).
     pub path: Vec<u32>,
+    /// Route on past the target (engine x, z), drawn after the car -> target line: a race's road path through its next
+    /// few gates (race.rs `race_nav`). Empty = none. Bump `beyond_gen` when it changes so the route is redrawn.
+    pub beyond: Vec<Vec2>,
+    pub beyond_gen: u32,
 }
 
 /// Colorado's road network shared with the world map (ui/worldmap.rs): the satnav graph, each node's height (engine
@@ -164,6 +168,8 @@ struct RouteData {
     applied_for: Option<u32>,
     /// Target of the last route: a new one (a waypoint) re-routes at once.
     routed_to: Option<Vec2>,
+    /// `SatNav::beyond_gen` of the last route: a new look-ahead redraws at once.
+    routed_beyond: u32,
 }
 
 /// Minimap render rate (Hz) when something changed (`FH1_MINIMAP_HZ`, 0 = every frame). The map
@@ -362,7 +368,7 @@ impl Plugin for MinimapPlugin {
         app.init_resource::<HeadingSpring>()
             .init_resource::<MinimapBadges>()
             .init_resource::<MapPace>()
-            .insert_resource(SatNav { target, distance_m: None, path: Vec::new() })
+            .insert_resource(SatNav { target, ..default() })
             // Colorado's road network: the map, satnav and icons run on Colorado only (X1d; other maps have no nav data
             // yet, and the HUD hides the disc there). The map camera is switched off elsewhere.
             .add_systems(
@@ -524,6 +530,7 @@ pub fn spawn(
         default_target: route_override().is_none().then_some(default_target),
         applied_for: None,
         routed_to: None,
+        routed_beyond: 0,
     });
     // Player arrow: shadow (2,3) at alpha 220 under arrow (3,3) of the 8×8 small icon sheet.
     let size = ARROW_PX * M_PER_PX;
@@ -606,10 +613,11 @@ fn route(
         pace.dirty = true;
     }
     let first = data.timer.elapsed_secs() == 0.0;
-    if !data.timer.tick(time.delta()).just_finished() && !first && data.routed_to == nav.target {
+    if !data.timer.tick(time.delta()).just_finished() && !first && data.routed_to == nav.target && data.routed_beyond == nav.beyond_gen {
         return;
     }
     data.routed_to = nav.target;
+    data.routed_beyond = nav.beyond_gen;
     let Ok(car) = cars.single() else { return };
     let mut rib = Ribbons::default();
     nav.distance_m = None;
@@ -623,6 +631,11 @@ fn route(
             rib.add(&pts, ROUTE.0 * M_PER_PX, false);
             nav.distance_m = Some(pts.windows(2).map(|w| Vec2::from(w[0]).distance(Vec2::from(w[1]))).sum());
             nav.path = nodes;
+        }
+        // On past the target (a race's next few gates): drawn only, not in the distance or the GPS path.
+        if nav.beyond.len() >= 2 {
+            let pts: Vec<[f32; 2]> = nav.beyond.iter().map(|p| p.to_array()).collect();
+            rib.add(&pts, ROUTE.0 * M_PER_PX, false);
         }
     }
     let _ = meshes.insert(data.mesh.id(), rib.mesh());

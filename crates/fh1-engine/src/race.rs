@@ -1009,7 +1009,9 @@ pub fn race_markers(
     }
 }
 
-/// During a race the satnav routes to the next gate and the objective line names the event and checkpoint.
+/// During a race the satnav routes to the next gate and the objective line names the event and checkpoint. The
+/// minimap's line goes on along the race's road path through the next [`NAV_AHEAD_GATES`] gates ([`lookahead`],
+/// `SatNav::beyond`; user 2026-10-09: "should extend to the next few so you can see further ahead").
 /// Contract with the world map (e4): while `RaceState::owns_nav()` the race owns `SatNav.target` / `Objective`; on
 /// release both are cleared (None) and the map's waypoint system re-applies the waypoint or free roam's default.
 /// `FH1_RACE_NAV_RESTORE=1`: the old behaviour (restore the values saved at the start).
@@ -1019,6 +1021,7 @@ pub fn race_nav(
     mut satnav: Option<ResMut<crate::ui::minimap::SatNav>>,
     mut objective: Option<ResMut<crate::ui::notify::Objective>>,
     mut saved: Local<Option<(Option<Vec2>, Option<String>, Option<Vec2>)>>,
+    mut ahead_for: Local<Option<(usize, u32)>>,
 ) {
     static RESTORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let restore = *RESTORE.get_or_init(|| std::env::var("FH1_RACE_NAV_RESTORE").is_ok_and(|v| v == "1"));
@@ -1032,7 +1035,10 @@ pub fn race_nav(
             let (t, text, ot) = if restore { (t, text, ot) } else { (None, None, None) };
             if let Some(s) = satnav.as_mut() {
                 s.target = t;
+                s.beyond.clear();
+                s.beyond_gen = s.beyond_gen.wrapping_add(1);
             }
+            *ahead_for = None;
             if let Some(o) = objective.as_mut() {
                 o.text = text;
                 o.target = ot;
@@ -1052,6 +1058,13 @@ pub fn race_nav(
         if s.target != t {
             s.target = t;
         }
+        // The minimap line runs on past the next gate through the following ones (computed once per gate).
+        let key = rs.race.map(|i| (i, p.gates_done));
+        if *ahead_for != key {
+            *ahead_for = key;
+            s.beyond = lookahead(def, p.gates_done);
+            s.beyond_gen = s.beyond_gen.wrapping_add(1);
+        }
     }
     if let Some(o) = objective.as_mut() {
         // With FH1's race widgets on screen (race/anark_hud.rs) the objective line stays empty, as in the game: the
@@ -1065,5 +1078,158 @@ pub fn race_nav(
             o.text = text;
             o.target = None;
         }
+    }
+}
+
+/// Gates past the next one the minimap's route line shows.
+const NAV_AHEAD_GATES: u32 = 3;
+
+/// The minimap route on past gate `done` (x, z): from that gate along the race's road path through the next
+/// [`NAV_AHEAD_GATES`] gates, laps wrapping on circuits, stopping at the finish. Each gate is found on the path searching
+/// forwards from the previous one (circuits wrap); a gate more than 60 m off the path is joined straight. Empty when
+/// `done` is the finish.
+fn lookahead(def: &RaceDef, done: u32) -> Vec<Vec2> {
+    let total = total_gates(def);
+    if done + 1 >= total || def.gates.is_empty() {
+        return Vec::new();
+    }
+    let last = (done + NAV_AHEAD_GATES).min(total - 1);
+    let p2 = |v: Vec3| Vec2::new(v.x, v.z);
+    let path: Vec<Vec2> = def.path.iter().map(|&v| p2(v)).collect();
+    let mut arc = vec![0.0f32];
+    for w in path.windows(2) {
+        arc.push(arc[arc.len() - 1] + w[0].distance(w[1]));
+    }
+    let len = arc[arc.len() - 1];
+    let wrap = def.circuit && len > 1.0;
+    // (distance off the path, arc length) of `q`, preferring the stretch just ahead of `from`.
+    let project = |q: Vec2, from: Option<f32>| -> Option<(f32, f32)> {
+        let mut best: Option<(f32, f32, f32)> = None;
+        for (k, w) in path.windows(2).enumerate() {
+            let ab = w[1] - w[0];
+            let l2 = ab.length_squared();
+            let t = if l2 < 1e-6 { 0.0 } else { ((q - w[0]).dot(ab) / l2).clamp(0.0, 1.0) };
+            let d = (w[0] + ab * t).distance(q);
+            let s = arc[k] + (arc[k + 1] - arc[k]) * t;
+            let cost = match from {
+                None => d,
+                Some(f) if wrap => d + 0.05 * (s - f).rem_euclid(len),
+                Some(f) => d + if s < f - 20.0 { 1e4 } else { 0.05 * (s - f).max(0.0) },
+            };
+            if best.is_none_or(|b| cost < b.2) {
+                best = Some((d, s, cost));
+            }
+        }
+        best.map(|b| (b.0, b.1))
+    };
+    let at = |s: f32| -> Vec2 {
+        let k = arc.partition_point(|&a| a <= s).clamp(1, arc.len() - 1);
+        let span = (arc[k] - arc[k - 1]).max(1e-6);
+        path[k - 1].lerp(path[k], ((s - arc[k - 1]) / span).clamp(0.0, 1.0))
+    };
+    let mut out = vec![p2(gate(def, done).centre)];
+    let mut s_prev = if path.len() >= 2 { project(out[0], None).filter(|x| x.0 < 60.0).map(|x| x.1) } else { None };
+    for n in done + 1..=last {
+        let q = p2(gate(def, n).centre);
+        let hit = if path.len() >= 2 { project(q, s_prev).filter(|x| x.0 < 60.0).map(|x| x.1) } else { None };
+        match (s_prev, hit) {
+            (Some(a), Some(b)) if b >= a || wrap => {
+                if b >= a {
+                    out.extend((0..path.len()).filter(|&k| arc[k] > a && arc[k] < b).map(|k| path[k]));
+                } else {
+                    out.extend((0..path.len()).filter(|&k| arc[k] > a).map(|k| path[k]));
+                    out.extend((0..path.len()).filter(|&k| arc[k] < b).map(|k| path[k]));
+                }
+                out.push(at(b));
+            }
+            _ => out.push(q),
+        }
+        s_prev = hit;
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A bare race: `gates` (centre x, z; forward +X, half width `hw`), road `path` (x, z) at y = 0.
+    pub(crate) fn test_def(gates: &[(f32, f32)], hw: f32, path: &[(f32, f32)], laps: u32, circuit: bool) -> RaceDef {
+        RaceDef {
+            horizon_id: String::new(),
+            name: String::new(),
+            kind: "Race".into(),
+            mode: 2,
+            laps,
+            circuit,
+            credits: 0,
+            drivers: 1,
+            track_id: 0,
+            route_file: String::new(),
+            length_m: 0.0,
+            marker: (Vec3::ZERO, 0.0),
+            grid: vec![(Vec3::ZERO, 0.0)],
+            gates: gates.iter().map(|&(x, z)| Gate { centre: Vec3::new(x, 0.0, z), forward: Vec2::X, half_width: hw }).collect(),
+            start_gate: 0,
+            path: path.iter().map(|&(x, z)| Vec3::new(x, 0.0, z)).collect(),
+            post_race: None,
+            barrier_bits: 0,
+            objects: Vec::new(),
+            field: Vec::new(),
+            ai: [(0, 0, 0); 4],
+            event_id: 0,
+            career_type: 0,
+            level: 0,
+            hub: 0,
+            unlock_xp: 0,
+            popularity_req: 0,
+            event_order: 0,
+            target_class: None,
+            player_car: None,
+            restriction: None,
+            prize_car: None,
+            recommended: Vec::new(),
+            cannons: [Vec::new(), Vec::new()],
+            start_cannon: None,
+        }
+    }
+
+    #[test]
+    fn minimap_lookahead_runs_through_the_next_gates() {
+        // Point to point along x: gates every 100 m, path every 10 m.
+        let path: Vec<(f32, f32)> = (0..=60).map(|k| (k as f32 * 10.0, 0.0)).collect();
+        let def = test_def(&[(100.0, 5.0), (200.0, 5.0), (300.0, 5.0), (400.0, 5.0), (500.0, 5.0), (600.0, 0.0)], 30.0, &path, 1, false);
+        let v = lookahead(&def, 0);
+        // From gate 0 through gates 1-3 (stopping at gate 3's projection, 400 m), monotonic along the road.
+        assert_eq!(v.first().copied(), Some(Vec2::new(100.0, 5.0)));
+        assert!((v.last().unwrap().x - 400.0).abs() < 1e-3 && v.last().unwrap().y.abs() < 1e-3, "{v:?}");
+        assert!(v.windows(2).skip(1).all(|w| w[1].x > w[0].x));
+        // Near the end it stops at the finish; at the finish there is nothing.
+        assert!((lookahead(&def, 4).last().unwrap().x - 600.0).abs() < 1e-3);
+        assert!(lookahead(&def, 5).is_empty());
+    }
+
+    #[test]
+    fn minimap_lookahead_wraps_laps_on_circuits() {
+        // A 400 m square loop, gates at the middle of each side, 2 laps (8 gates).
+        let mut path: Vec<(f32, f32)> = Vec::new();
+        for k in 0..40 {
+            let s = k as f32 * 40.0;
+            path.push(match k / 10 {
+                0 => (s, 0.0),
+                1 => (400.0, s - 400.0),
+                2 => (1200.0 - s, 400.0),
+                _ => (0.0, 1600.0 - s),
+            });
+        }
+        path.push((0.0, 0.0));
+        let def = test_def(&[(200.0, 0.0), (400.0, 200.0), (200.0, 400.0), (0.0, 200.0)], 30.0, &path, 2, true);
+        // From the last gate of lap 1 (done 3) on through gates 4-6 = lap 2's first three: across the loop's start.
+        let v = lookahead(&def, 3);
+        assert_eq!(v[0], Vec2::new(0.0, 200.0));
+        assert!(v.contains(&Vec2::new(0.0, 0.0)) && v.contains(&Vec2::new(400.0, 0.0)));
+        assert!(v.last().unwrap().distance(Vec2::new(200.0, 400.0)) < 1e-3, "{v:?}");
+        // Last lap: stops at the finish (gate 7 = (0, 200)).
+        assert!(lookahead(&def, 5).last().unwrap().distance(Vec2::new(0.0, 200.0)) < 1e-3);
     }
 }

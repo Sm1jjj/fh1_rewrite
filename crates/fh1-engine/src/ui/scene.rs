@@ -19,6 +19,7 @@ use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamp
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::math::{Affine3A, Vec3A};
 use bevy::prelude::*;
+use bevy::render::view::Msaa;
 use bevy::transform::TransformSystems;
 use fh1_ui::anark::Scene;
 use fh1_ui::player::{DrawKind, DrawText, Frame, Player};
@@ -209,10 +210,20 @@ fn additive_alpha() -> bool {
     *ON.get_or_init(|| std::env::var("FH1_HUD_ADDITIVE_ALPHA").map_or(true, |v| v != "0"))
 }
 
-fn spawn_ui_camera(mut commands: Commands) {
+/// The window overlay (HUD) camera, as opposed to the minimap / world map cameras that are `UiCamera`s too.
+#[derive(Component)]
+pub struct HudCamera;
+
+fn spawn_ui_camera(commands: Commands) {
+    spawn_hud_camera(commands, None);
+}
+
+/// `look` = (Msaa, Hdr, main texture usages) copied from the main camera (a respawn, [`sync_hdr`]); None = defaults.
+fn spawn_hud_camera(mut commands: Commands, look: Option<(Msaa, bool, bevy::camera::CameraMainTextureUsages)>) {
     if hud_2d() {
-        commands.spawn((
+        let mut e = commands.spawn((
             UiCamera,
+            HudCamera,
             // Bevy UI (placeholder menus, telemetry) draws through this window camera, never into
             // an offscreen one such as the minimap's.
             bevy::ui::IsDefaultUiCamera,
@@ -228,10 +239,17 @@ fn spawn_ui_camera(mut commands: Commands) {
             Transform::default(),
             RenderLayers::layer(UI_LAYER),
         ));
+        if let Some((msaa, hdr, usages)) = look {
+            e.insert((msaa, usages));
+            if hdr {
+                e.insert(bevy::camera::Hdr);
+            }
+        }
         return;
     }
     commands.spawn((
         UiCamera,
+        HudCamera,
         // Bevy UI (placeholder menus, telemetry) draws through this window camera, never into
         // an offscreen one such as the minimap's.
         bevy::ui::IsDefaultUiCamera,
@@ -256,15 +274,39 @@ fn spawn_ui_camera(mut commands: Commands) {
 /// never cleared, and the upscale pass alpha-blends it over the window every frame: under RTX (rtx.rs adds
 /// STORAGE_BINDING to the main camera's usages for Solarik) moving text (telemetry, F3 overlay) ghosted over its old
 /// frames. `FH1_HUD_SHARE_USAGES=0` = the old sync (Hdr only).
+///
+/// Msaa (Options > Anti-aliasing) is matched by RESPAWNING the 2D HUD camera (2026-10-09): changing a live Camera2d's
+/// Msaa left a mesh2d pipeline specialized for the old sample count on HUD parts shown again after the pause menu
+/// (wgpu "Incompatible sample count" validation error = crash). A new camera starts with fresh specializations and
+/// phases. `FH1_HUD_RESPAWN=0` = mutate in place (old).
 #[allow(clippy::type_complexity)]
 fn sync_hdr(
     mut commands: Commands,
-    main: Query<(Has<bevy::camera::Hdr>, Option<&bevy::camera::CameraMainTextureUsages>), With<fh1_render::post::FxPostCamera>>,
-    ui: Query<(Entity, Has<bevy::camera::Hdr>, Option<&bevy::camera::CameraMainTextureUsages>, &RenderLayers), With<UiCamera>>,
+    main: Query<(Has<bevy::camera::Hdr>, Option<&bevy::camera::CameraMainTextureUsages>, &Msaa), With<fh1_render::post::FxPostCamera>>,
+    mut ui: Query<(Entity, Has<bevy::camera::Hdr>, Option<&bevy::camera::CameraMainTextureUsages>, &RenderLayers, Option<&mut Msaa>, Has<HudCamera>), (With<UiCamera>, Without<fh1_render::post::FxPostCamera>)>,
 ) {
-    let Ok((main_hdr, main_usages)) = main.single() else { return };
+    let Ok((main_hdr, main_usages, main_msaa)) = main.single() else { return };
     let share_usages = std::env::var("FH1_HUD_SHARE_USAGES").map_or(true, |v| v != "0");
-    for (e, hdr, usages, layers) in &ui {
+    let respawn = hud_2d() && std::env::var("FH1_HUD_RESPAWN").map_or(true, |v| v != "0");
+    let main_usages_v = main_usages.map(|u| u.0).unwrap_or_else(|| bevy::camera::CameraMainTextureUsages::default().0);
+    for (e, hdr, usages, layers, msaa, hud) in &mut ui {
+        if hud && respawn {
+            let have_usages = usages.map(|u| u.0).unwrap_or_else(|| bevy::camera::CameraMainTextureUsages::default().0);
+            let msaa_ok = msaa.as_deref().is_some_and(|m| m == main_msaa);
+            if !msaa_ok || hdr != main_hdr || (share_usages && have_usages != main_usages_v) {
+                commands.entity(e).despawn();
+                let usages = if share_usages { main_usages_v } else { have_usages };
+                spawn_hud_camera(commands.reborrow(), Some((*main_msaa, main_hdr, bevy::camera::CameraMainTextureUsages(usages))));
+                info!("ui: HUD camera respawned (Msaa {:?}, Hdr {main_hdr})", main_msaa);
+                // One camera only: the next frame sees the new one.
+                return;
+            }
+            continue;
+        }
+        // The Camera3d HUD (FH1_HUD_3D=1) and FH1_HUD_RESPAWN=0: match in place (graphics.rs sync_aa skips HudCamera).
+        if let Some(mut m) = msaa.filter(|_| hud) {
+            m.set_if_neq(*main_msaa);
+        }
         // Only the window overlay camera; the minimap renders into its own image.
         if !layers.intersects(&RenderLayers::layer(UI_LAYER)) {
             continue;

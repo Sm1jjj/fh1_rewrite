@@ -47,6 +47,8 @@ pub const BLIT_LAYER: usize = 24;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
+    /// P17-A: 360-class hardware (fh1-render quality.rs QualityPreset::Console).
+    Console,
     Low,
     Medium,
     #[default]
@@ -55,10 +57,11 @@ pub enum Quality {
 }
 
 impl Quality {
-    const ALL: [Quality; 4] = [Quality::Low, Quality::Medium, Quality::High, Quality::Ultra];
+    const ALL: [Quality; 5] = [Quality::Console, Quality::Low, Quality::Medium, Quality::High, Quality::Ultra];
 
     pub fn name(self) -> &'static str {
         match self {
+            Quality::Console => "Console (720p)",
             Quality::Low => "Low",
             Quality::Medium => "Medium",
             Quality::High => "High",
@@ -72,6 +75,7 @@ impl Quality {
 
     fn preset(self) -> QualityPreset {
         match self {
+            Quality::Console => QualityPreset::Console,
             Quality::Low => QualityPreset::Low,
             Quality::Medium => QualityPreset::Medium,
             Quality::High => QualityPreset::High,
@@ -246,6 +250,16 @@ pub fn scale_value(g: &GraphicsSettings) -> String {
     if (run - g.render_scale).abs() < 1e-3 { set } else { format!("{set} (runs {:.0}%)", run * 100.0) }
 }
 
+/// P17-A: the Console preset's internal resolution cap (lines).
+const CONSOLE_LINES: f32 = 720.0;
+
+/// Picking Console in Options also picks the AA and blur that suit an integrated GPU (both stay changeable after):
+/// FXAA (MSAA costs bandwidth without the 360's eDRAM), no motion blur.
+pub fn console_defaults(g: &mut GraphicsSettings) {
+    g.aa = AntiAlias::Fxaa;
+    g.motion_blur = MotionBlur::Off;
+}
+
 /// Left / right: 5 % steps in 50..100 %; Enter wraps from 100 % to 50 %.
 pub fn step_scale(g: &mut GraphicsSettings, dir: i32) {
     let steps = (g.render_scale * 20.0).round() as i32;
@@ -266,9 +280,9 @@ impl Plugin for GraphicsPlugin {
             .init_resource::<Scaled>()
             // Render scale before AA: the blit camera it spawns must get the same Msaa as the other window cameras in
             // its first frame (Bevy's default 4x on one camera of a shared target is a wgpu validation error).
-            .add_systems(Update, (migrate_aa, sync_quality, sync_render_scale, sync_aa, sync_motion_blur).chain());
+            .add_systems(Update, (migrate_aa, aa_cycle_hook, sync_quality, sync_render_scale, sync_aa, sync_motion_blur).chain());
         if std::env::var("FH1_TRANSP_CENSUS").map_or(true, |v| v != "0") {
-            app.add_systems(Last, transp_census);
+            app.add_systems(Last, (transp_census, shadow_census));
         }
         if std::env::var("FH1_OCCLUSION").is_ok_and(|v| v == "1") && !rtx() {
             app.add_systems(Update, occlusion_culling);
@@ -281,6 +295,25 @@ fn sync_quality(settings: Res<Settings>, mut quality: ResMut<GraphicsQuality>) {
     if quality.preset != preset {
         *quality = GraphicsQuality::from_preset(preset);
         info!("graphics: quality {:?}", preset);
+    }
+    if quality.is_changed() {
+        quality.publish();
+    }
+}
+
+/// Dev hook `FH1_AA_CYCLE=<s>`: steps Options > Anti-aliasing to the next mode every s seconds (runtime AA switch tests;
+/// not saved unless the pause menu closes).
+fn aa_cycle_hook(time: Res<Time<Real>>, mut settings: ResMut<Settings>, mut next: Local<f32>) {
+    static EVERY: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let Some(every) = *EVERY.get_or_init(|| std::env::var("FH1_AA_CYCLE").ok().and_then(|v| v.parse().ok()).filter(|s: &f32| *s > 0.0)) else { return };
+    let now = time.elapsed_secs();
+    if *next == 0.0 {
+        *next = now + every;
+    }
+    if now >= *next {
+        *next = now + every;
+        settings.graphics.aa = settings.graphics.aa.next(false);
+        info!("graphics: FH1_AA_CYCLE -> {}", settings.graphics.aa.name());
     }
 }
 
@@ -313,7 +346,11 @@ fn sync_motion_blur(settings: Res<Settings>, blur: Option<ResMut<fh1_remaster::p
 /// Camera2d draws into the main camera's offscreen image below 100 % render scale: differing sample counts on one
 /// target are a wgpu validation error); FXAA / SMAA on the main camera.
 #[allow(clippy::type_complexity)]
-fn sync_aa(mut commands: Commands, settings: Res<Settings>, mut cams: Query<(Entity, &RenderTarget, &mut Msaa, Has<FxPostCamera>, Has<BlitCamera>, Has<Fxaa>, Has<Smaa>)>) {
+fn sync_aa(
+    mut commands: Commands,
+    settings: Res<Settings>,
+    mut cams: Query<(Entity, &RenderTarget, &mut Msaa, Has<FxPostCamera>, Has<BlitCamera>, Has<Fxaa>, Has<Smaa>), Without<super::scene::HudCamera>>,
+) {
     let Some(aa) = aa_choice(&settings.graphics) else { return };
     let msaa = aa.msaa();
     // The main camera's offscreen image (render scale < 100 %), if any.
@@ -382,7 +419,12 @@ fn sync_render_scale(
 ) {
     let Ok(window) = windows.single() else { return };
     let Ok((mut target, main_hdr, main_usages)) = main.single_mut() else { return };
-    let scale = render_scale(&settings.graphics);
+    let phys = window.physical_size();
+    let mut scale = render_scale(&settings.graphics);
+    // P17-A Console: at most 720 lines, the 360's resolution (a 1080p window renders at 67 %, then upscales + CAS).
+    if settings.graphics.quality == Quality::Console && phys.y > 0 {
+        scale = scale.min(CONSOLE_LINES / phys.y as f32).max(0.25);
+    }
     if scale >= 0.999 {
         if state.0.take().is_some() {
             *target = RenderTarget::Window(WindowRef::Primary);
@@ -396,7 +438,6 @@ fn sync_render_scale(
         }
         return;
     }
-    let phys = window.physical_size();
     let size = UVec2::new(((phys.x as f32 * scale).round() as u32).max(1), ((phys.y as f32 * scale).round() as u32).max(1));
     let handle = match &state.0 {
         Some(h) => h.clone(),
@@ -474,6 +515,45 @@ fn occlusion_culling(mut commands: Commands, cams: Query<Entity, (With<FxPostCam
 /// Main world only (the render-world phase census, fh1-remaster batch.rs FH1_RM_PHASE_STATS, froze one run).
 /// Counts include entities without CPU culling (always "visible") and shadow-view visibility, so they are upper bounds.
 /// `FH1_TRANSP_CENSUS=0` = off.
+/// P18 lever 2: shadow casters that go through Bevy's ECS shadow path (everything with a Mesh3d and no NotShadowCaster;
+/// the static world draws its own cascades), by owner, every 300 frames next to the transparency census. `seen` = visible
+/// in some view this frame (main or a cascade), `hidden` = casting but culled everywhere.
+#[allow(clippy::type_complexity)]
+fn shadow_census(
+    mut frame: Local<u32>,
+    meshes: Query<(Entity, &ViewVisibility, &InheritedVisibility, Has<bevy::gltf::GltfMaterialName>, Has<MeshMaterial3d<StandardMaterial>>, Has<MeshMaterial3d<fh1_remaster::material::RemasterMaterial>>, Has<MeshMaterial3d<fh1_render::material::FxMaterial>>), (With<Mesh3d>, Without<bevy::light::NotShadowCaster>)>,
+    parents: Query<&ChildOf>,
+    owners: Query<(Has<crate::Car>, Has<fh1_engine::ai::AiCar>, Has<fh1_engine::traffic::TrafficCar>)>,
+) {
+    *frame = frame.wrapping_add(1);
+    if *frame % 300 != 150 {
+        return;
+    }
+    // [player car, AI, traffic, other glTF, standard, remaster, fx, other] x [seen, hidden-but-alive]
+    let mut n = [[0u32; 2]; 8];
+    for (e, view, inherited, gltf, std, rm, fx) in &meshes {
+        if !inherited.get() {
+            continue;
+        }
+        let mut owner = None;
+        for a in std::iter::once(e).chain(parents.iter_ancestors(e)) {
+            if let Ok((car, ai, traffic)) = owners.get(a) {
+                if car || ai || traffic {
+                    owner = Some(if car { 0 } else if traffic { 2 } else { 1 });
+                    break;
+                }
+            }
+        }
+        let k = owner.unwrap_or(if gltf { 3 } else if std { 4 } else if rm { 5 } else if fx { 6 } else { 7 });
+        n[k][if view.get() { 0 } else { 1 }] += 1;
+    }
+    let f = |i: usize| format!("{}/{}", n[i][0], n[i][1]);
+    info!(
+        "shadow census (ECS casters seen/hidden): player car {} | AI {} | traffic {} | other glTF {} | standard {} | remaster {} | fx {} | other {}",
+        f(0), f(1), f(2), f(3), f(4), f(5), f(6), f(7)
+    );
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn transp_census(
     mut frame: Local<u32>,

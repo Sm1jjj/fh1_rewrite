@@ -452,7 +452,7 @@ fn update_lights(
         l.illuminance = sun_lux;
         l.color = sun_colour;
         l.shadow_maps_enabled = shadows_on() && !moon_casts && sun_dir.y > 0.0;
-        l.contact_shadows_enabled = l.shadow_maps_enabled && contact_shadows_on();
+        l.contact_shadows_enabled = l.shadow_maps_enabled && contact_shadows_on() && quality.as_ref().is_none_or(|q| q.contact_shadows);
         l.shadow_depth_bias = 0.02;
         l.shadow_normal_bias = 1.0;
         *tf = Transform::default().looking_to(-sun_dir, Vec3::Y);
@@ -469,7 +469,7 @@ fn update_lights(
         l.illuminance = moon_lux;
         l.color = moon_colour;
         l.shadow_maps_enabled = shadows_on() && moon_casts;
-        l.contact_shadows_enabled = l.shadow_maps_enabled && contact_shadows_on();
+        l.contact_shadows_enabled = l.shadow_maps_enabled && contact_shadows_on() && quality.as_ref().is_none_or(|q| q.contact_shadows);
         l.shadow_depth_bias = 0.02;
         l.shadow_normal_bias = 1.0;
         *tf = Transform::default().looking_to(-moon_dir, Vec3::Y);

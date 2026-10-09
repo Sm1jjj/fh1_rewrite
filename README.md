@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://github.com/Sm1jjj/fh1_rewrite/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/Sm1jjj/fh1_rewrite?label=download&style=for-the-badge&color=ff7a3c"></a>
   <img alt="Windows x64" src="https://img.shields.io/badge/windows-x64-1b1446?style=for-the-badge">
+  <img alt="Linux x64 (experimental)" src="https://img.shields.io/badge/linux-x64%20(experimental)-1b1446?style=for-the-badge">
   <img alt="Rust + Bevy" src="https://img.shields.io/badge/rust-bevy%200.19-1b1446?style=for-the-badge">
   <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-1b1446?style=for-the-badge">
 </p>
@@ -18,7 +19,8 @@ converts it on your machine, and nothing from the game is shipped here.
 **What works today:** the full Colorado map with streaming scenery, props, crowds and traffic; 175 cars with their
 own handling data, engine sounds and the in-game radio; races with AI drivers, wristband progression and credits;
 a garage with paint, rims, body kits and upgrades; a PBR "remaster" renderer with time of day; and online free roam
-on dedicated servers. Parity with the original is the goal and still a work in progress.
+on dedicated servers. Performance is a priority: the renderer is tuned for high frame rates, and a Console quality
+preset targets low-end PCs (integrated graphics) at the original game's 720p. Parity with the original is the goal and still a work in progress.
 
 ## Play
 
@@ -27,7 +29,24 @@ on dedicated servers. Parity with the original is the goal and still a work in p
 2. Open **FH1 Rewrite.exe** and choose your Forza Horizon disc: the `.iso`, a `.zip` holding it, or the folder it's in.
 3. Click **Install**, wait (up to an hour on slower PCs), then **PLAY**.
 
-No Rust, Python or other tools needed. A gamepad is recommended; keyboard works too.
+No Rust, Python or other tools needed. A gamepad is recommended; keyboard works too. The launcher updates itself
+when a new release is out.
+
+**Linux (experimental):** download `FH1Rewrite-<version>-linux-x64.tar.gz` from the same release, extract it and run
+`./fh1-rewrite`. It's built automatically for every release and gets less testing than Windows.
+
+### Graphics settings
+
+Pause → **Options → Graphics**:
+
+| Setting | Choices |
+|---|---|
+| Quality | **Console (720p)** for integrated graphics / older PCs, Low, Medium, High, Ultra. Sets shadows, draw distance, reflections, particles and crowd detail |
+| Anti-aliasing | Off, FXAA, SMAA, SMAA + MSAA 2x (default), MSAA 2x, MSAA 4x |
+| Motion blur | Off, Low, Medium (default), High |
+| Render scale | 50-100 %, upscaled and sharpened |
+
+Picking Console also switches to FXAA and turns motion blur off; you can change both afterwards.
 
 ### Got other Forza discs?
 
@@ -78,8 +97,8 @@ layouts.
 | `fh1setup` | Your disc → converted assets, per asset group, so updates only re-convert what changed |
 | `fh1-launcher` | The installer and launcher (`FH1 Rewrite.exe`) |
 | `fh1-engine` | The game: vehicle simulation, cameras, world streaming, races, AI, traffic, HUD and menus |
-| `fh1-remaster` | The default PBR renderer |
-| `fh1-shaders` / `fh1-render` | Xenos shader microcode → WGSL, and the "original shaders" renderer |
+| `fh1-remaster` | The PBR renderer: static world on the GPU, shadows, sky, car paint, post |
+| `fh1-shaders` / `fh1-render` | Xenos shader microcode → WGSL; shared render pieces (particles, sky, quality presets) |
 | `fh1-world` | Track collision and surfaces |
 | `fh1-audio` / `fh1-radio` | Engine sound from the game's FMOD banks, and the radio |
 | `fh1-ui` | UI data: string tables, fonts, HUD scenes |
@@ -103,7 +122,9 @@ cargo run --release -p fh1setup --features fm4 -- import-fm4 "path/to/FM4 Play D
 ```
 
 `tools\release.ps1` builds the Windows release zip. Vendored crates keep their own licenses: `vendor/lzxd` (patched for
-XMemCompress streams), `vendor/bevy_pbr` (shadow cascade caching) and `vendor/bevy_solarik`.
+XMemCompress streams), `vendor/bevy_pbr` (shadow cascade caching, cached bind groups, static atmosphere LUTs),
+`vendor/wgpu-core` (bind group tracking once per pass / command buffer) and `vendor/bevy_solarik`; each patched crate
+lists its changes in `FH1_PATCHES.md`.
 
 ## AI usage
 

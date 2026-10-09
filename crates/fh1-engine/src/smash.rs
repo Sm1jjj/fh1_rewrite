@@ -685,7 +685,7 @@ impl PropGround<'_> {
                     continue;
                 }
             }
-            out.push(SphereContact { point, normal, depth, surface: PROP_SURFACE });
+            out.push(SphereContact { point, normal, depth, surface: PROP_SURFACE, ..Default::default() });
         }
     }
 }

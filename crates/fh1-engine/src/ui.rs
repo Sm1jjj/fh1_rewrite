@@ -1120,7 +1120,12 @@ fn adjust(settings: &mut Settings, o: Opt, dir: i32) {
             settings.abs = i != 2;
         }
         Opt::DrivingLine => settings.driving_line = settings.driving_line.next(dir < 0),
-        Opt::Quality => settings.graphics.quality = settings.graphics.quality.next(dir < 0),
+        Opt::Quality => {
+            settings.graphics.quality = settings.graphics.quality.next(dir < 0);
+            if settings.graphics.quality == graphics::Quality::Console {
+                graphics::console_defaults(&mut settings.graphics);
+            }
+        }
         Opt::AntiAlias => settings.graphics.aa = settings.graphics.aa.next(dir < 0),
         Opt::MotionBlur => settings.graphics.motion_blur = settings.graphics.motion_blur.next(dir < 0),
         Opt::RenderScale => graphics::step_scale(&mut settings.graphics, dir),
