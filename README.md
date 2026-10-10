@@ -102,6 +102,7 @@ layouts.
 | `fh1-world` | Track collision and surfaces |
 | `fh1-audio` / `fh1-radio` | Engine sound from the game's FMOD banks, and the radio |
 | `fh1-ui` | UI data: string tables, fonts, HUD scenes |
+| `fh1-video` | FMV playback of the game's movies (intros, cutscenes) through an ffmpeg child process |
 | `fh1-net` | Multiplayer protocol, game server and server list |
 
 ## Build from source
@@ -110,8 +111,17 @@ Requires Windows, Rust (stable, MSVC toolchain) and your own Forza Horizon disc.
 
 ```
 cargo run --release -p fh1setup -- "path/to/Forza Horizon.iso"     # or an extracted disc folder
-cargo run --release -p fh1-engine
+cargo run --release --no-default-features -p fh1-engine
 ```
+
+`fh1-engine` compiles the Remaster RTX renderer (DLSS-RR) by default, which needs the NVIDIA DLSS SDK
+(the `DLSS_SDK` environment variable), the Vulkan headers and libclang. Without those, build with
+`--no-default-features` as above; the game then runs in its standard renderer. The `fh1setup` line keeps the
+optional FH2/FM4 importers; drop to `--no-default-features` there for an FH1-only setup tool.
+
+`fh1setup` also needs `ffmpeg` on `PATH` (or `FH1_FFMPEG` pointing at it): the `audio` group decodes the game's XMA
+banks through it and setup stops there without it. The release ships a pinned build; source builds must supply their
+own, and `fh1-engine` then uses the same ffmpeg for FMV playback.
 
 The Xbox 360 retail XEX key is needed to read the shaders inside `default.xex`. Source builds look for it in
 `data/xex_key.txt` or `FH1_XEX_KEY`; it is not part of this repository. Optional importers:
