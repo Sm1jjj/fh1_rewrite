@@ -31,6 +31,7 @@ mod vo;
 mod audio;
 mod backfire;
 mod camera;
+mod deadzone;
 mod diag;
 mod grass;
 mod crowd;
@@ -475,12 +476,16 @@ fn read_input(track: Res<Track>, mut settings: ResMut<ui::Settings>, keys: Res<B
     let mut camera = keys.just_pressed(KeyCode::KeyC);
     for pad in &pads {
         let axis = |a: GamepadAxis| pad.get(a).unwrap_or(0.0);
-        let stick = axis(GamepadAxis::LeftStickX);
-        if stick.abs() > 0.08 {
+        // FH1's ControllerAdvancedOptions: the left stick, right trigger and left trigger each pass through
+        // the player's inside/outside deadzone pair before the car sees them (deadzone.rs; defaults = the
+        // game's own ForzaProfile.sch values). Below the inside deadzone the input reads 0, so the keyboard
+        // steering (if any) stays in charge.
+        let stick = settings.deadzones.steer(axis(GamepadAxis::LeftStickX));
+        if stick != 0.0 {
             c.steer = stick;
         }
-        c.throttle = c.throttle.max(pad.get(GamepadButton::RightTrigger2).unwrap_or(0.0));
-        c.brake = c.brake.max(pad.get(GamepadButton::LeftTrigger2).unwrap_or(0.0));
+        c.throttle = c.throttle.max(settings.deadzones.throttle(pad.get(GamepadButton::RightTrigger2).unwrap_or(0.0)));
+        c.brake = c.brake.max(settings.deadzones.brake(pad.get(GamepadButton::LeftTrigger2).unwrap_or(0.0)));
         if pad.pressed(GamepadButton::South) {
             c.handbrake = 1.0;
         }
