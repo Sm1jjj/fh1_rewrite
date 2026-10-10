@@ -72,6 +72,7 @@ impl Plugin for UiPlugin {
                 "options" => Page::Options,
                 "cars" => Page::Cars,
                 "controls" => Page::Controls,
+                "deadzones" => Page::Deadzones,
                 "travel" => Page::FastTravel,
                 "maps" => Page::Maps,
                 _ => Page::Main,
@@ -146,6 +147,9 @@ pub struct Settings {
     pub ai_difficulty: fh1_engine::ai::AiDifficulty,
     /// FH1 "Shifting": Automatic / Manual / Manual with clutch.
     pub shifting: Shifting,
+    /// FH1 controller deadzones (`ControllerAdvancedOptions` in ForzaProfile.sch); the defaults here are the
+    /// game's own numbers (deadzone.rs). Adjustable in Options.
+    pub deadzones: crate::deadzone::Deadzones,
     /// FH1 "Rewind": hold X / Back to rewind up to 15 s.
     pub rewind: bool,
     pub hud: bool,
@@ -189,6 +193,7 @@ impl Default for Settings {
             driving_line: fh1_engine::ai::DrivingLine::Full,
             ai_difficulty: fh1_engine::ai::AiDifficulty::Medium,
             shifting: Shifting::Automatic,
+            deadzones: crate::deadzone::Deadzones::default(),
             rewind: true,
             hud: true,
             telemetry: false,
@@ -244,10 +249,13 @@ enum Page {
     Map,
     /// Options > Graphics (ui/graphics.rs): quality preset, anti-aliasing, render scale.
     Graphics,
+    /// Options > Controller deadzones: FH1's `ControllerAdvancedOptions` (deadzone.rs).
+    Deadzones,
 }
 
-/// Row of "Graphics" on the Options page (back from Options > Graphics lands on it).
-const GRAPHICS_ROW: usize = 14;
+/// Rows of the Options sub-pages, so backing out of one lands on its row here.
+const GRAPHICS_ROW: usize = 16;
+const DEADZONE_ROW: usize = 6;
 
 /// Long list pages: the cursor indexes the whole list and the rows scroll (like the car list).
 fn is_list(p: Page) -> bool {
@@ -855,6 +863,12 @@ enum Opt {
     Stm,
     Steering,
     Shifting,
+    SteerDeadzoneInside,
+    SteerDeadzoneOutside,
+    ThrottleDeadzoneInside,
+    ThrottleDeadzoneOutside,
+    BrakeDeadzoneInside,
+    BrakeDeadzoneOutside,
     Rewind,
     Hud,
     Telemetry,
@@ -955,6 +969,8 @@ fn items(menu: &Menu, settings: &Settings, garage: &Garage, track: &Track, maps:
                     opt("Traction control", on_off(settings.tcs), Opt::Tcs),
                     opt("Stability control", on_off(settings.stm), Opt::Stm),
                     opt("Shifting", shifting_name(settings.shifting).into(), Opt::Shifting),
+                    // FH1's controller deadzones live on their own Controller screen; ours is a sub-page.
+                    item("Controller deadzones", Act::Open(Page::Deadzones)),
                     opt("Driving line", settings.driving_line.name().into(), Opt::DrivingLine),
                     opt("AI difficulty", settings.ai_difficulty.name().into(), Opt::AiDifficulty),
                     opt("Rewind", on_off(settings.rewind), Opt::Rewind),
@@ -967,6 +983,23 @@ fn items(menu: &Menu, settings: &Settings, garage: &Garage, track: &Track, maps:
                     item("Graphics", Act::Open(Page::Graphics)),
                     Item { label: "Map".into(), value: Some(track.name.clone()), act: Act::Open(Page::Maps) },
                     item("Controls", Act::Open(Page::Controls)),
+                ],
+                0,
+            )
+        }
+        Page::Deadzones => {
+            let pct = |v: f32| format!("{:.0}%", v * 100.0);
+            let opt = |l: &str, v: f32, o: Opt| Item { label: l.into(), value: Some(pct(v)), act: Act::Opt(o) };
+            // FH1's ControllerAdvancedOptions (defaults from ForzaProfile.sch; deadzone.rs).
+            let d = &settings.deadzones;
+            (
+                vec![
+                    opt("Steering deadzone inside", d.steering_inside, Opt::SteerDeadzoneInside),
+                    opt("Steering deadzone outside", d.steering_outside, Opt::SteerDeadzoneOutside),
+                    opt("Throttle deadzone inside", d.throttle_inside, Opt::ThrottleDeadzoneInside),
+                    opt("Throttle deadzone outside", d.throttle_outside, Opt::ThrottleDeadzoneOutside),
+                    opt("Brake deadzone inside", d.brake_inside, Opt::BrakeDeadzoneInside),
+                    opt("Brake deadzone outside", d.brake_outside, Opt::BrakeDeadzoneOutside),
                 ],
                 0,
             )
@@ -1047,6 +1080,7 @@ fn page_title(p: Page) -> &'static str {
         Page::Customize => "CUSTOMIZE",
         Page::Map => "WORLD MAP",
         Page::Graphics => "GRAPHICS",
+        Page::Deadzones => "DEADZONES",
     }
 }
 
@@ -1142,6 +1176,13 @@ fn adjust(settings: &mut Settings, o: Opt, dir: i32) {
             let i = ALL.iter().position(|&x| x == settings.shifting).unwrap_or(0);
             settings.shifting = ALL[(i as i32 + if dir < 0 { 2 } else { 1 }) as usize % 3];
         }
+        // FH1 controller deadzones: 1 % steps; the inside never crosses its outside (or vice versa).
+        Opt::SteerDeadzoneInside => step_deadzone_inside(&mut settings.deadzones.steering_inside, &mut settings.deadzones.steering_outside, delta),
+        Opt::SteerDeadzoneOutside => step_deadzone_outside(&mut settings.deadzones.steering_inside, &mut settings.deadzones.steering_outside, delta),
+        Opt::ThrottleDeadzoneInside => step_deadzone_inside(&mut settings.deadzones.throttle_inside, &mut settings.deadzones.throttle_outside, delta),
+        Opt::ThrottleDeadzoneOutside => step_deadzone_outside(&mut settings.deadzones.throttle_inside, &mut settings.deadzones.throttle_outside, delta),
+        Opt::BrakeDeadzoneInside => step_deadzone_inside(&mut settings.deadzones.brake_inside, &mut settings.deadzones.brake_outside, delta),
+        Opt::BrakeDeadzoneOutside => step_deadzone_outside(&mut settings.deadzones.brake_inside, &mut settings.deadzones.brake_outside, delta),
         Opt::Hud => settings.hud = !settings.hud,
         Opt::Telemetry => settings.telemetry = !settings.telemetry,
         // Enter (dir 0) steps up and wraps to 0 past 100%.
@@ -1159,6 +1200,16 @@ fn adjust(settings: &mut Settings, o: Opt, dir: i32) {
             }
         }
     }
+}
+
+/// Step the inside of a deadzone pair by 1 % (shown in whole percent), never past its outside.
+fn step_deadzone_inside(inside: &mut f32, outside: &mut f32, delta: f32) {
+    *inside = (*inside + delta * 0.01).clamp(0.0, *outside);
+}
+
+/// Step the outside of a deadzone pair by 1 %, never below its inside.
+fn step_deadzone_outside(inside: &mut f32, outside: &mut f32, delta: f32) {
+    *outside = (*outside + delta * 0.01).clamp(*inside, 1.0);
 }
 
 #[derive(Default)]
@@ -1361,13 +1412,14 @@ fn menu_input(
         } else {
             let from = menu.page;
             snd.write(sfx::UiSfx::play(sfx::keys::CANCEL));
-            // Graphics is a sub-page of Options: back returns to its row there.
-            menu.page = if from == Page::Graphics { Page::Options } else { Page::Main };
+            // Graphics and the deadzones are sub-pages of Options: back returns to their row there.
+            menu.page = if matches!(from, Page::Graphics | Page::Deadzones) { Page::Options } else { Page::Main };
             menu.cursor = match from {
                 Page::FastTravel | Page::Map => 2,
                 Page::Cars | Page::Garage | Page::Customize => 3,
                 Page::Options | Page::Controls | Page::Maps => 5,
                 Page::Graphics => GRAPHICS_ROW,
+                Page::Deadzones => DEADZONE_ROW,
                 Page::Main => 0,
             };
             menu.dirty = true;
@@ -1701,7 +1753,7 @@ fn draw_menu(
         }
         let hint: String = match menu.page {
             Page::Main => "Enter / A  select      Esc / B  resume".into(),
-            Page::Options | Page::Graphics => "Left / Right  change      Esc / B  back".into(),
+            Page::Options | Page::Graphics | Page::Deadzones => "Left / Right  change      Esc / B  back".into(),
             Page::Cars => menu.cars.as_ref().map_or("Esc / B  back".into(), |b| format!("{}{}", b.hint(), menu.shop.hint_extra())),
             Page::Maps => menu.maps.hint(),
             Page::Customize => menu.custom.hint(),
